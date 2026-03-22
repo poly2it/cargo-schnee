@@ -1,0 +1,9 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+my-macro = { path = "../my-macro" }
+build-info = { path = "../build-info" }
+itoa = "1"

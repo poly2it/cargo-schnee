@@ -1,0 +1,539 @@
+<p align="center">
+  <img src="docs/cargo_schnee_banner.svg" alt="cargo-schnee" width="600">
+</p>
+
+Are you tired of slow and monolithic Rust derivations? Do you wish Nix would build Rust projects more granularly? Introducing cargo-schnee, a Cargo plugin which replaces the native Cargo builder with one which builds Rust projects fully and always in Nix, with complete [content-addressed derivation](https://nixos.org/manual/nix/stable/language/advanced-attributes.html#adv-attr-__contentAddressed)-enabled translation unit isolation.
+
+
+The following experimental features are required:
+
+```
+experimental-features = nix-command flakes dynamic-derivations ca-derivations
+```
+
+## How it works
+
+### Pipeline overview
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Schnee as cargo schnee
+    participant Cargo as cargo crate (library)
+    participant Daemon as Nix daemon
+    participant Store as nix-store --realise
+
+    User->>Schnee: cargo schnee build
+
+    Note over User,Store: Source preparation
+    Schnee->>Schnee: cargo vendor into Nix store
+    Schnee->>Schnee: project source into Nix store (NAR hash)
+
+    Note over User,Store: Unit graph extraction
+    Schnee->>Cargo: create_bcx() — extract unit graph
+    Cargo-->>Schnee: unit graph (DAG of compilation units)
+    Schnee->>Schnee: deduplicate units, topological sort
+
+    Note over User,Store: Derivation construction and registration
+    loop for each unit (topological order)
+        Schnee->>Schnee: construct derivation JSON
+        Schnee->>Schnee: serialize to ATerm
+        Schnee->>Schnee: SHA-256, compute .drv store path
+        alt .drv already exists in /nix/store
+            Schnee->>Schnee: skip (cached)
+        else new derivation
+            Schnee->>Daemon: wopAddTextToStore (Unix socket)
+            Daemon-->>Schnee: registered .drv path
+        end
+    end
+
+    Note over User,Store: Build and output copy
+    Schnee->>Store: nix-store --realise root.drv
+    Store-->>Schnee: /nix/store/…-test_project
+    Schnee->>User: copy outputs to target/debug/
+```
+
+### Source preparation
+
+Dependencies are vendored via `cargo vendor` into a temporary
+directory, then added to the Nix store with `nix-store --add`. The resulting
+store path is reused across builds by caching the `Cargo.lock` hash to
+vendor store path mapping in `target/.schnee-cache.json`. When running inside
+a Nix derivation (e.g. via `buildRustPackage`), network access is unavailable,
+so the `--vendor-dir` flag accepts a pre-vendored directory already in the Nix
+store from the outer build's fetch phase.
+
+The project source is added to the Nix store with
+`.gitignore`-aware filtering via `libgit2`. To avoid spawning `nix-store
+--add` on every build, the source tree is serialized to NAR format in-process
+and its store path is computed directly.
+
+NAR is Nix's deterministic archive
+format: directory entries are sorted lexicographically, strings are
+length-prefixed and padded to 8-byte boundaries. The store path computation
+hashes the NAR bytes with SHA-256, builds a fingerprint string containing the
+hash and store prefix, hashes that fingerprint again, XOR-folds the result
+from 32 bytes down to 20, and encodes it in Nix's base32 alphabet to produce
+the final `/nix/store/<hash>-<name>` path. This is the same algorithm Nix
+itself uses internally. If the computed path already exists in `/nix/store/`,
+the subprocess is skipped entirely.
+
+### Unit graph extraction
+
+cargo-schnee uses the `cargo` crate as a Rust library. Cargo's internal build
+pipeline has a planning phase that reads `Cargo.toml` and `Cargo.lock`,
+resolves all dependencies, unifies feature flags, and filters by target
+platform --- producing a complete graph of every `rustc` invocation needed for
+the build. cargo-schnee calls this planning phase via `ops::create_bcx()` and
+stops before any actual compilation begins, extracting the unit graph for its
+own use.
+
+Cargo's unit graph is a `HashMap<Unit, Vec<UnitDep>>` where each `Unit`
+represents a single `rustc` invocation and each `UnitDep` is a dependency
+edge. cargo-schnee converts these into its own `NixUnit` type, which carries
+the additional information needed to construct Nix derivations, such as store
+paths, placeholder references, and build script outputs. The conversion is not
+one-to-one: cargo may produce multiple `Unit` entries for the same crate with
+different internal hash values representing different dependency resolution
+variants. cargo-schnee deduplicates these by computing a *compilation
+identity*, a deterministic string derived from `package_name`, `version`,
+`target_name`, `mode`, `crate_types`, `edition`, `features`, and
+`host_vs_target`, and merging all `Unit` variants sharing the same identity
+into a single `NixUnit`. When merging dependencies, the lexicographically
+smallest dep key per slot is chosen for determinism.
+
+Each `NixUnit` is assigned a key, the hexadecimal SHA-256 of its compilation
+identity string. This key is used to reference dependencies between units and
+to look up derivation store paths during construction. It is stable across
+builds with the same `Cargo.lock` and `Cargo.toml`.
+
+Units exist in four kinds:
+
+| Kind | Meaning |
+|------|---------|
+| `Compile` | Regular `rustc` invocation (lib, bin, proc-macro, cdylib, dylib) |
+| `TestCompile` | Compilation with `--test` flag (test/bench harness) |
+| `BuildScriptCompile` | Compile a `build.rs` into a binary |
+| `BuildScriptRun` | Execute the compiled `build.rs`, capturing its `cargo:` stdout |
+
+Units are sorted topologically via Kahn's algorithm so that every
+unit appears after all its dependencies. The queue uses a `BTreeSet` to
+ensure deterministic ordering.
+
+To illustrate, running `cargo schnee graph` on the
+[simple example](examples/simple/) (a project with `serde` and `serde_json`
+as dependencies) produces the following graph with 24 units for 2 direct
+dependencies:
+
+```mermaid
+graph LR
+    n0["itoa [lib]"]:::dep
+    n1["memchr [lib]"]:::dep
+    n2{{"build(proc-macro2) [compile]"}}:::build
+    n3{{"build(proc-macro2) [run]"}}:::build
+    n4{{"build(quote) [compile]"}}:::build
+    n5{{"build(quote) [run]"}}:::build
+    n6{{"build(serde) [compile]"}}:::build
+    n7{{"build(serde) [run]"}}:::build
+    n8{{"build(serde_core) [compile]"}}:::build
+    n9{{"build(serde_core) [run]"}}:::build
+    n10["serde_core [lib]"]:::dep
+    n11{{"build(serde_json) [compile]"}}:::build
+    n12{{"build(serde_json) [run]"}}:::build
+    n13["unicode_ident [lib]"]:::dep
+    n14["proc_macro2 [lib]"]:::dep
+    n15["quote [lib]"]:::dep
+    n16["syn [lib]"]:::dep
+    n17[["serde_derive [proc-macro]"]]:::pmacro
+    n18["serde [lib]"]:::dep
+    n19{{"build(zmij) [compile]"}}:::build
+    n20{{"build(zmij) [run]"}}:::build
+    n21["zmij [lib]"]:::dep
+    n22["serde_json [lib]"]:::dep
+    n23(["test_project [bin]"]):::root
+
+    n3 --> n2
+    n5 --> n4
+    n7 --> n6
+    n9 --> n8
+    n10 -.-> n9
+    n12 --> n11
+    n14 --> n13
+    n14 -.-> n3
+    n15 --> n14
+    n15 -.-> n5
+    n16 --> n14
+    n16 --> n15
+    n16 --> n13
+    n17 --> n14
+    n17 --> n15
+    n17 --> n16
+    n18 --> n10
+    n18 --> n17
+    n18 -.-> n7
+    n20 --> n19
+    n21 -.-> n20
+    n22 --> n0
+    n22 --> n1
+    n22 --> n10
+    n22 --> n21
+    n22 -.-> n12
+    n23 --> n18
+    n23 --> n22
+
+    classDef root fill:#f6d365,stroke:#f39c12,color:#000
+    classDef local fill:#a8e6cf,stroke:#2ecc71,color:#000
+    classDef dep fill:#74b9ff,stroke:#0984e3,color:#000
+    classDef pmacro fill:#a29bfe,stroke:#6c5ce7,color:#000
+    classDef build fill:#dfe6e9,stroke:#636e72,color:#000
+```
+
+| Shape | Meaning | Notes |
+|-------|---------|-------|
+| Rectangle (blue) | Library compilation | `rustc --crate-type lib` |
+| Hexagon (grey) | [Build script](https://doc.rust-lang.org/cargo/reference/build-scripts.html) | **compile** produces the binary, **run** executes it and captures `cargo:` directives. Build scripts are pre-build steps that generate code, detect system libraries, or set compiler flags. |
+| Subroutine (purple) | Proc-macro compilation | Loaded into the compiler at the dependent's compile time |
+| Stadium (yellow) | Root binary | The final output copied to `target/debug/` |
+
+Solid arrows are compile-time dependencies. Dashed arrows are build-script
+dependencies; the library must wait for the build script to run before it
+can compile.
+
+### Derivation construction
+
+Each `NixUnit` is converted into a Nix derivation JSON. All derivations are
+[content-addressed](https://nixos.org/manual/nix/stable/language/advanced-attributes.html#adv-attr-__contentAddressed)
+with `outputHashAlgo = "sha256"` and `outputHashMode = "nar"`, meaning the
+output hash is not known ahead of time and is computed from the build result.
+This is useful because two derivations that produce identical output will
+share the same store path, even if they were built from different inputs.
+Crate updates that don't change the compiled output are effectively free.
+
+Since output paths are unknown until after
+a derivation is built, references to dependency outputs use Nix's CA
+placeholder scheme. A self-placeholder for the derivation's own output is
+computed as `"/" + nix_base32(SHA-256("nix-output:" + outputName))`. To
+reference another derivation's output, a downstream placeholder is computed as
+`"/" + nix_base32(SHA-256("nix-upstream-output:" + hashPart + ":" +
+outputPathName))`, where `hashPart` is the 32-character nix-base32 hash from
+the dependency's `.drv` store path. Nix base32 uses the alphabet
+`0123456789abcdfghijklmnpqrsvwxyz`.
+
+#### Compile derivations
+
+For `Compile` and `TestCompile` units, the derivation's builder script invokes
+`rustc` directly with explicit flags:
+
+```
+rustc <source_file> \
+  --sysroot <resolved_sysroot> \
+  --crate-name <crate_name> \
+  --edition <edition> \
+  --crate-type <crate_type> \
+  --emit dep-info,metadata,link \
+  --extern <name>=<placeholder>/<filename> \
+  -L dependency=<placeholder> \
+  -C extra-filename=<hash> \
+  -C metadata=<hash> \
+  --cfg 'feature="<feature>"' \
+  --error-format=json \
+  --json=diagnostic-rendered-ansi
+```
+
+`--extern` tells `rustc` where to find a dependency's compiled artifact,
+mapping its crate name to the `.rlib` or `.so` file produced by the
+dependency's own derivation. The `-L` flags add search directories for
+transitive dependencies not directly referenced by name.
+
+The derivation sandbox has no `PATH`, so all tools like `mkdir` and `rustc`
+are referenced by their full Nix store path. The script creates the output
+directory, then invokes `rustc`.
+
+Build scripts communicate with cargo by printing
+[`cargo:` directives](https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script)
+to stdout. These directives can set compiler flags (`cargo:rustc-cfg`),
+inject environment variables (`cargo:rustc-env`), or tell the linker where
+to find system libraries (`cargo:rustc-link-lib`, `cargo:rustc-link-search`).
+If the unit depends on a build script, the compile derivation parses these
+directives from the build script's output file and translates them into
+additional `rustc` flags. For units that produce a linked artifact like
+binaries, proc-macros, or cdylibs, link directives from all transitive build
+script outputs are accumulated. `rustc`'s stderr is redirected to `$out/diagnostics`, then replayed to stderr
+so that errors are visible both during the build and on cached rebuilds.
+
+`inputDrvs` lists the derivations that must be built before the current: direct
+dependencies, all transitive dependencies, build script compile and run
+derivations, and `links` dependencies for `DEP_*` env var propagation.
+
+`inputSrcs` lists store paths available in the sandbox. These are determined
+by scanning the builder script for `/nix/store/` references and adding their
+top-level store paths. The `rustc` closure is always included, which
+transitively provides the sysroot and standard library. `coreutils` is added
+for basic shell utilities. Units that need a linker or run build scripts also
+get the `cc` closure and system library closures like `pkg-config` and
+`openssl`.
+
+#### Proc-macro specifics
+
+[Proc-macro](https://doc.rust-lang.org/reference/procedural-macros.html)
+crates are compiler plugins that generate code at compile time. Unlike
+regular libraries, they are compiled into shared objects and loaded into the
+compiler process when a dependent crate is built. This requires special
+handling:
+
+- `--extern proc_macro` without a path exposes the compiler's built-in
+  `proc_macro` crate from the sysroot
+- `-C prefer-dynamic` matches cargo's behavior for proc-macro compilation
+- `--emit dep-info,link` omits `metadata` because proc-macros are loaded
+  as shared objects by the compiler rather than linked as rlibs into the
+  final binary
+- The sysroot must include `librustc_driver` and `libLLVM`, provided by
+  `rust-default` rather than `rust-std`
+
+#### Build script derivations
+
+Build scripts are split into two derivations, corresponding to the
+`BuildScriptCompile` and `BuildScriptRun` unit kinds:
+
+1. The **compile** derivation compiles `build.rs` into a binary, similar to a
+   normal `Compile` derivation but targeting the host platform.
+
+2. The **run** derivation executes the compiled binary with the standard cargo
+   build-script environment variables: `OUT_DIR`, `CARGO_MANIFEST_DIR`,
+   `TARGET`, `HOST`, `CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_PKG_*`, and
+   others. The script's stdout is captured to `$out/output` for downstream
+   derivations to parse. `PATH` includes `cc`, `coreutils`, and `pkg-config`.
+   `PKG_CONFIG_PATH` is set from the host environment.
+
+For crates with a `links` attribute, the corresponding environment variable
+is set to tell the build script to use system libraries rather than vendoring
+its own copy. For example, `openssl-sys` (which has `links = "openssl"`) gets
+`OPENSSL_NO_VENDOR=1`, and `libz-sys` gets `LIBZ_SYS_USE_PKG_CONFIG=1`.
+These mappings come from a built-in table or
+`[workspace.metadata.schnee.sys-env]` overrides in `Cargo.toml`:
+
+```toml
+[workspace.metadata.schnee.sys-env]
+bzip2 = "BZIP2_SYS_USE_PKG_CONFIG"
+lzma = "LZMA_SYS_USE_PKG_CONFIG"
+```
+
+For each dependency with a `links` attribute, the build script run derivation
+reads that dependency's `$out/output` and exports
+`DEP_<LINKS>_<KEY>=<value>` for all non-directive key-value pairs. This
+implements cargo's
+[links](https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key)
+mechanism.
+
+### Derivation registration
+
+Once the derivation JSON for each `NixUnit` has been constructed, it must be
+written to the Nix store as a `.drv` file before Nix can build it. The
+straightforward approach would be to spawn `nix derivation add` once per
+derivation, but a typical build has hundreds of derivations and the subprocess
+overhead adds up. Instead, cargo-schnee registers derivations from within its
+own process by serializing, hashing, and talking to the Nix daemon directly.
+
+Derivation JSON is serialized to
+[ATerm](https://nixos.org/manual/nix/stable/protocols/derivation-aterm) format,
+Nix's internal `.drv` file format, producing byte-identical output to `nix
+derivation add`. Object keys are explicitly sorted at serialization time to
+ensure determinism regardless of the underlying JSON map implementation.
+
+The `.drv` store path is computed in-process using the same algorithm as Nix.
+The ATerm bytes are hashed with SHA-256, then a fingerprint string is built
+from the hash, the sorted references, and the store prefix. That fingerprint
+is hashed again, XOR-folded from 32 bytes to 20, and encoded in nix-base32
+to produce the final `/nix/store/<hash>-<name>.drv` path.
+
+If the `.drv` path already exists in the store, registration is skipped.
+Otherwise, the derivation is registered via the Nix daemon Unix socket at
+`/nix/var/nix/daemon-socket/socket` using the `wopAddTextToStore` operation,
+opcode 8. The daemon protocol uses u64 little-endian integers and
+length-prefixed strings padded to 8-byte boundaries. If the daemon connection
+fails, cargo-schnee falls back to spawning `nix derivation add` as a
+subprocess.
+
+Units are registered level-by-level in topological order. All units at the
+same depth can be registered in a single batch since their dependencies are
+already resolved.
+
+When cargo-schnee itself runs inside a Nix derivation, as is the case with
+`buildRustPackage` integration, the outer build must have
+`requiredSystemFeatures = [ "recursive-nix" ]` so that the inner process can
+access the Nix daemon socket from within the sandbox.
+
+### Build and output copy
+
+The root derivations are built via `nix-store --realise`. Nix resolves the
+CA placeholder references in each `.drv`, substituting the actual output paths
+once dependencies are built. Unchanged derivations are served from the Nix
+store cache.
+
+Output paths are copied from the Nix store to `target/debug/`, or
+`target/<profile>/` for non-dev profiles and `target/<triple>/<profile>/` for
+cross builds. Permissions are adjusted from the Nix store's read-only
+`0444`/`0555` to writable `0644`/`0755`.
+
+## Usage
+
+The recommended way to use cargo-schnee is through a cargo wrapper that
+transparently redirects `cargo build`, `cargo run`, `cargo test`, and
+`cargo bench` to their `cargo schnee` equivalents. The
+[simple example](examples/simple/) demonstrates this approach with a Nix
+flake that creates the wrapper via `makeCargoWrapper` and uses it in both a
+`devShell` and a `buildRustPackage` derivation:
+
+```nix
+let
+  schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
+    inherit pkgs rustToolchain;
+    cargo = lib.getExe' rustToolchain "cargo";
+    overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
+  };
+in {
+  devShells.default = pkgs.mkShell {
+    buildInputs = [ schneeToolchain pkgs.nix pkgs.pkg-config ];
+  };
+}
+```
+
+```sh
+# With the wrapper, regular cargo commands use cargo-schnee automatically.
+cargo build
+cargo build --release
+cargo build --profile bench
+
+# Or invoke cargo-schnee directly.
+cargo schnee build --manifest-path path/to/Cargo.toml
+
+# Verbose output (-vv for Nix build logs).
+cargo schnee build -vv --manifest-path examples/simple/Cargo.toml
+```
+
+### Cross-compilation
+
+The [cross example](examples/cross/) demonstrates cross-compiling to
+`aarch64-unknown-linux-gnu`. The key difference from a native build is using
+`pkgsCross` to get a `makeRustPlatform` whose `stdenv.hostPlatform` is the
+target architecture, and adding the cross-linker to the toolchain:
+
+```nix
+let
+  crossPkgs = pkgs.pkgsCross.aarch64-multiplatform;
+
+  rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+    targets = [ "aarch64-unknown-linux-gnu" ];
+  };
+
+  schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
+    inherit pkgs rustToolchain;
+    cargo = lib.getExe' rustToolchain "cargo";
+    overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
+  };
+
+  crossRustPlatform = crossPkgs.makeRustPlatform {
+    cargo = schneeToolchain;
+    rustc = schneeToolchain;
+  };
+in {
+  packages.default = crossRustPlatform.buildRustPackage { /* ... */ };
+}
+```
+
+### Custom `-sys` crate environment variables
+
+cargo-schnee has a built-in table that tells common `-sys` crates to use
+`pkg-config` (e.g. `LIBGIT2_NO_VENDOR=1`, `OPENSSL_NO_VENDOR=1`). For `-sys`
+crates not in the table, add a `[workspace.metadata.schnee.sys-env]` section to
+your `Cargo.toml`:
+
+```toml
+[workspace.metadata.schnee.sys-env]
+# links name = "ENV_VAR_TO_SET".
+bzip2 = "BZIP2_SYS_USE_PKG_CONFIG"
+lzma = "LZMA_SYS_USE_PKG_CONFIG"
+```
+
+The key is the crate's
+[`links`](https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key)
+value (from its `Cargo.toml`), and the value is the environment variable to set
+to `1` during the build script run.
+
+### Packaging with `buildRustPackage`
+
+cargo-schnee integrates with `buildRustPackage` by wrapping the `cargo` binary.
+The wrapper intercepts `cargo build` and redirects it to `cargo schnee build`,
+while forwarding all other subcommands to the real `cargo`:
+
+```nix
+# flake.nix.
+{
+  inputs = {
+    cargo-schnee.url = "github:poly2it/cargo-schnee";
+    # ...
+  };
+
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, cargo-schnee }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+
+        # Create a cargo wrapper that redirects build/run/test to cargo-schnee.
+        schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
+          inherit pkgs rustToolchain;
+          cargo = lib.getExe' rustToolchain "cargo";
+          overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
+        };
+
+        # Use the wrapper as both cargo and rustc in makeRustPlatform.
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = schneeToolchain;
+          rustc = schneeToolchain;
+        };
+      in {
+        packages.default = rustPlatform.buildRustPackage {
+          pname = "my-project";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.nix ];
+          requiredSystemFeatures = [ "recursive-nix" ];
+          NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
+          auditable = false;
+          doCheck = false;
+        };
+      }
+    );
+}
+```
+
+Key points:
+
+- `requiredSystemFeatures = [ "recursive-nix" ]`: cargo-schnee calls
+  `nix-store --realise` from within the sandbox
+- `NIX_CONFIG` enables CA derivations inside the build
+- `auditable = false` prevents `cargo-auditable` from wrapping cargo (which
+  would bypass the schnee wrapper)
+
+See [`examples/simple/flake.nix`](examples/simple/flake.nix) for a complete
+working example.
+
+### Debugging and profiling
+
+```sh
+# Dump the Nix derivation graph as a Mermaid flowchart to stdout.
+cargo schnee graph --manifest-path examples/simple/Cargo.toml
+
+# Dump the cargo-level unit graph as JSON to stdout.
+cargo schnee plan --manifest-path examples/simple/Cargo.toml
+
+# Write a per-derivation timing report to a file.
+cargo schnee build --write-profile-to profile.txt \
+    --manifest-path examples/simple/Cargo.toml
+```

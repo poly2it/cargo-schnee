@@ -1,0 +1,3 @@
+[workspace]
+members = ["bin-a", "bin-b", "shared-lib"]
+resolver = "2"

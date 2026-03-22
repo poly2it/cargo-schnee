@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  check:
+    name: Build, test, lint, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@c5a866b6ab867e88becbed4467b93592bce69f8a # v21
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes ca-derivations
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - run: nix flake check --print-build-logs
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@c5a866b6ab867e88becbed4467b93592bce69f8a # v21
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes dynamic-derivations ca-derivations recursive-nix
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - name: Run integration tests
+        run: nix develop --command bash -c "cargo test -- --ignored --test-threads=1"
