@@ -191,17 +191,26 @@ impl NixUnit {
     }
 
     /// Compute the output filename that rustc will produce for this unit.
+    ///
+    /// For `--extern` linking rustc needs the `.rlib` (which contains a
+    /// `.rustc` metadata section), not the `.so`.  Crates that declare
+    /// `crate-type = ["cdylib", "rlib"]` produce both; we must pick the rlib.
+    /// Proc-macros are the exception — they are loaded as shared objects.
     pub(crate) fn output_lib_filename(&self) -> String {
-        if self
-            .crate_types
-            .iter()
-            .any(|ct| ct == "proc-macro" || ct == "dylib" || ct == "cdylib")
-        {
-            format!("lib{}{}.so", self.crate_name, self.extra_filename)
-        } else if self.crate_types.iter().any(|ct| ct == "bin")
+        if self.crate_types.iter().any(|ct| ct == "bin")
             || self.kind == UnitKind::BuildScriptCompile
         {
             format!("{}{}", self.crate_name, self.extra_filename)
+        } else if self.crate_types.iter().any(|ct| ct == "proc-macro") {
+            format!("lib{}{}.so", self.crate_name, self.extra_filename)
+        } else if self.crate_types.iter().any(|ct| ct == "rlib" || ct == "lib") {
+            format!("lib{}{}.rlib", self.crate_name, self.extra_filename)
+        } else if self
+            .crate_types
+            .iter()
+            .any(|ct| ct == "dylib" || ct == "cdylib")
+        {
+            format!("lib{}{}.so", self.crate_name, self.extra_filename)
         } else {
             format!("lib{}{}.rlib", self.crate_name, self.extra_filename)
         }
