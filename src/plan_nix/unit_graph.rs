@@ -2,6 +2,7 @@ use super::util::sanitize_drv_name;
 use super::{NixUnit, UnitKind};
 use anyhow::Result;
 use cargo::core::compiler::{CompileKind, CompileMode, Unit};
+use cargo::core::FeatureValue;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -176,6 +177,79 @@ pub(super) fn extract_units_from_bcx(
                         })
                         .or_insert_with(|| dep_key.clone());
                 }
+            }
+        }
+
+        // Fix missing optional deps activated by features but absent from the
+        // unit graph edge list.  This happens when optional deps are declared
+        // under always-false platform gates like
+        // [target.'cfg(any())'.dependencies] — cargo omits the dependency edge
+        // even when a feature explicitly activates it via `dep:` syntax.
+        if kind != UnitKind::BuildScriptRun {
+            // Build a map of feature -> [(extern_name, dep_unit_key)] from the
+            // manifest's feature definitions and the full unit graph.
+            let mut feature_dep_activations: HashMap<String, Vec<(String, String)>> =
+                HashMap::new();
+            let summary = unit.pkg.manifest().summary();
+            for feat in &unit.features {
+                let fvs = match summary.features().get(feat) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                for fv in fvs {
+                    let dep_toml_name = match fv {
+                        FeatureValue::Dep { dep_name } => *dep_name,
+                        FeatureValue::DepFeature {
+                            dep_name,
+                            weak: false,
+                            ..
+                        } => *dep_name,
+                        _ => continue,
+                    };
+                    let extern_name = dep_toml_name.as_str().replace('-', "_");
+                    // Look up the actual crate name (may differ with
+                    // `package = "..."` in the dep spec).
+                    let pkg_name = unit
+                        .pkg
+                        .dependencies()
+                        .iter()
+                        .find(|d| d.name_in_toml() == dep_toml_name)
+                        .map(|d| d.package_name())
+                        .unwrap_or(dep_toml_name);
+                    // Find the matching lib Unit in the full graph.
+                    if let Some(candidate) = all_units.iter().find(|c| {
+                        c.pkg.name() == pkg_name
+                            && c.target.is_lib()
+                            && !c.target.is_custom_build()
+                            && c.mode != CompileMode::RunCustomBuild
+                    }) {
+                        let dep_key = key_map[candidate].clone();
+                        feature_dep_activations
+                            .entry(feat.to_string())
+                            .or_default()
+                            .push((extern_name, dep_key));
+                    } else {
+                        log::warn!(
+                            "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
+                            extern_name,
+                            dep_toml_name,
+                            key,
+                        );
+                    }
+                }
+            }
+
+            for (extern_name, dep_key) in
+                find_missing_feature_deps(&dep_extern_map, &features, &feature_dep_activations)
+            {
+                log::info!(
+                    "Adding missing optional dep {} -> {} for {} \
+                     (feature-activated, possibly behind platform gate)",
+                    extern_name,
+                    dep_key,
+                    key,
+                );
+                dep_extern_map.insert(extern_name, dep_key);
             }
         }
 
@@ -586,6 +660,37 @@ pub(super) fn toposort(
     }
 
     Ok(result)
+}
+
+/// Return `(extern_name, dep_key)` pairs for optional deps that are activated
+/// by features but missing from `dep_extern`.
+///
+/// This handles the case where an optional dependency is declared under an
+/// always-false platform gate (e.g. `[target.'cfg(any())'.dependencies]`) and
+/// Cargo omits the unit-graph edge even though a feature explicitly activates
+/// the dep via `dep:` syntax.
+///
+/// `feature_dep_activations` maps each enabled feature name to the list of
+/// `(extern_name, dep_unit_key)` pairs it can provide.  Only entries whose
+/// `extern_name` is absent from `dep_extern` are returned.
+fn find_missing_feature_deps(
+    dep_extern: &HashMap<String, String>,
+    enabled_features: &[String],
+    feature_dep_activations: &HashMap<String, Vec<(String, String)>>,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for feat in enabled_features {
+        if let Some(activations) = feature_dep_activations.get(feat) {
+            for (extern_name, dep_key) in activations {
+                if !dep_extern.contains_key(extern_name)
+                    && !result.iter().any(|(e, _)| e == extern_name)
+                {
+                    result.push((extern_name.clone(), dep_key.clone()));
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Compute a grouping key for feature unification.  Two NixUnits with the same
@@ -1136,5 +1241,93 @@ mod tests {
         let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
         let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
         assert_eq!(a, b);
+    }
+
+    // -- find_missing_feature_deps (cfg(any()) optional dep fix) ---------------
+
+    #[test]
+    fn missing_feature_deps_adds_cfg_any_dep() {
+        // Simulate indexmap: features=["serde"] activates dep:serde_core and
+        // dep:serde, but cargo omits both from the unit graph because serde is
+        // under [target.'cfg(any())'.dependencies].
+        let mut dep_extern = HashMap::new();
+        dep_extern.insert("equivalent".into(), "equivalent-key".into());
+        dep_extern.insert("hashbrown".into(), "hashbrown-key".into());
+
+        let features = vec!["default".into(), "std".into(), "serde".into()];
+
+        let mut activations = HashMap::new();
+        activations.insert(
+            "serde".into(),
+            vec![
+                ("serde_core".into(), "serde-core-key".into()),
+                ("serde".into(), "serde-key".into()),
+            ],
+        );
+
+        let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
+
+        assert_eq!(additions.len(), 2, "both serde and serde_core should be added");
+        assert!(
+            additions.iter().any(|(e, k)| e == "serde" && k == "serde-key"),
+            "serde should be added"
+        );
+        assert!(
+            additions
+                .iter()
+                .any(|(e, k)| e == "serde_core" && k == "serde-core-key"),
+            "serde_core should be added"
+        );
+    }
+
+    #[test]
+    fn missing_feature_deps_skips_already_present() {
+        // If serde is already in dep_extern (normal case without cfg(any())),
+        // no additions should be made.
+        let mut dep_extern = HashMap::new();
+        dep_extern.insert("serde".into(), "serde-key".into());
+
+        let features = vec!["serde".into()];
+        let mut activations = HashMap::new();
+        activations.insert(
+            "serde".into(),
+            vec![("serde".into(), "serde-different-key".into())],
+        );
+
+        let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
+        assert!(
+            additions.is_empty(),
+            "should not duplicate a dep that already exists"
+        );
+    }
+
+    #[test]
+    fn missing_feature_deps_noop_when_no_dep_features() {
+        let dep_extern = HashMap::new();
+        let features = vec!["default".into(), "std".into()];
+        let activations = HashMap::new();
+
+        let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
+        assert!(additions.is_empty());
+    }
+
+    #[test]
+    fn missing_feature_deps_no_duplicate_across_features() {
+        // Two features both activate the same dep — it should only appear once.
+        let dep_extern = HashMap::new();
+        let features = vec!["feat_a".into(), "feat_b".into()];
+        let mut activations = HashMap::new();
+        activations.insert(
+            "feat_a".into(),
+            vec![("serde".into(), "serde-key".into())],
+        );
+        activations.insert(
+            "feat_b".into(),
+            vec![("serde".into(), "serde-key-alt".into())],
+        );
+
+        let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
+        assert_eq!(additions.len(), 1, "serde should appear only once");
+        assert_eq!(additions[0].0, "serde");
     }
 }
