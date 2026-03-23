@@ -377,6 +377,56 @@ fn github_just_workspace() {
     );
 }
 
+// Verify that the pre-flight system library check emits a warning when a
+// -sys crate's `links` value isn't discoverable via pkg-config.
+#[test]
+#[ignore]
+fn fixture_sys_lib_check_warning() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sys-lib-check");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    let (_stdout, stderr) = run_schnee_build(&manifest);
+
+    // The fake-sys crate declares `links = "nonexistent_test_lib_xyz"` which
+    // cannot exist in any pkg-config database.  cargo-schnee should warn.
+    assert!(
+        stderr.contains("nonexistent_test_lib_xyz"),
+        "Expected warning about missing system library 'nonexistent_test_lib_xyz' in stderr:\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("not found via pkg-config"),
+        "Expected actionable pkg-config hint in stderr:\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("buildInputs"),
+        "Expected buildInputs suggestion in stderr:\n{}",
+        stderr,
+    );
+
+    // The build should still succeed (build script is a no-op).
+    let binary = fixture_dir.join("target/debug/sys-lib-check-app");
+    assert!(
+        binary.exists(),
+        "Binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lib=fake-sys"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 // Cross-compilation: build minimal-bin for aarch64-unknown-linux-gnu.
 // Requires a Rust toolchain with aarch64 target and aarch64-linux-gnu cross-linker.
 #[test]

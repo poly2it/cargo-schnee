@@ -1,0 +1,5 @@
+[package]
+name = "fake-sys"
+version = "0.1.0"
+edition = "2021"
+links = "nonexistent_test_lib_xyz"

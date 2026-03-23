@@ -1,0 +1,3 @@
+[workspace]
+members = ["app", "fake-sys"]
+resolver = "2"

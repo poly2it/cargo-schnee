@@ -1,0 +1,7 @@
+[package]
+name = "sys-lib-check-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fake-sys = { path = "../fake-sys" }

@@ -276,6 +276,58 @@ fn read_custom_sys_env(manifest_path: &Path) -> Vec<(String, String)> {
     }
 }
 
+/// Check whether system libraries required by -sys crates are discoverable via
+/// pkg-config.  Emits warnings for missing libraries — never errors, since some
+/// -sys crates bundle their native code and don't need external packages.
+fn check_system_libraries(
+    nix_units: &[NixUnit],
+    pkg_config_bin: &Option<String>,
+    pkg_config_path_env: &str,
+) {
+    let pc_bin = match pkg_config_bin {
+        Some(bin) => bin,
+        None => return, // can't validate without pkg-config
+    };
+
+    // Collect unique (links_name, pkg_name) pairs from -sys crates.
+    let mut seen = std::collections::HashSet::new();
+    let mut checks: Vec<(&str, &str)> = Vec::new();
+    for u in nix_units {
+        if let Some(ref links) = u.links {
+            if seen.insert(links.as_str()) {
+                let pkg_name = u
+                    .cargo_envs
+                    .iter()
+                    .find(|(k, _)| k == "CARGO_PKG_NAME")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or(&u.crate_name);
+                checks.push((links.as_str(), pkg_name));
+            }
+        }
+    }
+
+    for &(links_name, pkg_name) in &checks {
+        let ok = std::process::Command::new(pc_bin)
+            .arg("--exists")
+            .arg(links_name)
+            .env("PKG_CONFIG_PATH", pkg_config_path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !ok {
+            log::warn!(
+                "System library '{}' (needed by {}) not found via pkg-config. \
+                 Add the corresponding package to buildInputs to make it available.",
+                links_name,
+                pkg_name,
+            );
+        }
+    }
+}
+
 /// Run the plan-nix pipeline: extract unit graph, add derivations, emit root .drv.
 ///
 /// Derivation `.drv` paths are computed in-process (ATerm serialization + store path hash).
@@ -646,6 +698,9 @@ pub fn run_plan_nix(
             }
         }
     }
+
+    // Pre-flight: warn about system libraries that pkg-config can't find.
+    check_system_libraries(&nix_units, &pkg_config_bin, &pkg_config_path_env);
 
     // Build key→index map for looking up dep info
     let key_to_idx: HashMap<String, usize> = nix_units
