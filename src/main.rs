@@ -301,7 +301,7 @@ fn add_to_nix_store(path: &str) -> Result<String> {
 
 /// Strip `../` prefixes from a relative path to produce an in-tree name.
 /// Mirrors `sanitiseName` in `buildPackage.nix`.
-/// e.g. `../skeptiva-openrpc` → `skeptiva-openrpc`, `../../foo/bar` → `foo/bar`
+/// e.g. `../my-lib` → `my-lib`, `../../foo/bar` → `foo/bar`
 fn sanitise_extra_source_name(rel_path: &str) -> Result<String> {
     let stripped = rel_path.replace("../", "");
     if stripped == rel_path || stripped.is_empty() {
@@ -348,7 +348,7 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
 ///
 /// Uses cargo's `Workspace` to enumerate members, then parses each manifest
 /// for `path = "..."` entries. Returns a map from canonical absolute path
-/// to the sanitised in-tree name (e.g. `../skeptiva-openrpc` → `skeptiva-openrpc`).
+/// to the sanitised in-tree name (e.g. `../my-lib` → `my-lib`).
 fn find_external_path_deps(project_dir: &Path) -> Result<HashMap<PathBuf, String>> {
     let manifest_path = project_dir.join("Cargo.toml");
     let gctx = GlobalContext::default()?;
@@ -531,7 +531,6 @@ fn rewrite_cargo_tomls(
     mappings: &HashMap<PathBuf, String>,
 ) -> Result<()> {
     let pattern = format!("{}/**/Cargo.toml", dest.display());
-    // Also include the root Cargo.toml (glob ** doesn't always match root level)
     let root_toml = dest.join("Cargo.toml");
 
     let mut toml_paths: Vec<PathBuf> = glob::glob(&pattern)
@@ -580,32 +579,16 @@ fn rewrite_cargo_tomls(
         }
 
         // [workspace.dependencies]
-        if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut()) {
-            if let Some(table) = ws.get_mut("dependencies").and_then(|v| v.as_table_mut()) {
-                changed |= rewrite_paths_in_table(
-                    table,
-                    &original_manifest_dir,
-                    dest_manifest_dir,
-                    dest,
-                    mappings,
-                );
-            }
-
-            // Update [workspace].exclude
-            if toml_path == &root_toml {
-                let exclude = ws
-                    .entry("exclude")
-                    .or_insert(toml::Value::Array(Vec::new()));
-                if let Some(arr) = exclude.as_array_mut() {
-                    for sanitised in mappings.values() {
-                        let val = toml::Value::String(sanitised.clone());
-                        if !arr.contains(&val) {
-                            arr.push(val);
-                            changed = true;
-                        }
-                    }
-                }
-            }
+        if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut())
+            && let Some(table) = ws.get_mut("dependencies").and_then(|v| v.as_table_mut())
+        {
+            changed |= rewrite_paths_in_table(
+                table,
+                &original_manifest_dir,
+                dest_manifest_dir,
+                dest,
+                mappings,
+            );
         }
 
         // [target.*.deps]
@@ -650,6 +633,51 @@ fn rewrite_cargo_tomls(
         }
     }
 
+    // Update [workspace].exclude in root Cargo.toml separately to avoid
+    // symlink-resolved path comparison issues with glob results.
+    update_workspace_exclude(&root_toml, mappings)?;
+
+    Ok(())
+}
+
+/// Add external dep directory names to `[workspace].exclude` in the root
+/// Cargo.toml so that workspace globs (e.g. `members = ["*"]`) don't try
+/// to treat them as workspace members.
+fn update_workspace_exclude(root_toml: &Path, mappings: &HashMap<PathBuf, String>) -> Result<()> {
+    if !root_toml.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(root_toml)?;
+    let mut doc: toml::Value = match toml::from_str(&content) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let mut changed = false;
+    if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut()) {
+        let exclude = ws
+            .entry("exclude")
+            .or_insert(toml::Value::Array(Vec::new()));
+        if let Some(arr) = exclude.as_array_mut() {
+            // Collect unique top-level directory names from sanitised paths.
+            // e.g. "my-lib/sub" → "my-lib"
+            let mut seen = std::collections::HashSet::new();
+            for sanitised in mappings.values() {
+                let top_dir = sanitised.split('/').next().unwrap_or(sanitised).to_string();
+                if seen.insert(top_dir.clone()) {
+                    let val = toml::Value::String(top_dir);
+                    if !arr.contains(&val) {
+                        arr.push(val);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        std::fs::write(root_toml, toml::to_string(&doc)?)?;
+    }
     Ok(())
 }
 
@@ -2116,6 +2144,106 @@ version = "1.2.3"
             names.contains(&&"external-dep-lib".to_string()),
             "expected 'external-dep-lib' in {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn update_workspace_exclude_adds_top_level_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_toml = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &root_toml,
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"target\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(PathBuf::from("/abs/my-lib"), "my-lib".to_string());
+        mappings.insert(PathBuf::from("/abs/other"), "other/sub".to_string());
+
+        update_workspace_exclude(&root_toml, &mappings).unwrap();
+
+        let content = std::fs::read_to_string(&root_toml).unwrap();
+        let doc: toml::Value = toml::from_str(&content).unwrap();
+        let exclude = doc["workspace"]["exclude"].as_array().unwrap();
+        let exclude_strs: Vec<&str> = exclude.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            exclude_strs.contains(&"target"),
+            "should preserve existing excludes: {:?}",
+            exclude_strs
+        );
+        assert!(
+            exclude_strs.contains(&"my-lib"),
+            "should add top-level dir: {:?}",
+            exclude_strs
+        );
+        // "other/sub" should be excluded as "other" (top-level component only)
+        assert!(
+            exclude_strs.contains(&"other"),
+            "should use top-level component, not full path: {:?}",
+            exclude_strs
+        );
+        assert!(
+            !exclude_strs.contains(&"other/sub"),
+            "should NOT use full sanitised path: {:?}",
+            exclude_strs
+        );
+    }
+
+    #[test]
+    fn rewrite_cargo_tomls_with_workspace_glob() {
+        // Simulates the scenario: workspace with members=["*"], an external
+        // dep directory copied into the tree. Without proper exclude, cargo
+        // would try to load it as a workspace member and fail.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let project_dir = dir.path(); // project_dir == dest for this test
+
+        // Root workspace Cargo.toml with glob members
+        std::fs::write(
+            dest.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"target\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        // A member crate with an external path dep
+        std::fs::create_dir_all(dest.join("app/src")).unwrap();
+        std::fs::write(
+            dest.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nmy-lib = { path = \"../../my-lib\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dest.join("app/src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Simulate the external dep already copied in
+        std::fs::create_dir_all(dest.join("my-lib/src")).unwrap();
+        std::fs::write(
+            dest.join("my-lib/Cargo.toml"),
+            "[package]\nname = \"my-lib\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(dest.join("my-lib/src/lib.rs"), "").unwrap();
+
+        // Build mappings: canonical path -> sanitised name
+        let canonical = project_dir.join("../../my-lib").canonicalize().unwrap_or(
+            // In test, the path doesn't exist on disk, so use the resolved path directly
+            project_dir.join("../../my-lib"),
+        );
+        let mut mappings = HashMap::new();
+        mappings.insert(canonical, "my-lib".to_string());
+
+        rewrite_cargo_tomls(dest, project_dir, &mappings).unwrap();
+
+        // Verify [workspace].exclude contains "my-lib"
+        let root_content = std::fs::read_to_string(dest.join("Cargo.toml")).unwrap();
+        let root_doc: toml::Value = toml::from_str(&root_content).unwrap();
+        let exclude = root_doc["workspace"]["exclude"].as_array().unwrap();
+        let exclude_strs: Vec<&str> = exclude.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            exclude_strs.contains(&"my-lib"),
+            "workspace.exclude should contain 'my-lib': {:?}",
+            exclude_strs
         );
     }
 }

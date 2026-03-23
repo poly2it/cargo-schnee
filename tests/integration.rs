@@ -473,6 +473,37 @@ fn fixture_external_path_dep() {
     );
 }
 
+/// Workspace with `members = ["*"]` and an external path dependency.
+/// This catches regressions where external deps copied into the store tree
+/// are matched by the workspace glob but not excluded, causing cargo to
+/// fail loading them as workspace members.
+#[test]
+#[ignore]
+fn fixture_workspace_glob_external() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob-external");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    // Verify the binary was produced
+    let binary = fixture_dir.join("target/debug/app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    // Verify it runs and uses the external lib
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from external-dep-lib"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Example tests
 // ---------------------------------------------------------------------------
