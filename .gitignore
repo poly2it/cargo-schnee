@@ -1,7 +1,7 @@
 /target
 /.cargo-schnee
 /examples/*/target
-/tests/fixtures/*/target
+/tests/fixtures/**/target
 /tests/repos/
 .cargo-vendor/
 .direnv

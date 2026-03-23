@@ -504,6 +504,63 @@ fn fixture_workspace_glob_external() {
     );
 }
 
+/// Same as fixture_workspace_glob_external but invoked from the member's
+/// manifest instead of the workspace root. Catches the bug where Cargo.lock
+/// isn't found because it lives at the workspace root, not in the member dir.
+#[test]
+#[ignore]
+fn fixture_workspace_glob_external_from_member() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob-external");
+    let manifest = fixture_dir.join("app/Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from external-dep-lib"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// External path dep pointing at a sub-crate inside another workspace.
+/// The sub-crate inherits `edition.workspace = true` from its parent workspace
+/// root. cargo-schnee must copy the entire external workspace (not just the
+/// sub-crate) so that workspace inheritance still resolves.
+#[test]
+#[ignore]
+fn fixture_external_ws_subcrate() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-ws-subcrate");
+    let manifest = fixture_dir.join("project/Cargo.toml");
+
+    clean_target(&fixture_dir.join("project"));
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("project/target/debug/ws-subcrate-project");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from sub-crate"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Example tests
 // ---------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+[package]
+name = "ws-subcrate-project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sub-crate = { path = "../sibling-ws/sub-crate" }
+
+[workspace]

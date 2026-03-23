@@ -253,6 +253,41 @@ fn resolve_manifest(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// Resolve the workspace root directory from a manifest path.
+/// If the manifest is a workspace member, walks up to find the workspace root.
+/// Falls back to the manifest's parent directory if no workspace root is found.
+fn resolve_workspace_root(manifest_path: &Path) -> Result<PathBuf> {
+    let gctx = GlobalContext::default()?;
+    match Workspace::new(manifest_path, &gctx) {
+        Ok(ws) => Ok(ws.root().to_path_buf()),
+        Err(_) => manifest_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory")),
+    }
+}
+
+/// Find `Cargo.lock` by checking `project_dir` first, then walking up to
+/// the workspace root. In workspace members the lockfile lives at the root.
+fn find_lockfile(project_dir: &Path) -> Result<PathBuf> {
+    let local = project_dir.join("Cargo.lock");
+    if local.exists() {
+        return Ok(local);
+    }
+    // Walk up looking for Cargo.lock next to a workspace-root Cargo.toml
+    let mut dir = project_dir.to_path_buf();
+    while let Some(parent) = dir.parent() {
+        dir = parent.to_path_buf();
+        let candidate = dir.join("Cargo.lock");
+        let manifest = dir.join("Cargo.toml");
+        if candidate.exists() && manifest.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fall back to the original path so the existing error message is preserved
+    Ok(local)
+}
+
 /// Read the binary target name from Cargo.toml (defaults to package name).
 fn read_bin_target_name(manifest_path: &Path) -> Result<String> {
     let content = std::fs::read_to_string(manifest_path)?;
@@ -469,6 +504,10 @@ fn collect_external_path_deps(
 }
 
 /// Inspect a single dependency table for path deps outside the project.
+///
+/// When a dep is a sub-crate inside an external workspace (i.e. the sub-crate
+/// inherits workspace properties), the entire workspace root is added to the
+/// map so that workspace inheritance still resolves in the store tree.
 fn collect_external_from_table(
     table: &toml::value::Table,
     manifest_dir: &Path,
@@ -484,13 +523,54 @@ fn collect_external_from_table(
         let resolved = manifest_dir.join(path_str);
         let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
         if !canonical.starts_with(project_canonical) {
-            let rel = relative_path(project_dir, &canonical);
-            let rel_str = rel.to_string_lossy();
-            if let Ok(sanitised) = sanitise_extra_source_name(&rel_str) {
-                external.entry(canonical).or_insert(sanitised);
+            // Check if this dep is inside an external workspace.
+            // If so, copy the entire workspace root to preserve inheritance.
+            if let Some(ws_root) = find_enclosing_workspace_root(&canonical, project_canonical) {
+                let ws_rel = relative_path(project_dir, &ws_root);
+                let ws_rel_str = ws_rel.to_string_lossy();
+                if let Ok(ws_sanitised) = sanitise_extra_source_name(&ws_rel_str) {
+                    // Map the workspace root for copying
+                    external
+                        .entry(ws_root.clone())
+                        .or_insert(ws_sanitised.clone());
+                    // Map the dep path for rewriting (sub-path within the workspace)
+                    if canonical != ws_root {
+                        let sub_path = canonical.strip_prefix(&ws_root).unwrap_or(Path::new(""));
+                        let dep_sanitised =
+                            format!("{}/{}", ws_sanitised, sub_path.to_string_lossy());
+                        external.entry(canonical).or_insert(dep_sanitised);
+                    }
+                }
+            } else {
+                let rel = relative_path(project_dir, &canonical);
+                let rel_str = rel.to_string_lossy();
+                if let Ok(sanitised) = sanitise_extra_source_name(&rel_str) {
+                    external.entry(canonical).or_insert(sanitised);
+                }
             }
         }
     }
+}
+
+/// Check if `path` is a sub-crate inside a workspace by looking at the
+/// immediate parent directory for a `Cargo.toml` with a `[workspace]` section.
+/// Returns the workspace root directory if found.
+fn find_enclosing_workspace_root(path: &Path, _stop_at: &Path) -> Option<PathBuf> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    let parent = dir.parent()?;
+    let manifest = parent.join("Cargo.toml");
+    if manifest.exists()
+        && let Ok(content) = std::fs::read_to_string(&manifest)
+        && let Ok(doc) = toml::from_str::<toml::Value>(&content)
+        && doc.get("workspace").is_some()
+    {
+        return Some(parent.to_path_buf());
+    }
+    None
 }
 
 /// Copy git-tracked files from an external source directory into `dest`.
@@ -783,7 +863,17 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
 
     // Copy external path deps into the store tree and rewrite Cargo.toml paths
     if !external_deps.is_empty() {
+        // Collect all source roots so we can skip sub-paths already covered
+        // by a workspace root copy (e.g. don't copy sub-crate/ separately
+        // when its parent workspace/ is already being copied).
+        let roots: Vec<&PathBuf> = external_deps.keys().collect();
         for (abs_path, sanitised) in &external_deps {
+            let dominated = roots
+                .iter()
+                .any(|r| *r != abs_path && abs_path.starts_with(r));
+            if dominated {
+                continue;
+            }
             let ext_dest = dest.join(sanitised);
             copy_source_to_dest(abs_path, &ext_dest)
                 .with_context(|| format!("Failed to copy extra source: {}", abs_path.display()))?;
@@ -1202,9 +1292,8 @@ fn run_build_pipeline(
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
-    let project_dir = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory"))?;
+    let project_dir_buf = resolve_workspace_root(&manifest_path)?;
+    let project_dir = project_dir_buf.as_path();
 
     let profile = if release {
         plan_nix::ProfileConfig::release()
@@ -1233,7 +1322,7 @@ fn run_build_pipeline(
 
     // Vendor dependencies — skip if Cargo.lock hasn't changed
     let vendor_start = Instant::now();
-    let lockfile_path = project_dir.join("Cargo.lock");
+    let lockfile_path = find_lockfile(project_dir)?;
     let lockfile_hash = hash_file(&lockfile_path)?;
     let vendor_store = if let Some(dir) = vendor_dir {
         let dir = dir
