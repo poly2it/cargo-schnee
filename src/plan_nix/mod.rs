@@ -297,16 +297,16 @@ fn check_system_libraries(
     let mut seen = std::collections::HashSet::new();
     let mut checks: Vec<(&str, &str)> = Vec::new();
     for u in nix_units {
-        if let Some(ref links) = u.links {
-            if seen.insert(links.as_str()) {
-                let pkg_name = u
-                    .cargo_envs
-                    .iter()
-                    .find(|(k, _)| k == "CARGO_PKG_NAME")
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or(&u.crate_name);
-                checks.push((links.as_str(), pkg_name));
-            }
+        if let Some(ref links) = u.links
+            && seen.insert(links.as_str())
+        {
+            let pkg_name = u
+                .cargo_envs
+                .iter()
+                .find(|(k, _)| k == "CARGO_PKG_NAME")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or(&u.crate_name);
+            checks.push((links.as_str(), pkg_name));
         }
     }
 
