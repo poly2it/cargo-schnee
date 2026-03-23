@@ -2104,6 +2104,7 @@ version = "1.2.3"
     }
 
     #[test]
+    #[ignore] // requires tests/fixtures/ which is not in the Nix build source
     fn find_external_path_deps_fixture() {
         let fixture_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-path-dep");
