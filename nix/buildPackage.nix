@@ -92,7 +92,8 @@ let
   detectedPname =
     if package != null then package
     else effectiveCargoToml.package.name or "unknown";
-  detectedVersion = effectiveCargoToml.package.version or "0.1.0";
+  rawVersion = effectiveCargoToml.package.version or null;
+  detectedVersion = if builtins.isString rawVersion then rawVersion else "0.1.0";
   finalPname = if pname != null then pname else detectedPname;
   finalVersion = if version != null then version else detectedVersion;
 
@@ -224,7 +225,7 @@ in
     inherit buildType;
     inherit cargoBuildFlags;
     inherit installPhase;
-    inherit preBuild postBuild meta;
+    inherit preBuild postBuild postInstall meta;
 
     nativeBuildInputs = [ pkgs.nix ]
       ++ nativeBuildInputs
