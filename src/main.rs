@@ -12,6 +12,7 @@ mod plan_nix;
 mod shell;
 
 use anyhow::{Context, Result};
+use cargo::core::Workspace;
 use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
@@ -298,18 +299,417 @@ fn add_to_nix_store(path: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+/// Strip `../` prefixes from a relative path to produce an in-tree name.
+/// Mirrors `sanitiseName` in `buildPackage.nix`.
+/// e.g. `../skeptiva-openrpc` → `skeptiva-openrpc`, `../../foo/bar` → `foo/bar`
+fn sanitise_extra_source_name(rel_path: &str) -> Result<String> {
+    let stripped = rel_path.replace("../", "");
+    if stripped == rel_path || stripped.is_empty() {
+        anyhow::bail!(
+            "Extra source path must contain '../' components: {}",
+            rel_path
+        );
+    }
+    Ok(stripped)
+}
+
+/// Compute a relative path from `from` directory to `to` path.
+/// Both must be absolute (or at least share a common prefix).
+fn relative_path(from: &Path, to: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+
+    // Find common prefix length
+    let common = from_components
+        .iter()
+        .zip(to_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    // Go up for each remaining component in `from`
+    for _ in &from_components[common..] {
+        result.push(Component::ParentDir);
+    }
+    // Append remaining components of `to`
+    for c in &to_components[common..] {
+        result.push(c);
+    }
+    if result.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        result
+    }
+}
+
+/// Discover path dependencies that live outside `project_dir`.
+///
+/// Uses cargo's `Workspace` to enumerate members, then parses each manifest
+/// for `path = "..."` entries. Returns a map from canonical absolute path
+/// to the sanitised in-tree name (e.g. `../skeptiva-openrpc` → `skeptiva-openrpc`).
+fn find_external_path_deps(project_dir: &Path) -> Result<HashMap<PathBuf, String>> {
+    let manifest_path = project_dir.join("Cargo.toml");
+    let gctx = GlobalContext::default()?;
+    let ws = Workspace::new(&manifest_path, &gctx)?;
+
+    let project_canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
+    let mut manifests = vec![manifest_path.clone()];
+    for pkg in ws.members() {
+        let p = pkg.manifest_path().to_path_buf();
+        if p != manifest_path {
+            manifests.push(p);
+        }
+    }
+
+    let mut external: HashMap<PathBuf, String> = HashMap::new();
+    for manifest in &manifests {
+        let content = match std::fs::read_to_string(manifest) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let manifest_dir = manifest.parent().unwrap();
+        collect_external_path_deps(
+            &doc,
+            manifest_dir,
+            &project_canonical,
+            project_dir,
+            &mut external,
+        );
+    }
+
+    if !external.is_empty() {
+        log::info!(
+            "Found {} external path dep(s): {:?}",
+            external.len(),
+            external.values().collect::<Vec<_>>()
+        );
+    }
+    Ok(external)
+}
+
+/// Walk all dependency tables in a parsed Cargo.toml and collect path deps
+/// that resolve to directories outside `project_dir`.
+fn collect_external_path_deps(
+    doc: &toml::Value,
+    manifest_dir: &Path,
+    project_canonical: &Path,
+    project_dir: &Path,
+    external: &mut HashMap<PathBuf, String>,
+) {
+    let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    // Top-level dep sections
+    for section in &dep_sections {
+        if let Some(table) = doc.get(section).and_then(|v| v.as_table()) {
+            collect_external_from_table(
+                table,
+                manifest_dir,
+                project_canonical,
+                project_dir,
+                external,
+            );
+        }
+    }
+
+    // [workspace.dependencies]
+    if let Some(ws) = doc.get("workspace").and_then(|v| v.as_table())
+        && let Some(table) = ws.get("dependencies").and_then(|v| v.as_table())
+    {
+        collect_external_from_table(
+            table,
+            manifest_dir,
+            project_canonical,
+            project_dir,
+            external,
+        );
+    }
+
+    // [target.*.{dependencies,dev-dependencies,build-dependencies}]
+    if let Some(target) = doc.get("target").and_then(|v| v.as_table()) {
+        for (_, target_val) in target {
+            if let Some(target_table) = target_val.as_table() {
+                for section in &dep_sections {
+                    if let Some(table) = target_table.get(*section).and_then(|v| v.as_table()) {
+                        collect_external_from_table(
+                            table,
+                            manifest_dir,
+                            project_canonical,
+                            project_dir,
+                            external,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // [patch.*]
+    if let Some(patch) = doc.get("patch").and_then(|v| v.as_table()) {
+        for (_, source_table) in patch {
+            if let Some(table) = source_table.as_table() {
+                collect_external_from_table(
+                    table,
+                    manifest_dir,
+                    project_canonical,
+                    project_dir,
+                    external,
+                );
+            }
+        }
+    }
+}
+
+/// Inspect a single dependency table for path deps outside the project.
+fn collect_external_from_table(
+    table: &toml::value::Table,
+    manifest_dir: &Path,
+    project_canonical: &Path,
+    project_dir: &Path,
+    external: &mut HashMap<PathBuf, String>,
+) {
+    for (_, dep_val) in table {
+        let path_str = match dep_val.get("path").and_then(|p| p.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let resolved = manifest_dir.join(path_str);
+        let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        if !canonical.starts_with(project_canonical) {
+            let rel = relative_path(project_dir, &canonical);
+            let rel_str = rel.to_string_lossy();
+            if let Ok(sanitised) = sanitise_extra_source_name(&rel_str) {
+                external.entry(canonical).or_insert(sanitised);
+            }
+        }
+    }
+}
+
+/// Copy git-tracked files from an external source directory into `dest`.
+fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
+    let files = collect_git_files(source_dir)?;
+    match files {
+        Some(files) => {
+            for file in &files {
+                let src_path = source_dir.join(file);
+                let dest_path = dest.join(file);
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if src_path.is_file() {
+                    std::fs::copy(&src_path, &dest_path)
+                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
+                }
+            }
+            log::info!(
+                "Extra source copy: {} files from {}",
+                files.len(),
+                source_dir.display()
+            );
+        }
+        None => {
+            copy_dir_excluding(source_dir, dest, &["target", ".git", ".direnv", "result"])?;
+            log::info!("Extra source copy (no git): {}", source_dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite path dependencies in all Cargo.toml files under `dest` so that
+/// external deps point to their new in-tree locations.
+fn rewrite_cargo_tomls(
+    dest: &Path,
+    project_dir: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> Result<()> {
+    let pattern = format!("{}/**/Cargo.toml", dest.display());
+    // Also include the root Cargo.toml (glob ** doesn't always match root level)
+    let root_toml = dest.join("Cargo.toml");
+
+    let mut toml_paths: Vec<PathBuf> = glob::glob(&pattern)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    if root_toml.exists() && !toml_paths.contains(&root_toml) {
+        toml_paths.push(root_toml.clone());
+    }
+
+    let project_canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
+    for toml_path in &toml_paths {
+        let content = std::fs::read_to_string(toml_path)?;
+        let mut doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // Determine the original manifest dir for path resolution
+        let rel_in_dest = toml_path.strip_prefix(dest).unwrap_or(Path::new(""));
+        let original_manifest_dir = project_canonical
+            .join(rel_in_dest)
+            .parent()
+            .unwrap_or(&project_canonical)
+            .to_path_buf();
+        let dest_manifest_dir = toml_path.parent().unwrap();
+
+        let mut changed = false;
+        let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+        // Top-level dep sections
+        for section in &dep_sections {
+            if let Some(table) = doc.get_mut(section).and_then(|v| v.as_table_mut()) {
+                changed |= rewrite_paths_in_table(
+                    table,
+                    &original_manifest_dir,
+                    dest_manifest_dir,
+                    dest,
+                    mappings,
+                );
+            }
+        }
+
+        // [workspace.dependencies]
+        if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut()) {
+            if let Some(table) = ws.get_mut("dependencies").and_then(|v| v.as_table_mut()) {
+                changed |= rewrite_paths_in_table(
+                    table,
+                    &original_manifest_dir,
+                    dest_manifest_dir,
+                    dest,
+                    mappings,
+                );
+            }
+
+            // Update [workspace].exclude
+            if toml_path == &root_toml {
+                let exclude = ws
+                    .entry("exclude")
+                    .or_insert(toml::Value::Array(Vec::new()));
+                if let Some(arr) = exclude.as_array_mut() {
+                    for sanitised in mappings.values() {
+                        let val = toml::Value::String(sanitised.clone());
+                        if !arr.contains(&val) {
+                            arr.push(val);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // [target.*.deps]
+        if let Some(target) = doc.get_mut("target").and_then(|v| v.as_table_mut()) {
+            for (_, target_val) in target.iter_mut() {
+                if let Some(target_table) = target_val.as_table_mut() {
+                    for section in &dep_sections {
+                        if let Some(table) = target_table
+                            .get_mut(*section)
+                            .and_then(|v| v.as_table_mut())
+                        {
+                            changed |= rewrite_paths_in_table(
+                                table,
+                                &original_manifest_dir,
+                                dest_manifest_dir,
+                                dest,
+                                mappings,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // [patch.*]
+        if let Some(patch) = doc.get_mut("patch").and_then(|v| v.as_table_mut()) {
+            for (_, source_table) in patch.iter_mut() {
+                if let Some(table) = source_table.as_table_mut() {
+                    changed |= rewrite_paths_in_table(
+                        table,
+                        &original_manifest_dir,
+                        dest_manifest_dir,
+                        dest,
+                        mappings,
+                    );
+                }
+            }
+        }
+
+        if changed {
+            std::fs::write(toml_path, toml::to_string(&doc)?)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Rewrite `path = "..."` entries in a single dependency table.
+/// Returns true if any entry was modified.
+fn rewrite_paths_in_table(
+    table: &mut toml::value::Table,
+    original_manifest_dir: &Path,
+    dest_manifest_dir: &Path,
+    dest: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> bool {
+    let mut changed = false;
+    for (_, dep_val) in table.iter_mut() {
+        let dep_table = match dep_val.as_table_mut() {
+            Some(t) => t,
+            None => continue,
+        };
+        let path_str = match dep_table.get("path").and_then(|p| p.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let resolved = original_manifest_dir.join(&path_str);
+        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        if let Some(sanitised) = mappings.get(&canonical) {
+            let target_in_dest = dest.join(sanitised);
+            let new_rel = relative_path(dest_manifest_dir, &target_in_dest);
+            dep_table.insert(
+                "path".into(),
+                toml::Value::String(new_rel.to_string_lossy().into_owned()),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Add the project source to the Nix store, respecting .gitignore.
 ///
 /// Uses libgit2 to discover tracked + untracked-but-not-ignored files,
 /// then computes the NAR store path in-process. If the path already exists
 /// in the store (warm build), skips the subprocess entirely. Otherwise,
 /// copies files to a temp dir and runs `nix-store --add`.
+///
+/// When path dependencies outside `project_dir` are detected, they are
+/// copied into the store tree and Cargo.toml paths are rewritten.
 fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
     // Collect allowed files via git2
     let allowed_files = collect_git_files(project_dir)?;
 
-    // Try in-process NAR hash to check if store path already exists
-    if let Some(ref files) = allowed_files {
+    // Detect external path dependencies
+    let external_deps = find_external_path_deps(project_dir).unwrap_or_else(|e| {
+        log::warn!("Failed to detect external path deps: {}", e);
+        HashMap::new()
+    });
+
+    // Fast path: no external deps → try in-process NAR cache
+    if external_deps.is_empty()
+        && let Some(ref files) = allowed_files
+    {
         match nar::serialize_nar(project_dir, Some(files)) {
             Ok(nar_data) => {
                 let store_path = nar::compute_nar_store_path("project-src", &nar_data);
@@ -328,7 +728,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         }
     }
 
-    // Fallback: copy to temp dir + nix-store --add
+    // Copy project files to temp dir
     let temp = tempfile::tempdir().context("Failed to create temp dir for source copy")?;
     let dest = temp.path().join("project-src");
 
@@ -351,6 +751,16 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
             log::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
             copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
         }
+    }
+
+    // Copy external path deps into the store tree and rewrite Cargo.toml paths
+    if !external_deps.is_empty() {
+        for (abs_path, sanitised) in &external_deps {
+            let ext_dest = dest.join(sanitised);
+            copy_source_to_dest(abs_path, &ext_dest)
+                .with_context(|| format!("Failed to copy extra source: {}", abs_path.display()))?;
+        }
+        rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
     }
 
     add_to_nix_store(&dest.to_string_lossy())
@@ -1656,5 +2066,61 @@ version = "1.2.3"
         let manifest = dir.path().join("Cargo.toml");
         std::fs::write(&manifest, "[dependencies]\n").unwrap();
         assert_eq!(read_package_version(&manifest), None);
+    }
+
+    #[test]
+    fn sanitise_strips_dot_dot() {
+        assert_eq!(
+            sanitise_extra_source_name("../foo").unwrap(),
+            "foo"
+        );
+        assert_eq!(
+            sanitise_extra_source_name("../../bar/baz").unwrap(),
+            "bar/baz"
+        );
+    }
+
+    #[test]
+    fn sanitise_rejects_no_dot_dot() {
+        assert!(sanitise_extra_source_name("foo").is_err());
+        assert!(sanitise_extra_source_name("./foo").is_err());
+    }
+
+    #[test]
+    fn relative_path_sibling() {
+        let from = Path::new("/a/b/project");
+        let to = Path::new("/a/b/sibling");
+        assert_eq!(relative_path(from, to), PathBuf::from("../sibling"));
+    }
+
+    #[test]
+    fn relative_path_deeper() {
+        let from = Path::new("/a/b/project/crates/foo");
+        let to = Path::new("/a/b/sibling");
+        assert_eq!(
+            relative_path(from, to),
+            PathBuf::from("../../../sibling")
+        );
+    }
+
+    #[test]
+    fn relative_path_same() {
+        let p = Path::new("/a/b/c");
+        assert_eq!(relative_path(p, p), PathBuf::from("."));
+    }
+
+    #[test]
+    fn find_external_path_deps_fixture() {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/external-path-dep");
+        let deps = find_external_path_deps(&fixture_dir).unwrap();
+        assert_eq!(deps.len(), 1, "expected 1 external dep, got {:?}", deps);
+        // The value should be the sanitised name
+        let names: Vec<_> = deps.values().collect();
+        assert!(
+            names.contains(&&"external-dep-lib".to_string()),
+            "expected 'external-dep-lib' in {:?}",
+            names
+        );
     }
 }
