@@ -2070,10 +2070,7 @@ version = "1.2.3"
 
     #[test]
     fn sanitise_strips_dot_dot() {
-        assert_eq!(
-            sanitise_extra_source_name("../foo").unwrap(),
-            "foo"
-        );
+        assert_eq!(sanitise_extra_source_name("../foo").unwrap(), "foo");
         assert_eq!(
             sanitise_extra_source_name("../../bar/baz").unwrap(),
             "bar/baz"
@@ -2097,10 +2094,7 @@ version = "1.2.3"
     fn relative_path_deeper() {
         let from = Path::new("/a/b/project/crates/foo");
         let to = Path::new("/a/b/sibling");
-        assert_eq!(
-            relative_path(from, to),
-            PathBuf::from("../../../sibling")
-        );
+        assert_eq!(relative_path(from, to), PathBuf::from("../../../sibling"));
     }
 
     #[test]
@@ -2111,8 +2105,8 @@ version = "1.2.3"
 
     #[test]
     fn find_external_path_deps_fixture() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/external-path-dep");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-path-dep");
         let deps = find_external_path_deps(&fixture_dir).unwrap();
         assert_eq!(deps.len(), 1, "expected 1 external dep, got {:?}", deps);
         // The value should be the sanitised name

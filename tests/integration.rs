@@ -458,11 +458,7 @@ fn fixture_external_path_dep() {
 
     // Verify the binary was produced
     let binary = fixture_dir.join("target/debug/external-path-dep");
-    assert!(
-        binary.exists(),
-        "Binary not found at {}",
-        binary.display()
-    );
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
 
     // Verify it runs and uses the external lib
     let output = Command::new(&binary)
