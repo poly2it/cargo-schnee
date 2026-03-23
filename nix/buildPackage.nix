@@ -14,6 +14,7 @@
   pname ? null,
   version ? null,
   package ? null,
+  hostPkgs ? null,
   rustToolchain ? null,
   nativeBuildInputs ? [],
   buildInputs ? [],
@@ -33,6 +34,9 @@
 
 let
   inherit (pkgs) lib;
+
+  # -- cross-compilation --------------------------------------------------
+  effectiveHostPkgs = if hostPkgs != null then hostPkgs else pkgs;
 
   # -- pname / version auto-detection ------------------------------------
   rootCargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
@@ -101,7 +105,7 @@ let
     overrides = self.lib.cargoOverrides { inherit pkgs; };
   };
 
-  schneeRustPlatform = pkgs.makeRustPlatform {
+  schneeRustPlatform = effectiveHostPkgs.makeRustPlatform {
     cargo = schneeToolchain;
     rustc = schneeToolchain;
   };
@@ -203,7 +207,7 @@ let
   # buildRustPackage, excluding the ones we consumed above.
   consumedKeys = [
     "pkgs" "src" "cargoLock" "cargoHash" "cargoDeps"
-    "pname" "version" "package" "rustToolchain"
+    "pname" "version" "package" "hostPkgs" "rustToolchain"
     "nativeBuildInputs" "buildInputs" "cargoExtraArgs"
     "extraSources" "env" "passthruEnv" "wrapBinaries"
     "buildType" "preBuild" "postBuild" "postInstall" "postFixup" "meta"

@@ -59,7 +59,7 @@ Dependencies are vendored via `cargo vendor` into a temporary
 directory, then added to the Nix store with `nix-store --add`. The resulting
 store path is reused across builds by caching the `Cargo.lock` hash to
 vendor store path mapping in `target/.schnee-cache.json`. When running inside
-a Nix derivation (e.g. via `buildRustPackage`), network access is unavailable,
+a Nix derivation, such as via `buildRustPackage`, network access is unavailable,
 so the `--vendor-dir` flag accepts a pre-vendored directory already in the Nix
 store from the outer build's fetch phase.
 
@@ -83,7 +83,7 @@ the subprocess is skipped entirely.
 cargo-schnee uses the `cargo` crate as a Rust library. Cargo's internal build
 pipeline has a planning phase that reads `Cargo.toml` and `Cargo.lock`,
 resolves all dependencies, unifies feature flags, and filters by target
-platform --- producing a complete graph of every `rustc` invocation needed for
+platform, producing a complete graph of every `rustc` invocation needed for
 the build. cargo-schnee calls this planning phase via `ops::create_bcx()` and
 stops before any actual compilation begins, extracting the unit graph for its
 own use.
@@ -120,10 +120,9 @@ Units are sorted topologically via Kahn's algorithm so that every
 unit appears after all its dependencies. The queue uses a `BTreeSet` to
 ensure deterministic ordering.
 
-To illustrate, running `cargo schnee graph` on the
-[simple example](examples/simple/) (a project with `serde` and `serde_json`
-as dependencies) produces the following graph with 24 units for 2 direct
-dependencies:
+To illustrate, the [simple example](examples/simple/) has `serde` and
+`serde_json` as dependencies. Running `cargo schnee graph` on it produces the
+following graph with 24 units for 2 direct dependencies:
 
 ```mermaid
 graph LR
@@ -251,9 +250,9 @@ directory, then invokes `rustc`.
 
 Build scripts communicate with cargo by printing
 [`cargo:` directives](https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script)
-to stdout. These directives can set compiler flags (`cargo:rustc-cfg`),
-inject environment variables (`cargo:rustc-env`), or tell the linker where
-to find system libraries (`cargo:rustc-link-lib`, `cargo:rustc-link-search`).
+to stdout. These directives can set compiler flags via `cargo:rustc-cfg`,
+inject environment variables via `cargo:rustc-env`, or tell the linker where
+to find system libraries via `cargo:rustc-link-lib` and `cargo:rustc-link-search`.
 If the unit depends on a build script, the compile derivation parses these
 directives from the build script's output file and translates them into
 additional `rustc` flags. For units that produce a linked artifact like
@@ -307,7 +306,7 @@ Build scripts are split into two derivations, corresponding to the
 
 For crates with a `links` attribute, the corresponding environment variable
 is set to tell the build script to use system libraries rather than vendoring
-its own copy. For example, `openssl-sys` (which has `links = "openssl"`) gets
+its own copy. For example, `openssl-sys`, which declares `links = "openssl"`, gets
 `OPENSSL_NO_VENDOR=1`, and `libz-sys` gets `LIBZ_SYS_USE_PKG_CONFIG=1`.
 These mappings come from a built-in table or
 `[workspace.metadata.schnee.sys-env]` overrides in `Cargo.toml`:
@@ -379,10 +378,11 @@ cross builds. Permissions are adjusted from the Nix store's read-only
 
 The recommended way to use cargo-schnee is through a cargo wrapper that
 transparently redirects `cargo build`, `cargo run`, `cargo test`, and
-`cargo bench` to their `cargo schnee` equivalents. The
-[simple example](examples/simple/) demonstrates this approach with a Nix
-flake that creates the wrapper via `makeCargoWrapper` and uses it in both a
-`devShell` and a `buildRustPackage` derivation:
+`cargo bench` to their `cargo schnee` equivalents. The wrapper also forwards
+`-p`/`--package`, `--features`, `--bin`, and `--no-default-features`. The
+[simple example](examples/simple/) demonstrates this approach with a
+`devShell` and both packaging methods described below. For development shells, create the wrapper via
+`makeCargoWrapper`:
 
 ```nix
 let
@@ -407,8 +407,14 @@ cargo build --profile bench
 # Or invoke cargo-schnee directly.
 cargo schnee build --manifest-path path/to/Cargo.toml
 
-# Verbose output (-vv for Nix build logs).
+# Pass -vv for Nix build logs.
 cargo schnee build -vv --manifest-path examples/simple/Cargo.toml
+
+# Build a specific package in a workspace.
+cargo build -p my-crate
+
+# Build with specific features.
+cargo build --features serde,json --no-default-features
 ```
 
 ### Cross-compilation
@@ -437,14 +443,24 @@ let
     rustc = schneeToolchain;
   };
 in {
-  packages.default = crossRustPlatform.buildRustPackage { /* ... */ };
+  packages.default = crossRustPlatform.buildRustPackage {
+    pname = "my-project";
+    version = "0.1.0";
+    src = ./.;
+    cargoLock.lockFile = ./Cargo.lock;
+    nativeBuildInputs = [ pkgs.nix ];
+    requiredSystemFeatures = [ "recursive-nix" ];
+    NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
+    auditable = false;
+    doCheck = false;
+  };
 }
 ```
 
 ### Custom `-sys` crate environment variables
 
 cargo-schnee has a built-in table that tells common `-sys` crates to use
-`pkg-config` (e.g. `LIBGIT2_NO_VENDOR=1`, `OPENSSL_NO_VENDOR=1`). For `-sys`
+`pkg-config`, such as `LIBGIT2_NO_VENDOR=1` and `OPENSSL_NO_VENDOR=1`. For `-sys`
 crates not in the table, add a `[workspace.metadata.schnee.sys-env]` section to
 your `Cargo.toml`:
 
@@ -457,69 +473,118 @@ lzma = "LZMA_SYS_USE_PKG_CONFIG"
 
 The key is the crate's
 [`links`](https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key)
-value (from its `Cargo.toml`), and the value is the environment variable to set
+value as declared in its `Cargo.toml`, and the value is the environment variable to set
 to `1` during the build script run.
+
+### Packaging with `lib.buildPackage`
+
+For straightforward packaging, `lib.buildPackage` handles all the toolchain
+wiring, `buildRustPackage` invariants, and install phase automatically.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+}
+```
+
+For workspaces with multiple packages, specify which one to build with the
+`package` attribute. The `pname` and `version` are read from the member's
+`Cargo.toml` automatically.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = src + "/Cargo.lock";
+  package = "greeter";
+}
+```
+
+For cross-compilation, pass `hostPkgs` with the package set for the platform
+where the binary will run. The `rustToolchain` must include the cross target.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src rustToolchain;
+  hostPkgs = pkgs.pkgsCross.aarch64-multiplatform;
+  cargoLock = ./Cargo.lock;
+}
+```
+
+Other supported attributes include `rustToolchain`, `buildInputs`,
+`nativeBuildInputs`, `cargoExtraArgs`, `env`, `buildType`, and `meta`. See
+[`examples/build-package/`](examples/build-package/) for a workspace example
+and [`examples/build-package-cross/`](examples/build-package-cross/) for
+cross-compilation.
 
 ### Packaging with `buildRustPackage`
 
-cargo-schnee integrates with `buildRustPackage` by wrapping the `cargo` binary.
-The wrapper intercepts `cargo build` and redirects it to `cargo schnee build`,
-while forwarding all other subcommands to the real `cargo`:
+For cases that need more control over the build, you can wire
+`makeCargoWrapper` and `buildRustPackage` manually. The wrapper intercepts
+`cargo build` and redirects it to `cargo schnee build`, while forwarding all
+other subcommands to the real `cargo`.
 
 ```nix
-# flake.nix.
 {
   inputs = {
     cargo-schnee.url = "github:poly2it/cargo-schnee";
-    # ...
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, cargo-schnee }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ (import rust-overlay) ];
-        };
-        rustToolchain = pkgs.rust-bin.stable.latest.default;
+  outputs = { self, nixpkgs, rust-overlay, cargo-schnee }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
 
-        # Create a cargo wrapper that redirects build/run/test to cargo-schnee.
-        schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
-          inherit pkgs rustToolchain;
-          cargo = lib.getExe' rustToolchain "cargo";
-          overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
-        };
+      mkSystem = system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+          inherit (pkgs) lib;
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
 
-        # Use the wrapper as both cargo and rustc in makeRustPlatform.
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = schneeToolchain;
-          rustc = schneeToolchain;
-        };
-      in {
-        packages.default = rustPlatform.buildRustPackage {
-          pname = "my-project";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
+            inherit pkgs rustToolchain;
+            cargo = lib.getExe' rustToolchain "cargo";
+            overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
+          };
 
-          nativeBuildInputs = [ pkgs.nix ];
-          requiredSystemFeatures = [ "recursive-nix" ];
-          NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
-          auditable = false;
-          doCheck = false;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = schneeToolchain;
+            rustc = schneeToolchain;
+          };
+        in {
+          packages.default = rustPlatform.buildRustPackage {
+            pname = "my-project";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.nix ];
+            requiredSystemFeatures = [ "recursive-nix" ];
+            NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
+            auditable = false;
+            doCheck = false;
+          };
         };
-      }
-    );
+    in {
+      packages = forAllSystems (system: (mkSystem system).packages);
+    };
 }
 ```
 
 Key points:
 
-- `requiredSystemFeatures = [ "recursive-nix" ]`: cargo-schnee calls
-  `nix-store --realise` from within the sandbox
-- `NIX_CONFIG` enables CA derivations inside the build
-- `auditable = false` prevents `cargo-auditable` from wrapping cargo (which
-  would bypass the schnee wrapper)
+- `requiredSystemFeatures = [ "recursive-nix" ]` gives cargo-schnee access to
+  the Nix daemon from within the sandbox.
+- `NIX_CONFIG` enables CA derivations inside the build.
+- `auditable = false` prevents `cargo-auditable` from wrapping cargo, which
+  would bypass the schnee wrapper.
 
 See [`examples/simple/flake.nix`](examples/simple/flake.nix) for a complete
 working example.

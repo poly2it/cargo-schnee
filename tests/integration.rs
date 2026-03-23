@@ -563,6 +563,36 @@ fn example_build_package() {
     );
 }
 
+// build-package-cross example: lib.buildPackage with hostPkgs (native build only)
+#[test]
+#[ignore]
+fn example_build_package_cross() {
+    let example_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package-cross");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/build-package-cross-example");
+    assert!(
+        binary.exists(),
+        "build-package-cross-example binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run build-package-cross-example");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello from cargo-schnee cross-compilation!"),
+        "Unexpected build-package-cross example output: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GitHub project tests
 // ---------------------------------------------------------------------------
