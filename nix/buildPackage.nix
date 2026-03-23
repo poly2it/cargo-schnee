@@ -39,18 +39,43 @@ let
 
   # For workspace builds with `package` set, find the member's Cargo.toml
   # by scanning workspace.members for a path whose Cargo.toml has a matching name.
+  # Members may contain globs (e.g. "crates/*", "*"), so we expand those first.
+
+  # Expand a single member pattern into concrete directory paths.
+  # "crates/foo" (no glob) -> [ "crates/foo" ]
+  # "crates/*"             -> list subdirectories of <src>/crates/
+  # "*"                    -> list subdirectories of <src>/
+  expandMember = m:
+    let
+      # Split on the first '*' to get the prefix directory and check if it's a glob.
+      hasGlob = lib.hasInfix "*" m;
+      # For "crates/*" the parent is "crates", for "*" the parent is "".
+      parent = lib.removeSuffix "/*" m;
+      parentDir = if parent == "*" || parent == "" then src else src + "/${parent}";
+      entries = builtins.readDir parentDir;
+      dirs = lib.filterAttrs (_: type: type == "directory") entries;
+      expanded = map (name:
+        if parent == "*" || parent == "" then name else "${parent}/${name}"
+      ) (builtins.attrNames dirs);
+    in
+      if hasGlob then expanded else [ m ];
+
   memberCargoToml =
     if package != null && (rootCargoToml ? workspace) then
       let
-        members = rootCargoToml.workspace.members or [];
+        memberPatterns = rootCargoToml.workspace.members or [];
+        allMembers = builtins.concatMap expandMember memberPatterns;
         findMember = builtins.foldl' (acc: m:
           if acc != null then acc
           else
             let
-              toml = builtins.fromTOML (builtins.readFile (src + "/${m}/Cargo.toml"));
+              cargoPath = src + "/${m}/Cargo.toml";
+              result = builtins.tryEval (builtins.fromTOML (builtins.readFile cargoPath));
             in
-              if (toml.package.name or "") == package then toml else null
-        ) null members;
+              if result.success && (result.value.package.name or "") == package
+              then result.value
+              else null
+        ) null allMembers;
       in findMember
     else null;
 

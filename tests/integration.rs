@@ -196,6 +196,37 @@ fn fixture_workspace_advanced() {
     );
 }
 
+// Workspace using members = ["*"] glob pattern
+#[test]
+#[ignore]
+fn fixture_workspace_glob_members() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let alpha = fixture_dir.join("target/debug/alpha");
+    let beta = fixture_dir.join("target/debug/beta");
+    assert!(alpha.exists(), "alpha binary not found at {}", alpha.display());
+    assert!(beta.exists(), "beta binary not found at {}", beta.display());
+
+    let output = Command::new(&alpha).output().expect("Failed to run alpha");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from alpha"),
+        "Unexpected alpha output"
+    );
+
+    let output = Command::new(&beta).output().expect("Failed to run beta");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from beta"),
+        "Unexpected beta output"
+    );
+}
+
 // Warm workspace rebuild produces identical binaries
 #[test]
 #[ignore]
@@ -321,72 +352,6 @@ fn concurrent_builds() {
     t2.join().expect("workspace build thread panicked");
 }
 
-// ---------------------------------------------------------------------------
-// GitHub project tests
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore]
-fn github_hyperfine() {
-    let repo = ensure_repo(
-        "hyperfine",
-        "https://github.com/sharkdp/hyperfine.git",
-        "v1.19.0",
-    );
-    let manifest = repo.join("Cargo.toml");
-
-    clean_target(&repo);
-    run_schnee_build(&manifest);
-
-    let binary = repo.join("target/debug/hyperfine");
-    assert!(
-        binary.exists(),
-        "hyperfine binary not found at {}",
-        binary.display()
-    );
-
-    let output = Command::new(&binary)
-        .arg("--version")
-        .output()
-        .expect("Failed to run hyperfine");
-    assert!(output.status.success(), "hyperfine --version failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("hyperfine"),
-        "Unexpected version output: {}",
-        stdout
-    );
-}
-
-#[test]
-#[ignore]
-fn github_just_workspace() {
-    let repo = ensure_repo("just", "https://github.com/casey/just.git", "1.40.0");
-    let manifest = repo.join("Cargo.toml");
-
-    clean_target(&repo);
-    run_schnee_build(&manifest);
-
-    let binary = repo.join("target/debug/just");
-    assert!(
-        binary.exists(),
-        "just binary not found at {}",
-        binary.display()
-    );
-
-    let output = Command::new(&binary)
-        .arg("--version")
-        .output()
-        .expect("Failed to run just");
-    assert!(output.status.success(), "just --version failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("just"),
-        "Unexpected version output: {}",
-        stdout
-    );
-}
-
 // Verify that the pre-flight system library check emits a warning when a
 // -sys crate's `links` value isn't discoverable via pkg-config.
 #[test]
@@ -471,5 +436,195 @@ fn fixture_cross_compile_aarch64() {
         file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
         "Binary is not aarch64: {}",
         file_str
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Example tests
+// ---------------------------------------------------------------------------
+
+// Simple single-crate example with serde dependency
+#[test]
+#[ignore]
+fn example_simple() {
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/simple");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/test-project");
+    assert!(
+        binary.exists(),
+        "test-project binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run test-project");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"name\": \"test\"") && stdout.contains("421"),
+        "Unexpected simple example output: {}",
+        stdout
+    );
+}
+
+// Cross-compilation example (native build only — verifies the crate compiles)
+#[test]
+#[ignore]
+fn example_cross() {
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/cross");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/cross-example");
+    assert!(
+        binary.exists(),
+        "cross-example binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run cross-example");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello from cargo-schnee cross-compilation!"),
+        "Unexpected cross example output: {}",
+        stdout
+    );
+}
+
+// build-package example: workspace with two binary crates and serde deps
+#[test]
+#[ignore]
+fn example_build_package() {
+    let example_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    // Verify both workspace binaries were produced
+    let greeter = example_dir.join("target/debug/greeter");
+    let formatter = example_dir.join("target/debug/formatter");
+    assert!(
+        greeter.exists(),
+        "greeter binary not found at {}",
+        greeter.display()
+    );
+    assert!(
+        formatter.exists(),
+        "formatter binary not found at {}",
+        formatter.display()
+    );
+
+    // greeter outputs JSON with a greeting message
+    let output = Command::new(&greeter)
+        .output()
+        .expect("Failed to run greeter");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from cargo-schnee buildPackage"),
+        "Unexpected greeter output: {}",
+        stdout
+    );
+
+    // formatter reads JSON from stdin and formats it
+    let output = Command::new(&formatter)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"message\": \"test\"}")
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("Failed to run formatter");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[formatted] test"),
+        "Unexpected formatter output: {}",
+        stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GitHub project tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn github_hyperfine() {
+    let repo = ensure_repo(
+        "hyperfine",
+        "https://github.com/sharkdp/hyperfine.git",
+        "v1.19.0",
+    );
+    let manifest = repo.join("Cargo.toml");
+
+    clean_target(&repo);
+    run_schnee_build(&manifest);
+
+    let binary = repo.join("target/debug/hyperfine");
+    assert!(
+        binary.exists(),
+        "hyperfine binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("Failed to run hyperfine");
+    assert!(output.status.success(), "hyperfine --version failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hyperfine"),
+        "Unexpected version output: {}",
+        stdout
+    );
+}
+
+#[test]
+#[ignore]
+fn github_just_workspace() {
+    let repo = ensure_repo("just", "https://github.com/casey/just.git", "1.40.0");
+    let manifest = repo.join("Cargo.toml");
+
+    clean_target(&repo);
+    run_schnee_build(&manifest);
+
+    let binary = repo.join("target/debug/just");
+    assert!(
+        binary.exists(),
+        "just binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("Failed to run just");
+    assert!(output.status.success(), "just --version failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("just"),
+        "Unexpected version output: {}",
+        stdout
     );
 }
