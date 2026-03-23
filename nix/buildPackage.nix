@@ -58,9 +58,11 @@ let
       parentDir = if parent == "*" || parent == "" then src else src + "/${parent}";
       entries = builtins.readDir parentDir;
       dirs = lib.filterAttrs (_: type: type == "directory") entries;
-      expanded = map (name:
-        if parent == "*" || parent == "" then name else "${parent}/${name}"
-      ) (builtins.attrNames dirs);
+      expanded = builtins.filter (p: builtins.pathExists (src + "/${p}/Cargo.toml")) (
+        map (name:
+          if parent == "*" || parent == "" then name else "${parent}/${name}"
+        ) (builtins.attrNames dirs)
+      );
     in
       if hasGlob then expanded else [ m ];
 
@@ -74,11 +76,11 @@ let
           else
             let
               cargoPath = src + "/${m}/Cargo.toml";
-              result = builtins.tryEval (builtins.fromTOML (builtins.readFile cargoPath));
             in
-              if result.success && (result.value.package.name or "") == package
-              then result.value
-              else null
+              if !builtins.pathExists cargoPath then null
+              else
+                let toml = builtins.fromTOML (builtins.readFile cargoPath);
+                in if (toml.package.name or "") == package then toml else null
         ) null allMembers;
       in findMember
     else null;

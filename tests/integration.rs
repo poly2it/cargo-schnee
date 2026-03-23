@@ -209,7 +209,11 @@ fn fixture_workspace_glob_members() {
 
     let alpha = fixture_dir.join("target/debug/alpha");
     let beta = fixture_dir.join("target/debug/beta");
-    assert!(alpha.exists(), "alpha binary not found at {}", alpha.display());
+    assert!(
+        alpha.exists(),
+        "alpha binary not found at {}",
+        alpha.display()
+    );
     assert!(beta.exists(), "beta binary not found at {}", beta.display());
 
     let output = Command::new(&alpha).output().expect("Failed to run alpha");
@@ -505,8 +509,7 @@ fn example_cross() {
 #[test]
 #[ignore]
 fn example_build_package() {
-    let example_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package");
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package");
     let manifest = example_dir.join("Cargo.toml");
 
     clean_target(&example_dir);
