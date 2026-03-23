@@ -1,8 +1,8 @@
 use super::util::sanitize_drv_name;
 use super::{NixUnit, UnitKind};
 use anyhow::Result;
-use cargo::core::compiler::{CompileKind, CompileMode, Unit};
 use cargo::core::FeatureValue;
+use cargo::core::compiler::{CompileKind, CompileMode, Unit};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -180,6 +180,17 @@ pub(super) fn extract_units_from_bcx(
             }
         }
 
+        if log::log_enabled!(log::Level::Debug) {
+            let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
+            dep_names.sort();
+            log::debug!(
+                "dep_extern_map for {} after first pass ({} entries): {:?}",
+                key,
+                dep_extern_map.len(),
+                dep_names,
+            );
+        }
+
         // Fix missing optional deps activated by features but absent from the
         // unit graph edge list.  This happens when optional deps are declared
         // under always-false platform gates like
@@ -224,6 +235,17 @@ pub(super) fn extract_units_from_bcx(
                             && c.mode != CompileMode::RunCustomBuild
                     }) {
                         let dep_key = key_map[candidate].clone();
+                        let already_present = dep_extern_map.contains_key(&extern_name);
+                        log::debug!(
+                            "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
+                             already_in_dep_extern={}",
+                            dep_toml_name,
+                            key,
+                            extern_name,
+                            pkg_name,
+                            dep_key,
+                            already_present,
+                        );
                         feature_dep_activations
                             .entry(feat.to_string())
                             .or_default()
@@ -332,6 +354,24 @@ pub(super) fn extract_units_from_bcx(
     // may link against different feature variants of the same crate, causing type
     // mismatches (e.g., proc_macro2::Span from variant A != proc_macro2::Span from B).
     unify_feature_variants(&mut nix_units);
+
+    // Validate: every dep_extern key must reference an existing NixUnit.
+    {
+        let valid_keys: HashSet<&str> = nix_units.iter().map(|u| u.key.as_str()).collect();
+        for u in &nix_units {
+            for (ext_name, dep_key) in &u.dep_extern {
+                if !valid_keys.contains(dep_key.as_str()) {
+                    log::warn!(
+                        "Stale dep_extern after unification: {} has {} -> key {} \
+                         which does NOT match any NixUnit",
+                        u.key,
+                        ext_name,
+                        dep_key,
+                    );
+                }
+            }
+        }
+    }
 
     // Compute transitive dependency closure (only for Compile units, for -L paths)
     let key_to_idx: HashMap<String, usize> = nix_units
@@ -1267,9 +1307,15 @@ mod tests {
 
         let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
 
-        assert_eq!(additions.len(), 2, "both serde and serde_core should be added");
+        assert_eq!(
+            additions.len(),
+            2,
+            "both serde and serde_core should be added"
+        );
         assert!(
-            additions.iter().any(|(e, k)| e == "serde" && k == "serde-key"),
+            additions
+                .iter()
+                .any(|(e, k)| e == "serde" && k == "serde-key"),
             "serde should be added"
         );
         assert!(
@@ -1317,10 +1363,7 @@ mod tests {
         let dep_extern = HashMap::new();
         let features = vec!["feat_a".into(), "feat_b".into()];
         let mut activations = HashMap::new();
-        activations.insert(
-            "feat_a".into(),
-            vec![("serde".into(), "serde-key".into())],
-        );
+        activations.insert("feat_a".into(), vec![("serde".into(), "serde-key".into())]);
         activations.insert(
             "feat_b".into(),
             vec![("serde".into(), "serde-key-alt".into())],

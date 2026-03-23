@@ -310,6 +310,13 @@ fn build_compile_script(
             let filename = dep_unit.output_lib_filename();
             parts.push("--extern".into());
             parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
+        } else {
+            log::warn!(
+                "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
+                unit.key,
+                extern_name,
+                dep_key,
+            );
         }
     }
 
