@@ -2,7 +2,7 @@
 /.cargo-schnee
 /examples/*/target
 /tests/fixtures/*/target
-/tests/.repos/
+/tests/repos/
 .cargo-vendor/
 .direnv
 profile*.txt

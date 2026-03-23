@@ -45,6 +45,7 @@ pub(super) fn construct_derivation(
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
+    passthru_envs: &[(String, String)],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -63,6 +64,7 @@ pub(super) fn construct_derivation(
             target,
             cfg_envs,
             custom_sys_env,
+            passthru_envs,
         )?,
         _ => {
             let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -421,6 +423,7 @@ fn build_run_script(
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
+    passthru_envs: &[(String, String)],
 ) -> Result<String> {
     // The build script compile derivation provides the binary
     let bs_compile_key = unit
@@ -517,6 +520,11 @@ fn build_run_script(
     for feat in &unit.features {
         let feat_env = feat.to_uppercase().replace('-', "_");
         script.push_str(&format!("export CARGO_FEATURE_{}=1 && ", feat_env));
+    }
+
+    // Passthrough env vars forwarded from the outer Nix derivation
+    for (k, v) in passthru_envs {
+        script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
 
     // DEP_<LINKS>_<KEY> env vars from dependency build scripts

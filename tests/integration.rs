@@ -42,7 +42,7 @@ fn run_schnee_build(manifest_path: &Path) -> (String, String) {
 fn ensure_repo(name: &str, url: &str, git_ref: &str) -> PathBuf {
     let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join(".repos");
+        .join("repos");
     let repo_dir = cache_dir.join(format!("{}-{}", name, git_ref));
 
     if repo_dir.join(".git").exists() {
@@ -63,6 +63,16 @@ fn ensure_repo(name: &str, url: &str, git_ref: &str) -> PathBuf {
         url,
         git_ref
     );
+
+    // Ensure the cloned repo has a [workspace] marker so cargo doesn't walk up
+    // to the cargo-schnee project root when running `cargo vendor` etc.
+    let cargo_toml = repo_dir.join("Cargo.toml");
+    if cargo_toml.exists() {
+        let contents = std::fs::read_to_string(&cargo_toml).unwrap();
+        if !contents.contains("[workspace]") {
+            std::fs::write(&cargo_toml, format!("[workspace]\n\n{contents}")).unwrap();
+        }
+    }
 
     repo_dir
 }
@@ -409,11 +419,7 @@ fn fixture_sys_lib_check_warning() {
 
     // The build should still succeed (build script is a no-op).
     let binary = fixture_dir.join("target/debug/sys-lib-check-app");
-    assert!(
-        binary.exists(),
-        "Binary not found at {}",
-        binary.display()
-    );
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
 
     let output = Command::new(&binary)
         .output()

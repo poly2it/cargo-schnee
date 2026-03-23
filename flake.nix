@@ -135,6 +135,7 @@
 
     in
     {
+      lib.buildPackage = import ./nix/buildPackage.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
 
       lib.cargoOverrides = { pkgs }:

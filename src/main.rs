@@ -866,6 +866,16 @@ fn run_build_pipeline(
     } else {
         None
     };
+
+    // Resolve passthrough env vars for build-script derivations.
+    // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
+    // whose values should be forwarded into per-crate build-script derivations.
+    let passthru_envs: Vec<(String, String)> = std::env::var("CARGO_SCHNEE_PASSTHRU_ENVS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|name| std::env::var(name).ok().map(|val| (name.to_string(), val)))
+        .collect();
+
     let (root_drvs, plan_units, cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
@@ -879,6 +889,7 @@ fn run_build_pipeline(
         packages,
         features,
         no_default_features,
+        &passthru_envs,
     )?;
 
     // Update unit graph cache
@@ -1531,6 +1542,7 @@ fn main() -> Result<()> {
                 package,
                 features,
                 no_default_features,
+                &[],
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -1560,6 +1572,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 false,
+                &[],
             )?;
             // Output the root .drv paths
             for (drv_path, _) in &root_drvs {

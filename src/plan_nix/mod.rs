@@ -203,7 +203,11 @@ impl NixUnit {
             format!("{}{}", self.crate_name, self.extra_filename)
         } else if self.crate_types.iter().any(|ct| ct == "proc-macro") {
             format!("lib{}{}.so", self.crate_name, self.extra_filename)
-        } else if self.crate_types.iter().any(|ct| ct == "rlib" || ct == "lib") {
+        } else if self
+            .crate_types
+            .iter()
+            .any(|ct| ct == "rlib" || ct == "lib")
+        {
             format!("lib{}{}.rlib", self.crate_name, self.extra_filename)
         } else if self
             .crate_types
@@ -355,6 +359,7 @@ pub fn run_plan_nix(
     packages: &[String],
     features: &[String],
     no_default_features: bool,
+    passthru_envs: &[(String, String)],
 ) -> Result<(Vec<(String, String)>, Vec<NixUnit>, Vec<(String, String)>)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
@@ -482,13 +487,35 @@ pub fn run_plan_nix(
 
     // Resolve tool paths
     let rustc_path = which_rustc()?;
-    let rustc_store = rustc_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot derive store path from rustc"))?
-        .to_string_lossy()
-        .to_string();
     let rustc_str = rustc_path.to_string_lossy().to_string();
+
+    // Query rustc for its sysroot — this works with wrapper scripts (nixpkgs'
+    // rustc-wrapper) where the binary's store path differs from the sysroot.
+    let rustc_sysroot = {
+        let output = std::process::Command::new(&rustc_path)
+            .arg("--print")
+            .arg("sysroot")
+            .output()
+            .context("Failed to run rustc --print sysroot")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "rustc --print sysroot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sysroot = String::from_utf8(output.stdout)
+            .context("rustc sysroot is not UTF-8")?
+            .trim()
+            .to_string();
+        // Resolve symlinks so we get the real nix store path
+        PathBuf::from(&sysroot)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&sysroot))
+            .to_string_lossy()
+            .to_string()
+    };
+    let rustc_store = rustc_sysroot;
+    info!("Sysroot: {}", rustc_store);
+
     // Find the proc_macro rlib from the HOST sysroot (proc-macros always run on host)
     let host_sysroot_lib = PathBuf::from(&rustc_store)
         .join("lib/rustlib")
@@ -496,8 +523,6 @@ pub fn run_plan_nix(
         .join("lib");
     let proc_macro_rlib = find_sysroot_rlib(&host_sysroot_lib, "proc_macro")?;
     info!("proc_macro rlib: {}", proc_macro_rlib);
-    let resolved_sysroot = rustc_store.clone();
-    info!("Sysroot: {}", resolved_sysroot);
     // For cross-compilation, verify the target sysroot exists
     if target.is_cross() {
         let target_sysroot_lib = PathBuf::from(&rustc_store)
@@ -761,7 +786,7 @@ pub fn run_plan_nix(
                     &bash_path,
                     &rustc_str,
                     &proc_macro_rlib,
-                    &resolved_sysroot,
+                    &rustc_store,
                     &mkdir_path,
                     &coreutils_store,
                     unit_cc_bin_dir,
@@ -775,6 +800,7 @@ pub fn run_plan_nix(
                     target,
                     &cfg_envs,
                     &custom_sys_env,
+                    passthru_envs,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",
