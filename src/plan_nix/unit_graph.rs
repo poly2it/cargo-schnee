@@ -733,6 +733,71 @@ fn find_missing_feature_deps(
     result
 }
 
+/// Compute topological levels for parallel derivation registration.
+///
+/// Returns a list of levels, where each level is a list of indices into
+/// `nix_units`.  All dependencies of a unit at level L are guaranteed to be at
+/// levels < L, so levels can be processed sequentially (within a level units
+/// are independent).
+///
+/// Uses iterative convergence rather than a single forward pass because
+/// `dep_extern` may contain edges not present in Cargo's unit graph (e.g.
+/// `cfg(any())`-gated deps injected by `find_missing_feature_deps`).  The
+/// toposort order may therefore place a dependency *after* its dependent,
+/// and a single pass would read the dependency's uninitialised level.
+pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
+    let key_to_idx: HashMap<String, usize> = nix_units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.key.clone(), i))
+        .collect();
+
+    let mut unit_level: Vec<usize> = vec![0; nix_units.len()];
+    loop {
+        let mut changed = false;
+        for i in 0..nix_units.len() {
+            let unit = &nix_units[i];
+            let mut max_dep: usize = 0;
+            for (_, dep_key) in &unit.dep_extern {
+                if let Some(&dep_idx) = key_to_idx.get(dep_key) {
+                    max_dep = max_dep.max(unit_level[dep_idx] + 1);
+                }
+            }
+            if let Some(ref key) = unit.build_script_dep
+                && let Some(&dep_idx) = key_to_idx.get(key)
+            {
+                max_dep = max_dep.max(unit_level[dep_idx] + 1);
+            }
+            if let Some(ref key) = unit.build_script_compile_key
+                && let Some(&dep_idx) = key_to_idx.get(key)
+            {
+                max_dep = max_dep.max(unit_level[dep_idx] + 1);
+            }
+            for (key, _) in &unit.links_dep_keys {
+                if let Some(&dep_idx) = key_to_idx.get(key) {
+                    max_dep = max_dep.max(unit_level[dep_idx] + 1);
+                }
+            }
+            if max_dep > unit_level[i] {
+                unit_level[i] = max_dep;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let max_level = unit_level.iter().max().copied().unwrap_or(0);
+    (0..=max_level)
+        .map(|l| {
+            (0..nix_units.len())
+                .filter(|&i| unit_level[i] == l)
+                .collect()
+        })
+        .collect()
+}
+
 /// Compute a grouping key for feature unification.  Two NixUnits with the same
 /// group key differ only in their feature sets and should be merged.
 fn feature_agnostic_group_key(u: &NixUnit) -> String {
@@ -815,8 +880,15 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             .find(|(k, _)| k == "CARGO_CRATE_NAME")
             .map(|(_, v)| v.as_str())
             .unwrap_or(&u.crate_name);
+        // pkg_name is resolved below; declare it early so extra_filename can use it.
+        let pkg_name = u
+            .cargo_envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_PKG_NAME")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(&u.crate_name);
         let new_extra_filename = compute_extra_filename(
-            &u.crate_name.replace('_', "-"), // pkg_name uses hyphens
+            pkg_name,
             pkg_version,
             target_name_field,
             &unified,
@@ -833,12 +905,6 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         let kind_suffix = if u.for_host { "-host" } else { "" };
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();
-        let pkg_name = u
-            .cargo_envs
-            .iter()
-            .find(|(k, _)| k == "CARGO_PKG_NAME")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or(&u.crate_name);
         let unified_identity = format!(
             "{}-{}-{}{}{}-{}-{:?}-{}",
             pkg_name,
@@ -860,14 +926,11 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         } else {
             ""
         };
+        // Use target_name_field directly (not .replace('_', "-")) to match
+        // make_unit_key which uses unit.target.name() without conversion.
         let new_key = sanitize_drv_name(&format!(
             "{}-{}-{}{}{}-{}",
-            pkg_name,
-            pkg_version,
-            target_name_field.replace('_', "-"),
-            mode_suffix,
-            type_suffix,
-            short_hash,
+            pkg_name, pkg_version, target_name_field, mode_suffix, type_suffix, short_hash,
         ));
 
         // Update redirect map with the actual new key.
@@ -1372,5 +1435,195 @@ mod tests {
         let additions = find_missing_feature_deps(&dep_extern, &features, &activations);
         assert_eq!(additions.len(), 1, "serde should appear only once");
         assert_eq!(additions[0].0, "serde");
+    }
+
+    // -- compute_topo_levels --------------------------------------------------
+
+    #[test]
+    fn topo_levels_basic_chain() {
+        // A → B → C  (linear chain)
+        let mut c = make_unit("c", "1.0.0", &[], &[]);
+        c.key = "c-key".into();
+        let mut b = make_unit("b", "1.0.0", &[], &[("c", "c-key")]);
+        b.key = "b-key".into();
+        let mut a = make_unit("a", "1.0.0", &[], &[("b", "b-key")]);
+        a.key = "a-key".into();
+
+        // Units in correct topo order
+        let units = vec![c, b, a];
+        let levels = compute_topo_levels(&units);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]); // c
+        assert_eq!(levels[1], vec![1]); // b
+        assert_eq!(levels[2], vec![2]); // a
+    }
+
+    #[test]
+    fn topo_levels_parallel_deps() {
+        // A depends on both B and C (independent)
+        let mut b = make_unit("b", "1.0.0", &[], &[]);
+        b.key = "b-key".into();
+        let mut c = make_unit("c", "1.0.0", &[], &[]);
+        c.key = "c-key".into();
+        let mut a = make_unit("a", "1.0.0", &[], &[("b", "b-key"), ("c", "c-key")]);
+        a.key = "a-key".into();
+
+        let units = vec![b, c, a];
+        let levels = compute_topo_levels(&units);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0], vec![0, 1]); // b, c at level 0
+        assert_eq!(levels[1], vec![2]); // a at level 1
+    }
+
+    /// Regression test for the cfg(any()) dep_drv_map miss bug.
+    ///
+    /// Simulates the indexmap/serde scenario: indexmap depends on serde via a
+    /// cfg(any())-gated dep (injected by find_missing_feature_deps), but the
+    /// toposort (based on Cargo's unit graph edges) puts indexmap BEFORE serde
+    /// because there's no Cargo edge between them.
+    ///
+    /// A single-pass level computation would read serde's uninitialised level
+    /// (0), placing indexmap and serde at the same level.  The iterative
+    /// algorithm must place serde strictly before indexmap.
+    #[test]
+    fn topo_levels_cfg_any_dep_before_dependent() {
+        // serde_core (no deps)
+        let mut serde_core = make_unit("serde_core", "1.0.228", &[], &[]);
+        serde_core.key = "serde_core-key".into();
+
+        // serde depends on serde_core
+        let mut serde = make_unit("serde", "1.0.228", &[], &[("serde_core", "serde_core-key")]);
+        serde.key = "serde-key".into();
+
+        // equivalent (no deps, indexmap's normal dep)
+        let mut equivalent = make_unit("equivalent", "1.0.2", &[], &[]);
+        equivalent.key = "equivalent-key".into();
+
+        // hashbrown (no deps, indexmap's normal dep)
+        let mut hashbrown = make_unit("hashbrown", "0.15.0", &[], &[]);
+        hashbrown.key = "hashbrown-key".into();
+
+        // indexmap depends on equivalent, hashbrown (from Cargo edges) AND
+        // serde, serde_core (from cfg(any()) fix — NOT in Cargo's edges).
+        let mut indexmap = make_unit(
+            "indexmap",
+            "2.13.0",
+            &["serde"],
+            &[
+                ("equivalent", "equivalent-key"),
+                ("hashbrown", "hashbrown-key"),
+                ("serde", "serde-key"),
+                ("serde_core", "serde_core-key"),
+            ],
+        );
+        indexmap.key = "indexmap-key".into();
+
+        // Simulate toposort order where indexmap appears BEFORE serde
+        // (lexicographic: "equivalent" < "hashbrown" < "indexmap" < "serde" < "serde_core")
+        // but serde_core and serde are NOT connected to indexmap in Cargo's graph.
+        // A realistic toposort might produce: [equivalent, hashbrown, indexmap, serde_core, serde]
+        let units = vec![equivalent, hashbrown, indexmap, serde_core, serde];
+
+        let levels = compute_topo_levels(&units);
+
+        // Find which level each unit is at
+        let level_of =
+            |idx: usize| -> usize { levels.iter().position(|l| l.contains(&idx)).unwrap() };
+
+        let equivalent_level = level_of(0);
+        let hashbrown_level = level_of(1);
+        let indexmap_level = level_of(2);
+        let serde_core_level = level_of(3);
+        let serde_level = level_of(4);
+
+        // serde_core must be before serde
+        assert!(
+            serde_core_level < serde_level,
+            "serde_core (level {}) must be before serde (level {})",
+            serde_core_level,
+            serde_level,
+        );
+        // serde must be before indexmap (the critical invariant)
+        assert!(
+            serde_level < indexmap_level,
+            "serde (level {}) must be before indexmap (level {})",
+            serde_level,
+            indexmap_level,
+        );
+        // equivalent and hashbrown must be before indexmap
+        assert!(
+            equivalent_level < indexmap_level,
+            "equivalent (level {}) must be before indexmap (level {})",
+            equivalent_level,
+            indexmap_level,
+        );
+        assert!(
+            hashbrown_level < indexmap_level,
+            "hashbrown (level {}) must be before indexmap (level {})",
+            hashbrown_level,
+            indexmap_level,
+        );
+    }
+
+    /// Verify that the iterative level computation handles deeply chained
+    /// reverse-ordered deps (worst case for convergence).
+    #[test]
+    fn topo_levels_reverse_order_chain() {
+        // Units in REVERSE dependency order: a → b → c → d
+        // Array order: [a, b, c, d]  (worst case for single-pass)
+        let mut d = make_unit("d", "1.0.0", &[], &[]);
+        d.key = "d-key".into();
+        let mut c = make_unit("c", "1.0.0", &[], &[("d", "d-key")]);
+        c.key = "c-key".into();
+        let mut b = make_unit("b", "1.0.0", &[], &[("c", "c-key")]);
+        b.key = "b-key".into();
+        let mut a = make_unit("a", "1.0.0", &[], &[("b", "b-key")]);
+        a.key = "a-key".into();
+
+        // Reverse order: a is first, d is last
+        let units = vec![a, b, c, d];
+        let levels = compute_topo_levels(&units);
+
+        assert_eq!(levels.len(), 4, "4 levels for a 4-unit chain");
+        // d at level 0, c at level 1, b at level 2, a at level 3
+        assert!(levels[0].contains(&3), "d (idx 3) should be at level 0");
+        assert!(levels[1].contains(&2), "c (idx 2) should be at level 1");
+        assert!(levels[2].contains(&1), "b (idx 1) should be at level 2");
+        assert!(levels[3].contains(&0), "a (idx 0) should be at level 3");
+    }
+
+    /// Verify unified key format matches make_unit_key format for crates
+    /// with underscores in their name (regression for the serde_core
+    /// key format mismatch).
+    #[test]
+    fn unify_preserves_underscores_in_key() {
+        let a = make_unit("serde_core", "1.0.228", &["result"], &[]);
+        let b = make_unit("serde_core", "1.0.228", &["alloc", "result"], &[]);
+
+        // Record original key prefix pattern (should contain "serde_core")
+        assert!(
+            a.key.contains("serde_core"),
+            "original key should preserve underscores: {}",
+            a.key,
+        );
+
+        let mut consumer = make_unit("serde", "1.0.228", &[], &[("serde_core", &a.key)]);
+        consumer.key = "serde-key".into();
+
+        let mut units = vec![a, b, consumer];
+        unify_feature_variants(&mut units);
+
+        let serde_core_unit = units.iter().find(|u| u.crate_name == "serde_core").unwrap();
+        // The unified key must still contain "serde_core" (not "serde-core")
+        assert!(
+            serde_core_unit.key.contains("serde_core"),
+            "unified key should preserve underscores: {}",
+            serde_core_unit.key,
+        );
+        assert!(
+            !serde_core_unit.key.contains("serde-core"),
+            "unified key should NOT convert underscores to hyphens: {}",
+            serde_core_unit.key,
+        );
     }
 }

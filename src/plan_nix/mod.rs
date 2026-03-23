@@ -15,7 +15,7 @@ pub(crate) mod util;
 use aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use daemon::NixDaemonConn;
 use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
-use unit_graph::extract_units_from_bcx;
+use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_command, which_command_no_deref, which_rustc,
 };
@@ -645,41 +645,7 @@ pub fn run_plan_nix(
         .map(|(i, u)| (u.key.clone(), i))
         .collect();
 
-    // Compute topological levels for parallel derivation registration.
-    let mut unit_level: Vec<usize> = vec![0; nix_units.len()];
-    for i in 0..nix_units.len() {
-        let unit = &nix_units[i];
-        let mut max_dep: usize = 0;
-        for (_, dep_key) in &unit.dep_extern {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key) {
-                max_dep = max_dep.max(unit_level[dep_idx] + 1);
-            }
-        }
-        if let Some(ref key) = unit.build_script_dep
-            && let Some(&dep_idx) = key_to_idx.get(key)
-        {
-            max_dep = max_dep.max(unit_level[dep_idx] + 1);
-        }
-        if let Some(ref key) = unit.build_script_compile_key
-            && let Some(&dep_idx) = key_to_idx.get(key)
-        {
-            max_dep = max_dep.max(unit_level[dep_idx] + 1);
-        }
-        for (key, _) in &unit.links_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(key) {
-                max_dep = max_dep.max(unit_level[dep_idx] + 1);
-            }
-        }
-        unit_level[i] = max_dep;
-    }
-    let max_level = unit_level.iter().max().copied().unwrap_or(0);
-    let topo_levels: Vec<Vec<usize>> = (0..=max_level)
-        .map(|l| {
-            (0..nix_units.len())
-                .filter(|&i| unit_level[i] == l)
-                .collect()
-        })
-        .collect();
+    let topo_levels = compute_topo_levels(&nix_units);
 
     info!(
         "Derivation DAG: {} levels, widest has {} units",
