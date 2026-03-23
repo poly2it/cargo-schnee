@@ -291,6 +291,9 @@ pub fn run_plan_nix(
     profile: &ProfileConfig,
     target: &TargetConfig,
     user_intent: UserIntent,
+    packages: &[String],
+    features: &[String],
+    no_default_features: bool,
 ) -> Result<(Vec<(String, String)>, Vec<NixUnit>, Vec<(String, String)>)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
@@ -360,7 +363,7 @@ pub fn run_plan_nix(
             0,
             false,
             None,
-            true,
+            false, // frozen: false to tolerate superset Cargo.lock (workspace subsets)
             true,
             true,
             &Some(target_dir.to_string_lossy().to_string().into()),
@@ -382,9 +385,21 @@ pub fn run_plan_nix(
                     cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
                 )];
         }
-        // For virtual workspaces (no [package] in root), build all members
-        if ws.is_virtual() {
+        // Package selection: -p/--package narrows the build to specific crates
+        if !packages.is_empty() {
+            options.spec = ops::Packages::Packages(packages.to_vec());
+        } else if ws.is_virtual() {
+            // For virtual workspaces (no [package] in root), build all members
             options.spec = ops::Packages::All(Vec::new());
+        }
+
+        // Feature flags
+        if !features.is_empty() || no_default_features {
+            options.cli_features = cargo::core::resolver::CliFeatures::from_command_line(
+                features,
+                false, // all_features
+                !no_default_features,
+            )?;
         }
 
         // Extract unit graph and target cfg — NO compilation happens here

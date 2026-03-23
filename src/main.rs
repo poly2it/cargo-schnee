@@ -76,6 +76,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Build and run a binary target
     Run {
@@ -97,6 +106,15 @@ enum SchneeCommand {
         /// Name of the binary target to run
         #[arg(long)]
         bin: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the binary after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -118,6 +136,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the test harness after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -139,6 +166,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the bench harness after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -160,6 +196,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Extract and display the compilation unit graph
     Plan {
@@ -708,6 +753,9 @@ fn run_build_pipeline(
     release: bool,
     profile_opt: &Option<String>,
     target: &Option<String>,
+    packages: &[String],
+    features: &[String],
+    no_default_features: bool,
     user_intent: UserIntent,
     verify_drv_paths: bool,
     verbose: u8,
@@ -789,9 +837,18 @@ fn run_build_pipeline(
         UserIntent::Bench => "bench",
         _ => "build",
     };
+    let packages_str = packages.join(",");
+    let features_str = features.join(",");
     let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}",
-        lockfile_hash, manifest_hash, profile.name, target_config.target_triple, intent_str
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        lockfile_hash,
+        manifest_hash,
+        profile.name,
+        target_config.target_triple,
+        intent_str,
+        packages_str,
+        features_str,
+        no_default_features,
     );
     let cached_units = if cache.unit_graph_hash.as_deref() == Some(&unit_graph_key) {
         if let (Some(old_src), Some(units)) = (&cache.unit_graph_src_store, &cache.unit_graph) {
@@ -819,6 +876,9 @@ fn run_build_pipeline(
         &profile,
         &target_config,
         user_intent,
+        packages,
+        features,
+        no_default_features,
     )?;
 
     // Update unit graph cache
@@ -1204,6 +1264,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
         } => {
             run_build_pipeline(
                 manifest_path,
@@ -1211,6 +1274,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Build,
                 verify_drv_paths,
                 verbose,
@@ -1225,6 +1291,9 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref bin,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1233,6 +1302,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Build,
                 verify_drv_paths,
                 verbose,
@@ -1289,6 +1361,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1297,6 +1372,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Test,
                 verify_drv_paths,
                 verbose,
@@ -1338,6 +1416,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1346,6 +1427,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Bench,
                 verify_drv_paths,
                 verbose,
@@ -1392,6 +1476,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
         } => {
             let manifest_path = resolve_manifest(manifest_path)?;
             let project_dir = manifest_path
@@ -1441,6 +1528,9 @@ fn main() -> Result<()> {
                 &profile_cfg,
                 &target_config,
                 UserIntent::Build,
+                package,
+                features,
+                no_default_features,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -1467,6 +1557,9 @@ fn main() -> Result<()> {
                 &default_profile,
                 &default_target,
                 UserIntent::Build,
+                &[],
+                &[],
+                false,
             )?;
             // Output the root .drv paths
             for (drv_path, _) in &root_drvs {

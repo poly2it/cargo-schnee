@@ -16,13 +16,19 @@ let
           ${flag}=*) ${var}="''${1#${flag}=}"; args+=("$1"); shift ;;
     '';
 
+  # Generate case arm for a boolean flag (no value, e.g. --no-default-features)
+  mkForwardBoolCase = flag:
+    let var = flagToVar flag; in
+    ''${flag}) ${var}=1; args+=("$1"); shift ;;'';
+
   # Generate one subcommand override branch
-  mkOverride = subcmd: { command, forwardArgs ? [], setup ? "", postRun ? "" }:
+  mkOverride = subcmd: { command, forwardArgs ? [], boolArgs ? [], setup ? "", postRun ? "" }:
     let
+      allFlags = forwardArgs ++ boolArgs;
       varInits = builtins.concatStringsSep "\n    "
-        (map (f: ''${flagToVar f}=""'') forwardArgs);
+        (map (f: ''${flagToVar f}=""'') allFlags);
       forwardCases = builtins.concatStringsSep "\n        "
-        (map mkForwardCase forwardArgs);
+        ((map mkForwardCase forwardArgs) ++ (map mkForwardBoolCase boolArgs));
     in ''
     ${subcmd})
         shift

@@ -252,6 +252,13 @@ pub(super) fn extract_units_from_bcx(
         });
     }
 
+    // Feature unification: when the same crate appears with different feature sets
+    // (e.g., host vs target feature split in v2 resolver), merge them into one
+    // compilation with the union of all features. Without this, transitive consumers
+    // may link against different feature variants of the same crate, causing type
+    // mismatches (e.g., proc_macro2::Span from variant A != proc_macro2::Span from B).
+    unify_feature_variants(&mut nix_units);
+
     // Compute transitive dependency closure (only for Compile units, for -L paths)
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
@@ -579,4 +586,555 @@ pub(super) fn toposort(
     }
 
     Ok(result)
+}
+
+/// Compute a grouping key for feature unification.  Two NixUnits with the same
+/// group key differ only in their feature sets and should be merged.
+fn feature_agnostic_group_key(u: &NixUnit) -> String {
+    let mode_suffix = match u.kind {
+        UnitKind::BuildScriptRun => "-run",
+        UnitKind::BuildScriptCompile => "-build-script",
+        UnitKind::TestCompile => "-test",
+        UnitKind::Compile => "",
+    };
+    let kind_suffix = if u.for_host { "-host" } else { "" };
+    let mut ct = u.crate_types.clone();
+    ct.sort();
+    format!(
+        "{}/{}/{}{}{}/{}:{:?}",
+        u.crate_name, u.edition, u.source_file, mode_suffix, kind_suffix, u.manifest_dir, ct,
+    )
+}
+
+/// Merge NixUnits that differ only in features into a single unit with the
+/// union of all features.  This prevents inconsistent `--extern` edges when
+/// cargo's v2 resolver produces separate host/target feature sets for the same
+/// crate (e.g. proc_macro2 with and without `span-locations`).
+fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
+    use log::info;
+
+    // Group indices by a feature-agnostic key.
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, u) in nix_units.iter().enumerate() {
+        let gk = feature_agnostic_group_key(u);
+        groups.entry(gk).or_default().push(i);
+    }
+
+    // Find groups that need merging (>1 member = same crate, different features).
+    let mut redirect: HashMap<String, String> = HashMap::new(); // old_key → new_key
+    let mut remove_indices: HashSet<usize> = HashSet::new();
+
+    for indices in groups.values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        // Compute union of features across all variants.
+        let mut unified_features: BTreeSet<String> = BTreeSet::new();
+        for &idx in indices {
+            for f in &nix_units[idx].features {
+                unified_features.insert(f.clone());
+            }
+        }
+        let unified: Vec<String> = unified_features.into_iter().collect();
+
+        // Pick the first index as the survivor; mark the rest for removal.
+        let survivor = indices[0];
+        for &idx in &indices[1..] {
+            redirect.insert(nix_units[idx].key.clone(), String::new()); // placeholder
+            remove_indices.insert(idx);
+        }
+
+        let u = &nix_units[survivor];
+        info!(
+            "Feature unification: merging {} variants of {} (features: {:?} → {:?})",
+            indices.len(),
+            u.crate_name,
+            indices
+                .iter()
+                .map(|&i| &nix_units[i].features)
+                .collect::<Vec<_>>(),
+            unified,
+        );
+
+        // Recompute key and extra_filename with unified features.
+        let pkg_version = u
+            .cargo_envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_PKG_VERSION")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("0.0.0");
+        let target_name_field = u
+            .cargo_envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_CRATE_NAME")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(&u.crate_name);
+        let new_extra_filename = compute_extra_filename(
+            &u.crate_name.replace('_', "-"), // pkg_name uses hyphens
+            pkg_version,
+            target_name_field,
+            &unified,
+            &u.crate_types,
+        );
+
+        // Compute new key from a synthetic identity string.
+        let mode_suffix = match u.kind {
+            UnitKind::BuildScriptRun => "-run",
+            UnitKind::BuildScriptCompile => "-build-script",
+            UnitKind::TestCompile => "-test",
+            UnitKind::Compile => "",
+        };
+        let kind_suffix = if u.for_host { "-host" } else { "" };
+        let mut crate_types_sorted = u.crate_types.clone();
+        crate_types_sorted.sort();
+        let pkg_name = u
+            .cargo_envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_PKG_NAME")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(&u.crate_name);
+        let unified_identity = format!(
+            "{}-{}-{}{}{}-{}-{:?}-{}",
+            pkg_name,
+            pkg_version,
+            target_name_field,
+            mode_suffix,
+            kind_suffix,
+            u.edition,
+            crate_types_sorted,
+            unified.join(","),
+        );
+        let hash = Sha256::digest(unified_identity.as_bytes());
+        let short_hash = format!(
+            "{:016x}",
+            u64::from_le_bytes(hash[..8].try_into().expect("SHA-256 produces ≥8 bytes"))
+        );
+        let type_suffix = if u.crate_types.iter().any(|ct| ct == "proc-macro") {
+            "-pm"
+        } else {
+            ""
+        };
+        let new_key = sanitize_drv_name(&format!(
+            "{}-{}-{}{}{}-{}",
+            pkg_name,
+            pkg_version,
+            target_name_field.replace('_', "-"),
+            mode_suffix,
+            type_suffix,
+            short_hash,
+        ));
+
+        // Update redirect map with the actual new key.
+        let old_survivor_key = nix_units[survivor].key.clone();
+        redirect.insert(old_survivor_key, new_key.clone());
+        for &idx in &indices[1..] {
+            redirect.insert(nix_units[idx].key.clone(), new_key.clone());
+        }
+
+        // Merge is_root and target_name from all variants.
+        let mut merged_is_root = false;
+        let mut merged_target_name = String::new();
+        for &idx in indices {
+            if nix_units[idx].is_root {
+                merged_is_root = true;
+                if merged_target_name.is_empty() {
+                    merged_target_name = nix_units[idx].target_name.clone();
+                }
+            }
+        }
+
+        // Merge dep_extern: union across all variants, preferring the smallest key
+        // (which will be redirected later).
+        let mut merged_dep_extern: HashMap<String, String> = HashMap::new();
+        for &idx in indices {
+            for (ext_name, dep_key) in &nix_units[idx].dep_extern {
+                merged_dep_extern
+                    .entry(ext_name.clone())
+                    .and_modify(|existing| {
+                        if *dep_key < *existing {
+                            *existing = dep_key.clone();
+                        }
+                    })
+                    .or_insert_with(|| dep_key.clone());
+            }
+        }
+        let mut merged_dep_extern_vec: Vec<(String, String)> =
+            merged_dep_extern.into_iter().collect();
+        merged_dep_extern_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Apply to survivor.
+        let u = &mut nix_units[survivor];
+        u.key = new_key;
+        u.features = unified;
+        u.extra_filename = new_extra_filename;
+        u.is_root = merged_is_root;
+        if merged_is_root && !merged_target_name.is_empty() {
+            u.target_name = merged_target_name;
+        }
+        u.dep_extern = merged_dep_extern_vec;
+    }
+
+    if redirect.is_empty() {
+        return;
+    }
+
+    // Apply redirects to ALL units' dependency edges (including the survivor itself,
+    // since its deps may reference keys that were merged).
+    let apply = |key: &str| -> String {
+        redirect
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
+    };
+    for u in nix_units.iter_mut() {
+        for (_, dep_key) in &mut u.dep_extern {
+            *dep_key = apply(dep_key);
+        }
+        if let Some(ref mut k) = u.build_script_dep {
+            *k = apply(k);
+        }
+        if let Some(ref mut k) = u.build_script_compile_key {
+            *k = apply(k);
+        }
+        for (dep_key, _) in &mut u.links_dep_keys {
+            *dep_key = apply(dep_key);
+        }
+    }
+
+    // Remove merged-away units (iterate in reverse to keep indices stable).
+    let mut sorted_removes: Vec<usize> = remove_indices.into_iter().collect();
+    sorted_removes.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in sorted_removes {
+        nix_units.remove(idx);
+    }
+
+    // Deduplicate dep_extern entries that now point to the same key after redirects.
+    for u in nix_units.iter_mut() {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut deduped = Vec::new();
+        for (ext_name, dep_key) in u.dep_extern.drain(..) {
+            if seen.contains_key(&dep_key) {
+                // Same dep_key for different extern names — keep both (this is valid:
+                // a crate can re-export under multiple extern names).
+                deduped.push((ext_name, dep_key));
+            } else {
+                seen.insert(dep_key.clone(), deduped.len());
+                deduped.push((ext_name, dep_key));
+            }
+        }
+        u.dep_extern = deduped;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal NixUnit for testing.  Only the fields relevant to
+    /// feature-unification and dependency tracking are populated.
+    fn make_unit(name: &str, version: &str, features: &[&str], deps: &[(&str, &str)]) -> NixUnit {
+        let feats: Vec<String> = features.iter().map(|f| f.to_string()).collect();
+        let crate_types = vec!["lib".to_string()];
+        let extra_filename = compute_extra_filename(name, version, name, &feats, &crate_types);
+        let identity = format!(
+            "{}-{}-{}-{}-{:?}-{}",
+            name,
+            version,
+            name,
+            "2021",
+            crate_types,
+            feats.join(","),
+        );
+        let hash = Sha256::digest(identity.as_bytes());
+        let short_hash = format!(
+            "{:016x}",
+            u64::from_le_bytes(hash[..8].try_into().expect("8 bytes"))
+        );
+        let key = sanitize_drv_name(&format!("{}-{}-{}-{}", name, version, name, short_hash));
+        NixUnit {
+            key,
+            drv_name: format!("{}-{}-{}", name, version, name),
+            kind: UnitKind::Compile,
+            source_file: format!("/nix/store/fake/{}/src/lib.rs", name),
+            crate_name: name.replace('-', "_"),
+            crate_types,
+            edition: "2021".into(),
+            features: feats,
+            dep_extern: deps
+                .iter()
+                .map(|(ext, key)| (ext.to_string(), key.to_string()))
+                .collect(),
+            all_dep_keys: Vec::new(),
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("/nix/store/fake/{}", name),
+            cargo_envs: vec![
+                ("CARGO_PKG_NAME".into(), name.into()),
+                ("CARGO_PKG_VERSION".into(), version.into()),
+                ("CARGO_CRATE_NAME".into(), name.replace('-', "_")),
+            ],
+            extra_filename,
+            needs_linker: false,
+            is_local: false,
+            links: None,
+            links_dep_keys: Vec::new(),
+            is_root: false,
+            target_name: String::new(),
+            for_host: false,
+            drv_path: None,
+        }
+    }
+
+    // -- feature_agnostic_group_key -------------------------------------------
+
+    #[test]
+    fn group_key_same_for_different_features() {
+        let a = make_unit("proc-macro2", "1.0.106", &["default"], &[]);
+        let b = make_unit(
+            "proc-macro2",
+            "1.0.106",
+            &["default", "span-locations"],
+            &[],
+        );
+        assert_eq!(
+            feature_agnostic_group_key(&a),
+            feature_agnostic_group_key(&b)
+        );
+    }
+
+    #[test]
+    fn group_key_differs_for_different_crates() {
+        let a = make_unit("proc-macro2", "1.0.106", &["default"], &[]);
+        let b = make_unit("quote", "1.0.40", &["default"], &[]);
+        assert_ne!(
+            feature_agnostic_group_key(&a),
+            feature_agnostic_group_key(&b)
+        );
+    }
+
+    #[test]
+    fn group_key_differs_for_host_vs_target() {
+        let mut a = make_unit("proc-macro2", "1.0.106", &["default"], &[]);
+        let b = make_unit("proc-macro2", "1.0.106", &["default"], &[]);
+        a.for_host = true;
+        assert_ne!(
+            feature_agnostic_group_key(&a),
+            feature_agnostic_group_key(&b)
+        );
+    }
+
+    #[test]
+    fn group_key_differs_for_different_kinds() {
+        let mut a = make_unit("foo", "1.0.0", &[], &[]);
+        let b = make_unit("foo", "1.0.0", &[], &[]);
+        a.kind = UnitKind::TestCompile;
+        assert_ne!(
+            feature_agnostic_group_key(&a),
+            feature_agnostic_group_key(&b)
+        );
+    }
+
+    // -- unify_feature_variants: no-op when no duplicates ---------------------
+
+    #[test]
+    fn unify_noop_when_no_duplicates() {
+        let mut units = vec![
+            make_unit("serde", "1.0.0", &["default", "derive"], &[]),
+            make_unit("quote", "1.0.0", &["default"], &[]),
+        ];
+        let keys_before: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 2);
+        let keys_after: Vec<String> = units.iter().map(|u| u.key.clone()).collect();
+        assert_eq!(keys_before, keys_after);
+    }
+
+    // -- unify_feature_variants: merges feature variants ----------------------
+
+    #[test]
+    fn unify_merges_feature_variants() {
+        let mut units = vec![
+            make_unit("proc-macro2", "1.0.106", &["default", "proc-macro"], &[]),
+            make_unit(
+                "proc-macro2",
+                "1.0.106",
+                &["default", "proc-macro", "span-locations"],
+                &[],
+            ),
+        ];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 1, "should merge into one unit");
+        assert_eq!(
+            units[0].features,
+            vec!["default", "proc-macro", "span-locations"],
+            "features should be the union"
+        );
+    }
+
+    #[test]
+    fn unify_merges_non_subset_features() {
+        // Features {A, B} and {A, C} → {A, B, C}
+        let mut units = vec![
+            make_unit("foo", "1.0.0", &["a", "b"], &[]),
+            make_unit("foo", "1.0.0", &["a", "c"], &[]),
+        ];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].features, vec!["a", "b", "c"]);
+    }
+
+    // -- unify_feature_variants: dependency edge consistency -------------------
+
+    #[test]
+    fn unify_redirects_dep_edges() {
+        // Simulate the proc_macro2 scenario:
+        //   pm2_v1 (key "pm2-v1") — features {default}
+        //   pm2_v2 (key "pm2-v2") — features {default, span-locations}
+        //   quote  depends on pm2_v1
+        //   attr   depends on pm2_v2
+        // After unification, both quote and attr should point to the SAME pm2 key.
+        let mut pm2_v1 = make_unit("proc-macro2", "1.0.0", &["default"], &[]);
+        pm2_v1.key = "pm2-v1".into();
+        let mut pm2_v2 = make_unit("proc-macro2", "1.0.0", &["default", "span-locations"], &[]);
+        pm2_v2.key = "pm2-v2".into();
+
+        let mut quote = make_unit("quote", "1.0.0", &["default"], &[("proc_macro2", "pm2-v1")]);
+        quote.key = "quote-key".into();
+
+        let mut attr = make_unit(
+            "proc-macro-error-attr2",
+            "2.0.0",
+            &["default"],
+            &[("proc_macro2", "pm2-v2"), ("quote", "quote-key")],
+        );
+        attr.key = "attr-key".into();
+
+        let mut units = vec![pm2_v1, pm2_v2, quote, attr];
+        unify_feature_variants(&mut units);
+
+        // pm2 variants merged into one
+        let pm2_units: Vec<_> = units
+            .iter()
+            .filter(|u| u.crate_name == "proc_macro2")
+            .collect();
+        assert_eq!(pm2_units.len(), 1, "pm2 should be merged into one unit");
+        let merged_pm2_key = &pm2_units[0].key;
+
+        // Both quote and attr should now reference the same pm2 key
+        let quote_unit = units.iter().find(|u| u.crate_name == "quote").unwrap();
+        let attr_unit = units
+            .iter()
+            .find(|u| u.crate_name == "proc_macro_error_attr2")
+            .unwrap();
+
+        let quote_pm2_dep = quote_unit
+            .dep_extern
+            .iter()
+            .find(|(name, _)| name == "proc_macro2")
+            .map(|(_, k)| k.as_str());
+        let attr_pm2_dep = attr_unit
+            .dep_extern
+            .iter()
+            .find(|(name, _)| name == "proc_macro2")
+            .map(|(_, k)| k.as_str());
+
+        assert_eq!(
+            quote_pm2_dep,
+            Some(merged_pm2_key.as_str()),
+            "quote's proc_macro2 dep should point to merged key"
+        );
+        assert_eq!(
+            attr_pm2_dep,
+            Some(merged_pm2_key.as_str()),
+            "attr's proc_macro2 dep should point to merged key"
+        );
+        assert_eq!(
+            quote_pm2_dep, attr_pm2_dep,
+            "quote and attr must agree on which proc_macro2 they link"
+        );
+    }
+
+    #[test]
+    fn unify_preserves_root_status() {
+        let mut a = make_unit("my-bin", "0.1.0", &["feat-a"], &[]);
+        a.is_root = true;
+        a.target_name = "my-bin".into();
+        let b = make_unit("my-bin", "0.1.0", &["feat-a", "feat-b"], &[]);
+
+        let mut units = vec![a, b];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 1);
+        assert!(units[0].is_root, "root status should be preserved");
+        assert_eq!(units[0].target_name, "my-bin");
+    }
+
+    #[test]
+    fn unify_does_not_merge_host_and_target() {
+        let mut host = make_unit("proc-macro2", "1.0.0", &["default"], &[]);
+        host.for_host = true;
+        let target = make_unit("proc-macro2", "1.0.0", &["default", "span-locations"], &[]);
+
+        let mut units = vec![host, target];
+        unify_feature_variants(&mut units);
+        assert_eq!(
+            units.len(),
+            2,
+            "host and target variants must NOT be merged"
+        );
+    }
+
+    #[test]
+    fn unify_redirects_build_script_dep() {
+        let mut bs_v1 = make_unit("proc-macro2", "1.0.0", &["default"], &[]);
+        bs_v1.key = "pm2-bs-v1".into();
+        bs_v1.kind = UnitKind::BuildScriptRun;
+        let mut bs_v2 = make_unit("proc-macro2", "1.0.0", &["default", "span-locations"], &[]);
+        bs_v2.key = "pm2-bs-v2".into();
+        bs_v2.kind = UnitKind::BuildScriptRun;
+
+        let mut consumer = make_unit("proc-macro2", "1.0.0", &["default"], &[]);
+        consumer.key = "pm2-lib".into();
+        consumer.build_script_dep = Some("pm2-bs-v1".into());
+
+        let mut units = vec![bs_v1, bs_v2, consumer];
+        unify_feature_variants(&mut units);
+
+        let lib_unit = units.iter().find(|u| u.kind == UnitKind::Compile).unwrap();
+        let bs_units: Vec<_> = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::BuildScriptRun)
+            .collect();
+        assert_eq!(bs_units.len(), 1, "build script variants should merge");
+        assert_eq!(
+            lib_unit.build_script_dep.as_deref(),
+            Some(bs_units[0].key.as_str()),
+            "build_script_dep should be redirected to the merged key"
+        );
+    }
+
+    // -- compute_extra_filename -----------------------------------------------
+
+    #[test]
+    fn extra_filename_differs_with_features() {
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["a".into()], &["lib".into()]);
+        let b = compute_extra_filename(
+            "foo",
+            "1.0.0",
+            "foo",
+            &["a".into(), "b".into()],
+            &["lib".into()],
+        );
+        assert_ne!(
+            a, b,
+            "different features must produce different extra_filename"
+        );
+    }
+
+    #[test]
+    fn extra_filename_deterministic() {
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
+        let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
+        assert_eq!(a, b);
+    }
 }
