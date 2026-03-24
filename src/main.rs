@@ -806,7 +806,66 @@ fn rewrite_paths_in_table(
 /// copied into the store tree and Cargo.toml paths are rewritten.
 fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
     // Collect allowed files via git2
-    let allowed_files = collect_git_files(project_dir)?;
+    let mut allowed_files = collect_git_files(project_dir)?;
+
+    // Include extra gitignored files specified in [*.metadata.schnee.extra-includes]
+    let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
+    let mut extra_outside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, store_rel_path)
+    if !extra_patterns.is_empty() {
+        let mut count = 0usize;
+        for pattern in &extra_patterns {
+            // glob crate: `dir/**` only matches the dir itself (zero components).
+            // Normalise to `dir/**/*` so files are matched recursively.
+            let pat = if pattern.ends_with("**") {
+                format!("{}/*", pattern)
+            } else {
+                pattern.clone()
+            };
+            let full = project_dir.join(&pat).to_string_lossy().to_string();
+            match glob::glob(&full) {
+                Ok(paths) => {
+                    for entry in paths.flatten() {
+                        if !entry.is_file() {
+                            continue;
+                        }
+                        if let Ok(rel) = entry.strip_prefix(project_dir) {
+                            // Inside project_dir — add to allowed files
+                            if let Some(ref mut files) = allowed_files {
+                                files.insert(rel.to_path_buf());
+                            }
+                            count += 1;
+                        } else if let (Ok(canon_entry), Ok(canon_proj)) =
+                            (entry.canonicalize(), project_dir.canonicalize())
+                        {
+                            // Outside project_dir — compute _parent-based relative path
+                            // Walk up from project_dir to find common ancestor, replacing
+                            // each '..' with '_parent'.
+                            let proj_comps: Vec<_> = canon_proj.components().collect();
+                            let entry_comps: Vec<_> = canon_entry.components().collect();
+                            let common = proj_comps
+                                .iter()
+                                .zip(entry_comps.iter())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            let mut store_rel = PathBuf::new();
+                            for _ in common..proj_comps.len() {
+                                store_rel.push("_parent");
+                            }
+                            for comp in &entry_comps[common..] {
+                                store_rel.push(comp);
+                            }
+                            extra_outside.push((canon_entry, store_rel));
+                            count += 1;
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
+            }
+        }
+        if count > 0 {
+            shell::status("Including", &format!("{} extra source files", count));
+        }
+    }
 
     // Detect external path dependencies
     let external_deps = find_external_path_deps(project_dir).unwrap_or_else(|e| {
@@ -814,8 +873,9 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         HashMap::new()
     });
 
-    // Fast path: no external deps → try in-process NAR cache
+    // Fast path: no external deps or outside extra includes → try in-process NAR cache
     if external_deps.is_empty()
+        && extra_outside.is_empty()
         && let Some(ref files) = allowed_files
     {
         match nar::serialize_nar(project_dir, Some(files)) {
@@ -859,6 +919,16 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
             log::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
             copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
         }
+    }
+
+    // Copy extra-includes that live outside the project directory
+    for (abs_path, store_rel) in &extra_outside {
+        let dest_path = dest.join(store_rel);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(abs_path, &dest_path)
+            .with_context(|| format!("Failed to copy extra include {}", abs_path.display()))?;
     }
 
     // Copy external path deps into the store tree and rewrite Cargo.toml paths
@@ -931,6 +1001,39 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
 
     log::info!("Source: {} files via git2", files.len());
     Ok(Some(files))
+}
+
+/// Read extra-includes glob patterns from `[workspace.metadata.schnee]` or
+/// `[package.metadata.schnee]` in the given Cargo.toml.
+fn read_extra_includes(manifest_path: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(manifest_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = doc
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("extra-includes"))
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            doc.get("package")
+                .and_then(|p| p.get("metadata"))
+                .and_then(|m| m.get("schnee"))
+                .and_then(|s| s.get("extra-includes"))
+                .and_then(|v| v.as_array())
+        });
+    match arr {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Recursively copy a directory, skipping entries whose names match the exclude list.

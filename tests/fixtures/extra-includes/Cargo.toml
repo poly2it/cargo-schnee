@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "extra-includes"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.schnee]
+extra-includes = ["src/generated/**"]

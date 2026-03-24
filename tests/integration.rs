@@ -589,6 +589,41 @@ fn fixture_build_script_copy() {
     );
 }
 
+/// Extra includes: gitignored generated files specified via
+/// `[package.metadata.schnee] extra-includes` are copied into the store.
+/// The test creates the generated file before building (simulating a pre-build
+/// step that produces gitignored output).
+#[test]
+#[ignore]
+fn fixture_extra_includes() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extra-includes");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    // Simulate a pre-build step: create the gitignored generated file
+    let generated_dir = fixture_dir.join("src/generated");
+    std::fs::create_dir_all(&generated_dir).expect("create generated dir");
+    std::fs::write(generated_dir.join("data.html"), "<p>generated</p>\n")
+        .expect("write generated file");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/extra-includes");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("<p>generated</p>"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the
