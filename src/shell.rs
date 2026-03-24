@@ -18,6 +18,7 @@ pub fn status(label: &str, message: &str) {
 #[derive(Debug, PartialEq)]
 pub enum DrvKind {
     Compile,
+    Check,
     TestCompile,
     BuildScriptCompile,
     BuildScriptRun,
@@ -45,6 +46,8 @@ pub fn parse_drv_display(drv_path: &str) -> (String, String, DrvKind) {
         (n, DrvKind::BuildScriptCompile)
     } else if let Some(n) = name.strip_suffix("-test") {
         (n, DrvKind::TestCompile)
+    } else if let Some(n) = name.strip_suffix("-check") {
+        (n, DrvKind::Check)
     } else {
         (name, DrvKind::Compile)
     };

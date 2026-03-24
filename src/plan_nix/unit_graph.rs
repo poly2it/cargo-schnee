@@ -85,6 +85,8 @@ pub(super) fn extract_units_from_bcx(
             UnitKind::BuildScriptCompile
         } else if unit.mode == CompileMode::Test {
             UnitKind::TestCompile
+        } else if matches!(unit.mode, CompileMode::Check { .. }) {
+            UnitKind::Check
         } else {
             UnitKind::Compile
         };
@@ -317,10 +319,11 @@ pub(super) fn extract_units_from_bcx(
         // Standard cargo env vars
         let cargo_envs = compute_cargo_envs(unit);
 
-        let needs_linker = kind == UnitKind::TestCompile
-            || crate_types
-                .iter()
-                .any(|ct| ct == "proc-macro" || ct == "bin" || ct == "cdylib" || ct == "dylib");
+        let needs_linker = kind != UnitKind::Check
+            && (kind == UnitKind::TestCompile
+                || crate_types.iter().any(|ct| {
+                    ct == "proc-macro" || ct == "bin" || ct == "cdylib" || ct == "dylib"
+                }));
 
         let is_root = root_keys.contains(&key);
         let target_name = root_target_names.get(&key).cloned().unwrap_or_default();
@@ -424,6 +427,7 @@ pub(super) fn mode_suffix_for_drv_name(kind: &UnitKind) -> &'static str {
         UnitKind::BuildScriptCompile => "-build-script",
         UnitKind::BuildScriptRun => "-run-build-script",
         UnitKind::TestCompile => "-test",
+        UnitKind::Check => "-check",
         UnitKind::Compile => "",
     }
 }
@@ -434,6 +438,7 @@ fn compilation_identity(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
+        CompileMode::Check { .. } => "-check",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
@@ -484,6 +489,7 @@ fn make_unit_key(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
+        CompileMode::Check { .. } => "-check",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
@@ -816,6 +822,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         UnitKind::BuildScriptRun => "-run",
         UnitKind::BuildScriptCompile => "-build-script",
         UnitKind::TestCompile => "-test",
+        UnitKind::Check => "-check",
         UnitKind::Compile => "",
     };
     let kind_suffix = if u.for_host { "-host" } else { "" };
@@ -911,6 +918,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             UnitKind::BuildScriptRun => "-run",
             UnitKind::BuildScriptCompile => "-build-script",
             UnitKind::TestCompile => "-test",
+            UnitKind::Check => "-check",
             UnitKind::Compile => "",
         };
         let kind_suffix = if u.for_host { "-host" } else { "" };

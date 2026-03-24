@@ -127,6 +127,8 @@ fn extract_cfg_envs(cfgs: &[cargo_platform::Cfg]) -> Vec<(String, String)> {
 pub enum UnitKind {
     /// Regular rustc compilation (lib, bin, proc-macro, etc.)
     Compile,
+    /// Metadata-only check (--emit=metadata, no codegen)
+    Check,
     /// Compilation with --test (test/bench harness)
     TestCompile,
     /// Compilation of a build script binary
@@ -197,6 +199,10 @@ impl NixUnit {
     /// `crate-type = ["cdylib", "rlib"]` produce both; we must pick the rlib.
     /// Proc-macros are the exception — they are loaded as shared objects.
     pub(crate) fn output_lib_filename(&self) -> String {
+        // Check mode emits only .rmeta (no .rlib/.so)
+        if self.kind == UnitKind::Check {
+            return format!("lib{}{}.rmeta", self.crate_name, self.extra_filename);
+        }
         if self.crate_types.iter().any(|ct| ct == "bin")
             || self.kind == UnitKind::BuildScriptCompile
         {
@@ -234,7 +240,10 @@ pub fn local_compile_drv_paths(units: &[NixUnit]) -> Vec<&str> {
             u.is_local
                 && matches!(
                     u.kind,
-                    UnitKind::Compile | UnitKind::TestCompile | UnitKind::BuildScriptCompile
+                    UnitKind::Compile
+                        | UnitKind::Check
+                        | UnitKind::TestCompile
+                        | UnitKind::BuildScriptCompile
                 )
         })
         .filter_map(|u| u.drv_path.as_deref())

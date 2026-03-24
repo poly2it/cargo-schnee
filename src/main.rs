@@ -58,6 +58,33 @@ struct SchneeArgs {
 
 #[derive(Subcommand)]
 enum SchneeCommand {
+    /// Type-check the project without producing binaries
+    Check {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Build artifacts in release mode, with optimizations
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to check (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Build the project via dynamic derivations (nix build)
     Build {
         /// Path to Cargo.toml
@@ -180,6 +207,12 @@ enum SchneeCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Run clippy lints on the project (not yet implemented)
+    Clippy,
+    /// Build documentation (not yet implemented)
+    Doc,
+    /// Automatically apply lint suggestions (not yet implemented)
+    Fix,
     /// Dump the Nix derivation graph as a Mermaid flowchart
     Graph {
         /// Path to Cargo.toml
@@ -1336,6 +1369,7 @@ fn write_profile(
                     shell::DrvKind::BuildScriptRun => " (build script run)",
                     shell::DrvKind::BuildScriptCompile => " (build script)",
                     shell::DrvKind::TestCompile => " (test)",
+                    shell::DrvKind::Check => " (check)",
                     shell::DrvKind::Compile => "",
                 };
                 let label = if version.is_empty() {
@@ -1463,6 +1497,7 @@ fn run_build_pipeline(
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
     let intent_str = match user_intent {
         UserIntent::Build => "build",
+        UserIntent::Check { .. } => "check",
         UserIntent::Test => "test",
         UserIntent::Bench => "bench",
         _ => "build",
@@ -1600,6 +1635,23 @@ fn run_build_pipeline(
                         };
                         progress.clear();
                         shell::status("Compiling", &msg);
+                    }
+                }
+                shell::DrvKind::Check => {
+                    let display_key = format!("{}-{}", pkg, version);
+                    if seen_pkgs.insert(display_key) {
+                        let is_project = project_pkg_name.as_deref() == Some(&pkg);
+                        let msg = if !version.is_empty() {
+                            if is_project {
+                                format!("{} v{} ({})", pkg, version, project_dir.display())
+                            } else {
+                                format!("{} v{}", pkg, version)
+                            }
+                        } else {
+                            pkg.clone()
+                        };
+                        progress.clear();
+                        shell::status("Checking", &msg);
                     }
                 }
                 shell::DrvKind::BuildScriptRun if verbose > 0 => {
@@ -1891,6 +1943,32 @@ fn main() -> Result<()> {
     let verify_drv_paths = args.verify_drv_paths;
 
     match args.command {
+        SchneeCommand::Check {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref features,
+            no_default_features,
+        } => {
+            run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                features,
+                no_default_features,
+                UserIntent::Check { test: false },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &interrupted,
+            )?;
+        }
         SchneeCommand::Build {
             ref manifest_path,
             ref vendor_dir,
@@ -2168,6 +2246,17 @@ fn main() -> Result<()> {
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
+        }
+        SchneeCommand::Clippy => {
+            anyhow::bail!(
+                "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
+            );
+        }
+        SchneeCommand::Doc => {
+            anyhow::bail!("cargo schnee doc is not yet implemented (needs rustdoc integration)");
+        }
+        SchneeCommand::Fix => {
+            anyhow::bail!("cargo schnee fix is not yet implemented (needs rustfix integration)");
         }
         SchneeCommand::Plan { ref manifest_path } => {
             let manifest_path = resolve_manifest(manifest_path)?;

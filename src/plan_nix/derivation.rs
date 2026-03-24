@@ -266,9 +266,12 @@ fn build_compile_script(
         parts.push("--test".into());
     }
 
-    // --emit (proc-macro crates don't emit metadata, matching cargo)
+    // --emit: check units emit metadata only (no codegen/link),
+    // proc-macro crates don't emit metadata (matching cargo).
     parts.push("--emit".into());
-    if is_proc_macro {
+    if unit.kind == UnitKind::Check {
+        parts.push("dep-info,metadata".into());
+    } else if is_proc_macro {
         parts.push("dep-info,link".into());
     } else {
         parts.push("dep-info,metadata,link".into());

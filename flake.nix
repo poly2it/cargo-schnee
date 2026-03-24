@@ -147,6 +147,12 @@
               export HOME=''${HOME:-$(mktemp -d)}
             '';
         in {
+          check = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee check";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            boolArgs = [ "--no-default-features" ];
+            setup = schneeSetup;
+          };
           build = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee build";
             forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" "--bin" ];
