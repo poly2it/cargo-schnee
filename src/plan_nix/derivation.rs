@@ -540,13 +540,14 @@ fn build_run_script(
         }
     }
 
-    // Ensure build scripts have a writable HOME (some crates spawn embedded
-    // engines or write temp files to $HOME, which doesn't exist in the sandbox).
+    // Create a writable copy of the manifest dir so build scripts that read
+    // files relative to CWD (cargo convention) AND scripts that write temp
+    // files relative to CWD (e.g. embedded DB engines) both work.
     script.push_str("export HOME=$TMPDIR && ");
-
-    // Run the build script from its manifest dir (cargo convention)
+    script.push_str("_bs_workdir=$TMPDIR/workdir && ");
+    script.push_str("cp -r $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
     script.push_str(&format!(
-        "cd $CARGO_MANIFEST_DIR && {}/{} > $out/output",
+        "cd $_bs_workdir && {}/{} > $out/output",
         bs_placeholder, bs_binary,
     ));
 

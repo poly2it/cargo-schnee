@@ -834,7 +834,11 @@ pub fn run_plan_nix(
                     );
                 }
                 log::debug!("Verified: {} -> {}", nix_units[i].key, drv_path);
-            } else if Path::new(&drv_path).exists() {
+            } else if daemon
+                .as_mut()
+                .and_then(|c| c.is_valid_path(&drv_path).ok())
+                .unwrap_or(false)
+            {
                 cache_hits += 1;
             } else if let Some(ref mut conn) = daemon {
                 match conn.add_text_to_store(&drv_file_name, &aterm, &ref_strs) {
