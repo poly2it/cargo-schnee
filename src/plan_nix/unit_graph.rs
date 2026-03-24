@@ -220,13 +220,13 @@ pub(super) fn extract_units_from_bcx(
                     let extern_name = dep_toml_name.as_str().replace('-', "_");
                     // Look up the actual crate name (may differ with
                     // `package = "..."` in the dep spec).
-                    let pkg_name = unit
+                    let dep_spec = unit
                         .pkg
                         .dependencies()
                         .iter()
-                        .find(|d| d.name_in_toml() == dep_toml_name)
-                        .map(|d| d.package_name())
-                        .unwrap_or(dep_toml_name);
+                        .find(|d| d.name_in_toml() == dep_toml_name);
+                    let pkg_name = dep_spec.map(|d| d.package_name()).unwrap_or(dep_toml_name);
+                    let is_platform_gated = dep_spec.is_some_and(|d| d.platform().is_some());
                     // Find the matching lib Unit in the full graph.
                     if let Some(candidate) = all_units.iter().find(|c| {
                         c.pkg.name() == pkg_name
@@ -250,6 +250,17 @@ pub(super) fn extract_units_from_bcx(
                             .entry(feat.to_string())
                             .or_default()
                             .push((extern_name, dep_key));
+                    } else if is_platform_gated {
+                        // Dep is behind a target-specific gate (e.g.
+                        // cfg(windows)) and absent from the unit graph on
+                        // this platform — expected, not actionable.
+                        log::debug!(
+                            "Feature-activated dep {} (dep:{}) not in unit graph for {} \
+                             (platform-gated, expected)",
+                            extern_name,
+                            dep_toml_name,
+                            key,
+                        );
                     } else {
                         log::warn!(
                             "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
