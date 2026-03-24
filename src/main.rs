@@ -1638,14 +1638,6 @@ fn run_build_pipeline(
             || trimmed.starts_with("warning: you did not specify")
             || trimmed.starts_with("copying path '")
         {
-        } else if let Some(quoted) = trimmed.strip_prefix("> ") {
-            progress.clear();
-            diagnostics::emit_line(
-                &mut diag_shell,
-                quoted,
-                &src_store_prefix,
-                &project_dir_prefix,
-            );
         } else if !trimmed.is_empty() {
             progress.clear();
             diagnostics::emit_line(
