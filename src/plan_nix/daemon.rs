@@ -88,6 +88,19 @@ impl NixDaemonConn {
         Ok(())
     }
 
+    /// Check whether a store path is valid (registered in the Nix DB).
+    /// Uses wopIsValidPath (opcode 1).
+    pub(super) fn is_valid_path(&mut self, path: &str) -> Result<bool> {
+        use std::io::Write;
+
+        self.write_u64(1)?; // wopIsValidPath
+        self.write_string(path)?;
+        self.stream.flush()?;
+
+        self.process_stderr()?;
+        Ok(self.read_u64()? != 0)
+    }
+
     /// Register a text file in the Nix store (wopAddTextToStore, opcode 8).
     /// Returns the resulting store path.
     pub(super) fn add_text_to_store(

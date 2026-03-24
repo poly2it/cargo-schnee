@@ -33,17 +33,13 @@ fn remap_paths(text: &str, src_store_prefix: &str, project_dir_prefix: &str) -> 
 
 /// Process a line from nix-store --realise stderr.
 ///
-/// If the line is a rustc JSON diagnostic, parse it, remap paths, and render via Shell.
-/// Otherwise, remap paths and print as-is.
+/// Only rustc JSON diagnostics (with a `rendered` field) are remapped and rendered.
+/// All other lines (build script output, non-JSON nix messages, etc.) are silently dropped.
 pub fn emit_line(shell: &mut Shell, line: &str, src_store_prefix: &str, project_dir_prefix: &str) {
     if let Some(rendered) = try_parse_diagnostic(line) {
         let remapped = remap_paths(&rendered, src_store_prefix, project_dir_prefix);
         // print_ansi_stderr handles ANSI → terminal color translation (or stripping if piped)
         let _ = shell.print_ansi_stderr(remapped.as_bytes());
-    } else if !line.starts_with('{') {
-        // Non-JSON line (nix messages, etc.) — remap paths and print
-        let remapped = remap_paths(line, src_store_prefix, project_dir_prefix);
-        eprintln!("{}", remapped);
     }
     // JSON lines without a `rendered` field (artifacts, etc.) are silently dropped
 }

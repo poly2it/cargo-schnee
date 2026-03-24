@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/greeter", "crates/formatter"]
+resolver = "2"

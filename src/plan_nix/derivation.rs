@@ -45,6 +45,8 @@ pub(super) fn construct_derivation(
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
+    passthru_envs: &[(String, String)],
+    vendor_store: &str,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -63,6 +65,7 @@ pub(super) fn construct_derivation(
             target,
             cfg_envs,
             custom_sys_env,
+            passthru_envs,
         )?,
         _ => {
             let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -172,6 +175,13 @@ pub(super) fn construct_derivation(
         }
     }
 
+    // Build scripts may reference vendor crate source files at runtime
+    // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
+    // Include the vendor dir so the Nix sandbox allows access.
+    if unit.kind == UnitKind::BuildScriptRun && !vendor_store.is_empty() {
+        input_srcs.insert(vendor_store.to_string());
+    }
+
     collect_store_paths(&script, &mut input_srcs);
 
     let mut input_srcs_vec: Vec<String> = input_srcs.into_iter().collect();
@@ -256,9 +266,12 @@ fn build_compile_script(
         parts.push("--test".into());
     }
 
-    // --emit (proc-macro crates don't emit metadata, matching cargo)
+    // --emit: check units emit metadata only (no codegen/link),
+    // proc-macro crates don't emit metadata (matching cargo).
     parts.push("--emit".into());
-    if is_proc_macro {
+    if unit.kind == UnitKind::Check {
+        parts.push("dep-info,metadata".into());
+    } else if is_proc_macro {
         parts.push("dep-info,link".into());
     } else {
         parts.push("dep-info,metadata,link".into());
@@ -310,6 +323,13 @@ fn build_compile_script(
             let filename = dep_unit.output_lib_filename();
             parts.push("--extern".into());
             parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
+        } else {
+            log::warn!(
+                "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
+                unit.key,
+                extern_name,
+                dep_key,
+            );
         }
     }
 
@@ -414,6 +434,7 @@ fn build_run_script(
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
+    passthru_envs: &[(String, String)],
 ) -> Result<String> {
     // The build script compile derivation provides the binary
     let bs_compile_key = unit
@@ -512,6 +533,11 @@ fn build_run_script(
         script.push_str(&format!("export CARGO_FEATURE_{}=1 && ", feat_env));
     }
 
+    // Passthrough env vars forwarded from the outer Nix derivation
+    for (k, v) in passthru_envs {
+        script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
+    }
+
     // DEP_<LINKS>_<KEY> env vars from dependency build scripts
     for (dep_key, links_name) in &unit.links_dep_keys {
         if let Some(dep_drv) = dep_drv_map.get(dep_key) {
@@ -525,9 +551,47 @@ fn build_run_script(
         }
     }
 
-    // Run the build script from its manifest dir (cargo convention)
+    // Create a writable copy of the manifest dir so build scripts that read
+    // files relative to CWD (cargo convention) AND scripts that write temp
+    // files relative to CWD (e.g. embedded DB engines) both work.
+    script.push_str("export HOME=$TMPDIR && ");
+    script.push_str("_bs_workdir=$TMPDIR/workdir && ");
+    script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
+    // Update CARGO_MANIFEST_DIR to the writable copy so build scripts that
+    // read assets via std::env::var("CARGO_MANIFEST_DIR") get a writable path.
+    script.push_str("export CARGO_MANIFEST_DIR=$_bs_workdir && ");
+    script.push_str("export CARGO_MANIFEST_PATH=$_bs_workdir/Cargo.toml && ");
+    // Build scripts that copy files from Nix store paths (vendor deps) can
+    // end up with read-only (444/555) permissions on destinations, because
+    // fs::copy preserves source permissions via fchmod. When multiple threads
+    // copy to the same location, the second thread can't overwrite a 444 file.
+    // This LD_PRELOAD shim ensures all files/dirs always retain owner-write.
+    script.push_str(concat!(
+        r#"cat > $TMPDIR/_wdirs.c << 'WDIRS_EOF'"#,
+        "\n",
+        "#define _GNU_SOURCE\n",
+        "#include <dlfcn.h>\n",
+        "#include <sys/stat.h>\n",
+        "int chmod(const char *p, mode_t m) {\n",
+        "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"chmod\");\n",
+        "  return f(p,m|0200); }\n",
+        "int fchmod(int d, mode_t m) {\n",
+        "  int (*f)(int,mode_t)=dlsym(RTLD_NEXT,\"fchmod\");\n",
+        "  return f(d,m|0200); }\n",
+        "int fchmodat(int d,const char *p, mode_t m, int fl) {\n",
+        "  int (*f)(int,const char*,mode_t,int)=dlsym(RTLD_NEXT,\"fchmodat\");\n",
+        "  return f(d,p,m|0200,fl); }\n",
+        "int mkdir(const char *p, mode_t m) {\n",
+        "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdir\");\n",
+        "  return f(p,m|0200); }\n",
+        "int mkdirat(int d, const char *p, mode_t m) {\n",
+        "  int (*f)(int,const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdirat\");\n",
+        "  return f(d,p,m|0200); }\n",
+        "WDIRS_EOF\n",
+    ));
+    script.push_str("cc -shared -fPIC -o $TMPDIR/_wdirs.so $TMPDIR/_wdirs.c -ldl && ");
     script.push_str(&format!(
-        "cd $CARGO_MANIFEST_DIR && {}/{} > $out/output",
+        "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
     ));
 

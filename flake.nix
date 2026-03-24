@@ -135,6 +135,7 @@
 
     in
     {
+      lib.buildPackage = import ./nix/buildPackage.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
 
       lib.cargoOverrides = { pkgs }:
@@ -146,9 +147,16 @@
               export HOME=''${HOME:-$(mktemp -d)}
             '';
         in {
+          check = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee check";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            boolArgs = [ "--no-default-features" ];
+            setup = schneeSetup;
+          };
           build = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee build";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" "--bin" ];
+            boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
             postRun = ''
               if [ -n "$__target" ]; then
@@ -172,17 +180,20 @@
           };
           run = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee run";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" "--bin" ];
+            boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           test = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee test";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           bench = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee bench";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
         };

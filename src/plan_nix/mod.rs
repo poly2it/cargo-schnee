@@ -15,7 +15,7 @@ pub(crate) mod util;
 use aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use daemon::NixDaemonConn;
 use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
-use unit_graph::extract_units_from_bcx;
+use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_command, which_command_no_deref, which_rustc,
 };
@@ -127,6 +127,8 @@ fn extract_cfg_envs(cfgs: &[cargo_platform::Cfg]) -> Vec<(String, String)> {
 pub enum UnitKind {
     /// Regular rustc compilation (lib, bin, proc-macro, etc.)
     Compile,
+    /// Metadata-only check (--emit=metadata, no codegen)
+    Check,
     /// Compilation with --test (test/bench harness)
     TestCompile,
     /// Compilation of a build script binary
@@ -191,17 +193,34 @@ impl NixUnit {
     }
 
     /// Compute the output filename that rustc will produce for this unit.
+    ///
+    /// For `--extern` linking rustc needs the `.rlib` (which contains a
+    /// `.rustc` metadata section), not the `.so`.  Crates that declare
+    /// `crate-type = ["cdylib", "rlib"]` produce both; we must pick the rlib.
+    /// Proc-macros are the exception — they are loaded as shared objects.
     pub(crate) fn output_lib_filename(&self) -> String {
-        if self
-            .crate_types
-            .iter()
-            .any(|ct| ct == "proc-macro" || ct == "dylib" || ct == "cdylib")
-        {
-            format!("lib{}{}.so", self.crate_name, self.extra_filename)
-        } else if self.crate_types.iter().any(|ct| ct == "bin")
+        // Check mode emits only .rmeta (no .rlib/.so)
+        if self.kind == UnitKind::Check {
+            return format!("lib{}{}.rmeta", self.crate_name, self.extra_filename);
+        }
+        if self.crate_types.iter().any(|ct| ct == "bin")
             || self.kind == UnitKind::BuildScriptCompile
         {
             format!("{}{}", self.crate_name, self.extra_filename)
+        } else if self.crate_types.iter().any(|ct| ct == "proc-macro") {
+            format!("lib{}{}.so", self.crate_name, self.extra_filename)
+        } else if self
+            .crate_types
+            .iter()
+            .any(|ct| ct == "rlib" || ct == "lib")
+        {
+            format!("lib{}{}.rlib", self.crate_name, self.extra_filename)
+        } else if self
+            .crate_types
+            .iter()
+            .any(|ct| ct == "dylib" || ct == "cdylib")
+        {
+            format!("lib{}{}.so", self.crate_name, self.extra_filename)
         } else {
             format!("lib{}{}.rlib", self.crate_name, self.extra_filename)
         }
@@ -221,7 +240,10 @@ pub fn local_compile_drv_paths(units: &[NixUnit]) -> Vec<&str> {
             u.is_local
                 && matches!(
                     u.kind,
-                    UnitKind::Compile | UnitKind::TestCompile | UnitKind::BuildScriptCompile
+                    UnitKind::Compile
+                        | UnitKind::Check
+                        | UnitKind::TestCompile
+                        | UnitKind::BuildScriptCompile
                 )
         })
         .filter_map(|u| u.drv_path.as_deref())
@@ -267,6 +289,58 @@ fn read_custom_sys_env(manifest_path: &Path) -> Vec<(String, String)> {
     }
 }
 
+/// Check whether system libraries required by -sys crates are discoverable via
+/// pkg-config.  Emits warnings for missing libraries — never errors, since some
+/// -sys crates bundle their native code and don't need external packages.
+fn check_system_libraries(
+    nix_units: &[NixUnit],
+    pkg_config_bin: &Option<String>,
+    pkg_config_path_env: &str,
+) {
+    let pc_bin = match pkg_config_bin {
+        Some(bin) => bin,
+        None => return, // can't validate without pkg-config
+    };
+
+    // Collect unique (links_name, pkg_name) pairs from -sys crates.
+    let mut seen = std::collections::HashSet::new();
+    let mut checks: Vec<(&str, &str)> = Vec::new();
+    for u in nix_units {
+        if let Some(ref links) = u.links
+            && seen.insert(links.as_str())
+        {
+            let pkg_name = u
+                .cargo_envs
+                .iter()
+                .find(|(k, _)| k == "CARGO_PKG_NAME")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or(&u.crate_name);
+            checks.push((links.as_str(), pkg_name));
+        }
+    }
+
+    for &(links_name, pkg_name) in &checks {
+        let ok = std::process::Command::new(pc_bin)
+            .arg("--exists")
+            .arg(links_name)
+            .env("PKG_CONFIG_PATH", pkg_config_path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !ok {
+            log::warn!(
+                "System library '{}' (needed by {}) not found via pkg-config. \
+                 Add the corresponding package to buildInputs to make it available.",
+                links_name,
+                pkg_name,
+            );
+        }
+    }
+}
+
 /// Run the plan-nix pipeline: extract unit graph, add derivations, emit root .drv.
 ///
 /// Derivation `.drv` paths are computed in-process (ATerm serialization + store path hash).
@@ -291,6 +365,10 @@ pub fn run_plan_nix(
     profile: &ProfileConfig,
     target: &TargetConfig,
     user_intent: UserIntent,
+    packages: &[String],
+    features: &[String],
+    no_default_features: bool,
+    passthru_envs: &[(String, String)],
 ) -> Result<(Vec<(String, String)>, Vec<NixUnit>, Vec<(String, String)>)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
@@ -360,7 +438,7 @@ pub fn run_plan_nix(
             0,
             false,
             None,
-            true,
+            false, // frozen: false to tolerate superset Cargo.lock (workspace subsets)
             true,
             true,
             &Some(target_dir.to_string_lossy().to_string().into()),
@@ -382,9 +460,21 @@ pub fn run_plan_nix(
                     cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
                 )];
         }
-        // For virtual workspaces (no [package] in root), build all members
-        if ws.is_virtual() {
+        // Package selection: -p/--package narrows the build to specific crates
+        if !packages.is_empty() {
+            options.spec = ops::Packages::Packages(packages.to_vec());
+        } else if ws.is_virtual() {
+            // For virtual workspaces (no [package] in root), build all members
             options.spec = ops::Packages::All(Vec::new());
+        }
+
+        // Feature flags
+        if !features.is_empty() || no_default_features {
+            options.cli_features = cargo::core::resolver::CliFeatures::from_command_line(
+                features,
+                false, // all_features
+                !no_default_features,
+            )?;
         }
 
         // Extract unit graph and target cfg — NO compilation happens here
@@ -406,13 +496,35 @@ pub fn run_plan_nix(
 
     // Resolve tool paths
     let rustc_path = which_rustc()?;
-    let rustc_store = rustc_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot derive store path from rustc"))?
-        .to_string_lossy()
-        .to_string();
     let rustc_str = rustc_path.to_string_lossy().to_string();
+
+    // Query rustc for its sysroot — this works with wrapper scripts (nixpkgs'
+    // rustc-wrapper) where the binary's store path differs from the sysroot.
+    let rustc_sysroot = {
+        let output = std::process::Command::new(&rustc_path)
+            .arg("--print")
+            .arg("sysroot")
+            .output()
+            .context("Failed to run rustc --print sysroot")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "rustc --print sysroot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sysroot = String::from_utf8(output.stdout)
+            .context("rustc sysroot is not UTF-8")?
+            .trim()
+            .to_string();
+        // Resolve symlinks so we get the real nix store path
+        PathBuf::from(&sysroot)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&sysroot))
+            .to_string_lossy()
+            .to_string()
+    };
+    let rustc_store = rustc_sysroot;
+    info!("Sysroot: {}", rustc_store);
+
     // Find the proc_macro rlib from the HOST sysroot (proc-macros always run on host)
     let host_sysroot_lib = PathBuf::from(&rustc_store)
         .join("lib/rustlib")
@@ -420,8 +532,6 @@ pub fn run_plan_nix(
         .join("lib");
     let proc_macro_rlib = find_sysroot_rlib(&host_sysroot_lib, "proc_macro")?;
     info!("proc_macro rlib: {}", proc_macro_rlib);
-    let resolved_sysroot = rustc_store.clone();
-    info!("Sysroot: {}", resolved_sysroot);
     // For cross-compilation, verify the target sysroot exists
     if target.is_cross() {
         let target_sysroot_lib = PathBuf::from(&rustc_store)
@@ -623,6 +733,9 @@ pub fn run_plan_nix(
         }
     }
 
+    // Pre-flight: warn about system libraries that pkg-config can't find.
+    check_system_libraries(&nix_units, &pkg_config_bin, &pkg_config_path_env);
+
     // Build key→index map for looking up dep info
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
@@ -630,41 +743,7 @@ pub fn run_plan_nix(
         .map(|(i, u)| (u.key.clone(), i))
         .collect();
 
-    // Compute topological levels for parallel derivation registration.
-    let mut unit_level: Vec<usize> = vec![0; nix_units.len()];
-    for i in 0..nix_units.len() {
-        let unit = &nix_units[i];
-        let mut max_dep: usize = 0;
-        for (_, dep_key) in &unit.dep_extern {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key) {
-                max_dep = max_dep.max(unit_level[dep_idx] + 1);
-            }
-        }
-        if let Some(ref key) = unit.build_script_dep
-            && let Some(&dep_idx) = key_to_idx.get(key)
-        {
-            max_dep = max_dep.max(unit_level[dep_idx] + 1);
-        }
-        if let Some(ref key) = unit.build_script_compile_key
-            && let Some(&dep_idx) = key_to_idx.get(key)
-        {
-            max_dep = max_dep.max(unit_level[dep_idx] + 1);
-        }
-        for (key, _) in &unit.links_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(key) {
-                max_dep = max_dep.max(unit_level[dep_idx] + 1);
-            }
-        }
-        unit_level[i] = max_dep;
-    }
-    let max_level = unit_level.iter().max().copied().unwrap_or(0);
-    let topo_levels: Vec<Vec<usize>> = (0..=max_level)
-        .map(|l| {
-            (0..nix_units.len())
-                .filter(|&i| unit_level[i] == l)
-                .collect()
-        })
-        .collect();
+    let topo_levels = compute_topo_levels(&nix_units);
 
     info!(
         "Derivation DAG: {} levels, widest has {} units",
@@ -716,7 +795,7 @@ pub fn run_plan_nix(
                     &bash_path,
                     &rustc_str,
                     &proc_macro_rlib,
-                    &resolved_sysroot,
+                    &rustc_store,
                     &mkdir_path,
                     &coreutils_store,
                     unit_cc_bin_dir,
@@ -730,6 +809,8 @@ pub fn run_plan_nix(
                     target,
                     &cfg_envs,
                     &custom_sys_env,
+                    passthru_envs,
+                    &vendor_dir.to_string_lossy(),
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",
@@ -763,7 +844,11 @@ pub fn run_plan_nix(
                     );
                 }
                 log::debug!("Verified: {} -> {}", nix_units[i].key, drv_path);
-            } else if Path::new(&drv_path).exists() {
+            } else if daemon
+                .as_mut()
+                .and_then(|c| c.is_valid_path(&drv_path).ok())
+                .unwrap_or(false)
+            {
                 cache_hits += 1;
             } else if let Some(ref mut conn) = daemon {
                 match conn.add_text_to_store(&drv_file_name, &aterm, &ref_strs) {

@@ -9,7 +9,7 @@ struct Config {
 fn main() {
     let config = Config {
         name: "test".to_string(),
-        value: 421,
+        value: 430,
     };
     let json = serde_json::to_string_pretty(&config).unwrap();
     println!("{}", json);

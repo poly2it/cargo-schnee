@@ -12,6 +12,7 @@ mod plan_nix;
 mod shell;
 
 use anyhow::{Context, Result};
+use cargo::core::Workspace;
 use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
@@ -57,6 +58,33 @@ struct SchneeArgs {
 
 #[derive(Subcommand)]
 enum SchneeCommand {
+    /// Type-check the project without producing binaries
+    Check {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Build artifacts in release mode, with optimizations
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to check (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Build the project via dynamic derivations (nix build)
     Build {
         /// Path to Cargo.toml
@@ -76,6 +104,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Build and run a binary target
     Run {
@@ -97,6 +134,15 @@ enum SchneeCommand {
         /// Name of the binary target to run
         #[arg(long)]
         bin: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the binary after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -118,6 +164,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the test harness after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -139,10 +194,25 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the bench harness after --
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Run clippy lints on the project (not yet implemented)
+    Clippy,
+    /// Build documentation (not yet implemented)
+    Doc,
+    /// Automatically apply lint suggestions (not yet implemented)
+    Fix,
     /// Dump the Nix derivation graph as a Mermaid flowchart
     Graph {
         /// Path to Cargo.toml
@@ -160,6 +230,15 @@ enum SchneeCommand {
         /// Target triple for cross-compilation
         #[arg(long)]
         target: Option<String>,
+        /// Package(s) to build (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Extract and display the compilation unit graph
     Plan {
@@ -205,6 +284,41 @@ fn resolve_manifest(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
             Ok(manifest.canonicalize()?)
         }
     }
+}
+
+/// Resolve the workspace root directory from a manifest path.
+/// If the manifest is a workspace member, walks up to find the workspace root.
+/// Falls back to the manifest's parent directory if no workspace root is found.
+fn resolve_workspace_root(manifest_path: &Path) -> Result<PathBuf> {
+    let gctx = GlobalContext::default()?;
+    match Workspace::new(manifest_path, &gctx) {
+        Ok(ws) => Ok(ws.root().to_path_buf()),
+        Err(_) => manifest_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory")),
+    }
+}
+
+/// Find `Cargo.lock` by checking `project_dir` first, then walking up to
+/// the workspace root. In workspace members the lockfile lives at the root.
+fn find_lockfile(project_dir: &Path) -> Result<PathBuf> {
+    let local = project_dir.join("Cargo.lock");
+    if local.exists() {
+        return Ok(local);
+    }
+    // Walk up looking for Cargo.lock next to a workspace-root Cargo.toml
+    let mut dir = project_dir.to_path_buf();
+    while let Some(parent) = dir.parent() {
+        dir = parent.to_path_buf();
+        let candidate = dir.join("Cargo.lock");
+        let manifest = dir.join("Cargo.toml");
+        if candidate.exists() && manifest.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fall back to the original path so the existing error message is preserved
+    Ok(local)
 }
 
 /// Read the binary target name from Cargo.toml (defaults to package name).
@@ -253,18 +367,550 @@ fn add_to_nix_store(path: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+/// Strip `../` prefixes from a relative path to produce an in-tree name.
+/// Mirrors `sanitiseName` in `buildPackage.nix`.
+/// e.g. `../my-lib` → `my-lib`, `../../foo/bar` → `foo/bar`
+fn sanitise_extra_source_name(rel_path: &str) -> Result<String> {
+    let stripped = rel_path.replace("../", "");
+    if stripped == rel_path || stripped.is_empty() {
+        anyhow::bail!(
+            "Extra source path must contain '../' components: {}",
+            rel_path
+        );
+    }
+    Ok(stripped)
+}
+
+/// Compute a relative path from `from` directory to `to` path.
+/// Both must be absolute (or at least share a common prefix).
+fn relative_path(from: &Path, to: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+
+    // Find common prefix length
+    let common = from_components
+        .iter()
+        .zip(to_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut result = PathBuf::new();
+    // Go up for each remaining component in `from`
+    for _ in &from_components[common..] {
+        result.push(Component::ParentDir);
+    }
+    // Append remaining components of `to`
+    for c in &to_components[common..] {
+        result.push(c);
+    }
+    if result.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        result
+    }
+}
+
+/// Discover path dependencies that live outside `project_dir`.
+///
+/// Uses cargo's `Workspace` to enumerate members, then parses each manifest
+/// for `path = "..."` entries. Returns a map from canonical absolute path
+/// to the sanitised in-tree name (e.g. `../my-lib` → `my-lib`).
+fn find_external_path_deps(project_dir: &Path) -> Result<HashMap<PathBuf, String>> {
+    let manifest_path = project_dir.join("Cargo.toml");
+    let gctx = GlobalContext::default()?;
+    let ws = Workspace::new(&manifest_path, &gctx)?;
+
+    let project_canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
+    let mut manifests = vec![manifest_path.clone()];
+    for pkg in ws.members() {
+        let p = pkg.manifest_path().to_path_buf();
+        if p != manifest_path {
+            manifests.push(p);
+        }
+    }
+
+    let mut external: HashMap<PathBuf, String> = HashMap::new();
+    for manifest in &manifests {
+        let content = match std::fs::read_to_string(manifest) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let manifest_dir = manifest.parent().unwrap();
+        collect_external_path_deps(
+            &doc,
+            manifest_dir,
+            &project_canonical,
+            project_dir,
+            &mut external,
+        );
+    }
+
+    if !external.is_empty() {
+        log::info!(
+            "Found {} external path dep(s): {:?}",
+            external.len(),
+            external.values().collect::<Vec<_>>()
+        );
+    }
+    Ok(external)
+}
+
+/// Walk all dependency tables in a parsed Cargo.toml and collect path deps
+/// that resolve to directories outside `project_dir`.
+fn collect_external_path_deps(
+    doc: &toml::Value,
+    manifest_dir: &Path,
+    project_canonical: &Path,
+    project_dir: &Path,
+    external: &mut HashMap<PathBuf, String>,
+) {
+    let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    // Top-level dep sections
+    for section in &dep_sections {
+        if let Some(table) = doc.get(section).and_then(|v| v.as_table()) {
+            collect_external_from_table(
+                table,
+                manifest_dir,
+                project_canonical,
+                project_dir,
+                external,
+            );
+        }
+    }
+
+    // [workspace.dependencies]
+    if let Some(ws) = doc.get("workspace").and_then(|v| v.as_table())
+        && let Some(table) = ws.get("dependencies").and_then(|v| v.as_table())
+    {
+        collect_external_from_table(
+            table,
+            manifest_dir,
+            project_canonical,
+            project_dir,
+            external,
+        );
+    }
+
+    // [target.*.{dependencies,dev-dependencies,build-dependencies}]
+    if let Some(target) = doc.get("target").and_then(|v| v.as_table()) {
+        for (_, target_val) in target {
+            if let Some(target_table) = target_val.as_table() {
+                for section in &dep_sections {
+                    if let Some(table) = target_table.get(*section).and_then(|v| v.as_table()) {
+                        collect_external_from_table(
+                            table,
+                            manifest_dir,
+                            project_canonical,
+                            project_dir,
+                            external,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // [patch.*]
+    if let Some(patch) = doc.get("patch").and_then(|v| v.as_table()) {
+        for (_, source_table) in patch {
+            if let Some(table) = source_table.as_table() {
+                collect_external_from_table(
+                    table,
+                    manifest_dir,
+                    project_canonical,
+                    project_dir,
+                    external,
+                );
+            }
+        }
+    }
+}
+
+/// Inspect a single dependency table for path deps outside the project.
+///
+/// When a dep is a sub-crate inside an external workspace (i.e. the sub-crate
+/// inherits workspace properties), the entire workspace root is added to the
+/// map so that workspace inheritance still resolves in the store tree.
+fn collect_external_from_table(
+    table: &toml::value::Table,
+    manifest_dir: &Path,
+    project_canonical: &Path,
+    project_dir: &Path,
+    external: &mut HashMap<PathBuf, String>,
+) {
+    for (_, dep_val) in table {
+        let path_str = match dep_val.get("path").and_then(|p| p.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let resolved = manifest_dir.join(path_str);
+        let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+        if !canonical.starts_with(project_canonical) {
+            // Check if this dep is inside an external workspace.
+            // If so, copy the entire workspace root to preserve inheritance.
+            if let Some(ws_root) = find_enclosing_workspace_root(&canonical, project_canonical) {
+                let ws_rel = relative_path(project_dir, &ws_root);
+                let ws_rel_str = ws_rel.to_string_lossy();
+                if let Ok(ws_sanitised) = sanitise_extra_source_name(&ws_rel_str) {
+                    // Map the workspace root for copying
+                    external
+                        .entry(ws_root.clone())
+                        .or_insert(ws_sanitised.clone());
+                    // Map the dep path for rewriting (sub-path within the workspace)
+                    if canonical != ws_root {
+                        let sub_path = canonical.strip_prefix(&ws_root).unwrap_or(Path::new(""));
+                        let dep_sanitised =
+                            format!("{}/{}", ws_sanitised, sub_path.to_string_lossy());
+                        external.entry(canonical).or_insert(dep_sanitised);
+                    }
+                }
+            } else {
+                let rel = relative_path(project_dir, &canonical);
+                let rel_str = rel.to_string_lossy();
+                if let Ok(sanitised) = sanitise_extra_source_name(&rel_str) {
+                    external.entry(canonical).or_insert(sanitised);
+                }
+            }
+        }
+    }
+}
+
+/// Check if `path` is a sub-crate inside a workspace by looking at the
+/// immediate parent directory for a `Cargo.toml` with a `[workspace]` section.
+/// Returns the workspace root directory if found.
+fn find_enclosing_workspace_root(path: &Path, _stop_at: &Path) -> Option<PathBuf> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    let parent = dir.parent()?;
+    let manifest = parent.join("Cargo.toml");
+    if manifest.exists()
+        && let Ok(content) = std::fs::read_to_string(&manifest)
+        && let Ok(doc) = toml::from_str::<toml::Value>(&content)
+        && doc.get("workspace").is_some()
+    {
+        return Some(parent.to_path_buf());
+    }
+    None
+}
+
+/// Copy git-tracked files from an external source directory into `dest`.
+fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
+    let files = collect_git_files(source_dir)?;
+    match files {
+        Some(files) => {
+            for file in &files {
+                let src_path = source_dir.join(file);
+                let dest_path = dest.join(file);
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if src_path.is_file() {
+                    std::fs::copy(&src_path, &dest_path)
+                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
+                }
+            }
+            log::info!(
+                "Extra source copy: {} files from {}",
+                files.len(),
+                source_dir.display()
+            );
+        }
+        None => {
+            copy_dir_excluding(source_dir, dest, &["target", ".git", ".direnv", "result"])?;
+            log::info!("Extra source copy (no git): {}", source_dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite path dependencies in all Cargo.toml files under `dest` so that
+/// external deps point to their new in-tree locations.
+fn rewrite_cargo_tomls(
+    dest: &Path,
+    project_dir: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> Result<()> {
+    let pattern = format!("{}/**/Cargo.toml", dest.display());
+    let root_toml = dest.join("Cargo.toml");
+
+    let mut toml_paths: Vec<PathBuf> = glob::glob(&pattern)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    if root_toml.exists() && !toml_paths.contains(&root_toml) {
+        toml_paths.push(root_toml.clone());
+    }
+
+    let project_canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+
+    for toml_path in &toml_paths {
+        let content = std::fs::read_to_string(toml_path)?;
+        let mut doc: toml::Value = match toml::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // Determine the original manifest dir for path resolution
+        let rel_in_dest = toml_path.strip_prefix(dest).unwrap_or(Path::new(""));
+        let original_manifest_dir = project_canonical
+            .join(rel_in_dest)
+            .parent()
+            .unwrap_or(&project_canonical)
+            .to_path_buf();
+        let dest_manifest_dir = toml_path.parent().unwrap();
+
+        let mut changed = false;
+        let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+        // Top-level dep sections
+        for section in &dep_sections {
+            if let Some(table) = doc.get_mut(section).and_then(|v| v.as_table_mut()) {
+                changed |= rewrite_paths_in_table(
+                    table,
+                    &original_manifest_dir,
+                    dest_manifest_dir,
+                    dest,
+                    mappings,
+                );
+            }
+        }
+
+        // [workspace.dependencies]
+        if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut())
+            && let Some(table) = ws.get_mut("dependencies").and_then(|v| v.as_table_mut())
+        {
+            changed |= rewrite_paths_in_table(
+                table,
+                &original_manifest_dir,
+                dest_manifest_dir,
+                dest,
+                mappings,
+            );
+        }
+
+        // [target.*.deps]
+        if let Some(target) = doc.get_mut("target").and_then(|v| v.as_table_mut()) {
+            for (_, target_val) in target.iter_mut() {
+                if let Some(target_table) = target_val.as_table_mut() {
+                    for section in &dep_sections {
+                        if let Some(table) = target_table
+                            .get_mut(*section)
+                            .and_then(|v| v.as_table_mut())
+                        {
+                            changed |= rewrite_paths_in_table(
+                                table,
+                                &original_manifest_dir,
+                                dest_manifest_dir,
+                                dest,
+                                mappings,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // [patch.*]
+        if let Some(patch) = doc.get_mut("patch").and_then(|v| v.as_table_mut()) {
+            for (_, source_table) in patch.iter_mut() {
+                if let Some(table) = source_table.as_table_mut() {
+                    changed |= rewrite_paths_in_table(
+                        table,
+                        &original_manifest_dir,
+                        dest_manifest_dir,
+                        dest,
+                        mappings,
+                    );
+                }
+            }
+        }
+
+        if changed {
+            std::fs::write(toml_path, toml::to_string(&doc)?)?;
+        }
+    }
+
+    // Update [workspace].exclude in root Cargo.toml separately to avoid
+    // symlink-resolved path comparison issues with glob results.
+    update_workspace_exclude(&root_toml, mappings)?;
+
+    Ok(())
+}
+
+/// Add external dep directory names to `[workspace].exclude` in the root
+/// Cargo.toml so that workspace globs (e.g. `members = ["*"]`) don't try
+/// to treat them as workspace members.
+fn update_workspace_exclude(root_toml: &Path, mappings: &HashMap<PathBuf, String>) -> Result<()> {
+    if !root_toml.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(root_toml)?;
+    let mut doc: toml::Value = match toml::from_str(&content) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+
+    let mut changed = false;
+    if let Some(ws) = doc.get_mut("workspace").and_then(|v| v.as_table_mut()) {
+        let exclude = ws
+            .entry("exclude")
+            .or_insert(toml::Value::Array(Vec::new()));
+        if let Some(arr) = exclude.as_array_mut() {
+            // Collect unique top-level directory names from sanitised paths.
+            // e.g. "my-lib/sub" → "my-lib"
+            let mut seen = std::collections::HashSet::new();
+            for sanitised in mappings.values() {
+                let top_dir = sanitised.split('/').next().unwrap_or(sanitised).to_string();
+                if seen.insert(top_dir.clone()) {
+                    let val = toml::Value::String(top_dir);
+                    if !arr.contains(&val) {
+                        arr.push(val);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        std::fs::write(root_toml, toml::to_string(&doc)?)?;
+    }
+    Ok(())
+}
+
+/// Rewrite `path = "..."` entries in a single dependency table.
+/// Returns true if any entry was modified.
+fn rewrite_paths_in_table(
+    table: &mut toml::value::Table,
+    original_manifest_dir: &Path,
+    dest_manifest_dir: &Path,
+    dest: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> bool {
+    let mut changed = false;
+    for (_, dep_val) in table.iter_mut() {
+        let dep_table = match dep_val.as_table_mut() {
+            Some(t) => t,
+            None => continue,
+        };
+        let path_str = match dep_table.get("path").and_then(|p| p.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let resolved = original_manifest_dir.join(&path_str);
+        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        if let Some(sanitised) = mappings.get(&canonical) {
+            let target_in_dest = dest.join(sanitised);
+            let new_rel = relative_path(dest_manifest_dir, &target_in_dest);
+            dep_table.insert(
+                "path".into(),
+                toml::Value::String(new_rel.to_string_lossy().into_owned()),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Add the project source to the Nix store, respecting .gitignore.
 ///
 /// Uses libgit2 to discover tracked + untracked-but-not-ignored files,
 /// then computes the NAR store path in-process. If the path already exists
 /// in the store (warm build), skips the subprocess entirely. Otherwise,
 /// copies files to a temp dir and runs `nix-store --add`.
+///
+/// When path dependencies outside `project_dir` are detected, they are
+/// copied into the store tree and Cargo.toml paths are rewritten.
 fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
     // Collect allowed files via git2
-    let allowed_files = collect_git_files(project_dir)?;
+    let mut allowed_files = collect_git_files(project_dir)?;
 
-    // Try in-process NAR hash to check if store path already exists
-    if let Some(ref files) = allowed_files {
+    // Include extra gitignored files specified in [*.metadata.schnee.extra-includes]
+    let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
+    let mut extra_outside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, store_rel_path)
+    if !extra_patterns.is_empty() {
+        let mut count = 0usize;
+        for pattern in &extra_patterns {
+            // glob crate: `dir/**` only matches the dir itself (zero components).
+            // Normalise to `dir/**/*` so files are matched recursively.
+            let pat = if pattern.ends_with("**") {
+                format!("{}/*", pattern)
+            } else {
+                pattern.clone()
+            };
+            let full = project_dir.join(&pat).to_string_lossy().to_string();
+            match glob::glob(&full) {
+                Ok(paths) => {
+                    for entry in paths.flatten() {
+                        if !entry.is_file() {
+                            continue;
+                        }
+                        if let Ok(rel) = entry.strip_prefix(project_dir) {
+                            // Inside project_dir — add to allowed files
+                            if let Some(ref mut files) = allowed_files {
+                                files.insert(rel.to_path_buf());
+                            }
+                            count += 1;
+                        } else if let (Ok(canon_entry), Ok(canon_proj)) =
+                            (entry.canonicalize(), project_dir.canonicalize())
+                        {
+                            // Outside project_dir — compute _parent-based relative path
+                            // Walk up from project_dir to find common ancestor, replacing
+                            // each '..' with '_parent'.
+                            let proj_comps: Vec<_> = canon_proj.components().collect();
+                            let entry_comps: Vec<_> = canon_entry.components().collect();
+                            let common = proj_comps
+                                .iter()
+                                .zip(entry_comps.iter())
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            let mut store_rel = PathBuf::new();
+                            for _ in common..proj_comps.len() {
+                                store_rel.push("_parent");
+                            }
+                            for comp in &entry_comps[common..] {
+                                store_rel.push(comp);
+                            }
+                            extra_outside.push((canon_entry, store_rel));
+                            count += 1;
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
+            }
+        }
+        if count > 0 {
+            shell::status("Including", &format!("{} extra source files", count));
+        }
+    }
+
+    // Detect external path dependencies
+    let external_deps = find_external_path_deps(project_dir).unwrap_or_else(|e| {
+        log::warn!("Failed to detect external path deps: {}", e);
+        HashMap::new()
+    });
+
+    // Fast path: no external deps or outside extra includes → try in-process NAR cache
+    if external_deps.is_empty()
+        && extra_outside.is_empty()
+        && let Some(ref files) = allowed_files
+    {
         match nar::serialize_nar(project_dir, Some(files)) {
             Ok(nar_data) => {
                 let store_path = nar::compute_nar_store_path("project-src", &nar_data);
@@ -283,7 +929,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         }
     }
 
-    // Fallback: copy to temp dir + nix-store --add
+    // Copy project files to temp dir
     let temp = tempfile::tempdir().context("Failed to create temp dir for source copy")?;
     let dest = temp.path().join("project-src");
 
@@ -306,6 +952,36 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
             log::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
             copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
         }
+    }
+
+    // Copy extra-includes that live outside the project directory
+    for (abs_path, store_rel) in &extra_outside {
+        let dest_path = dest.join(store_rel);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(abs_path, &dest_path)
+            .with_context(|| format!("Failed to copy extra include {}", abs_path.display()))?;
+    }
+
+    // Copy external path deps into the store tree and rewrite Cargo.toml paths
+    if !external_deps.is_empty() {
+        // Collect all source roots so we can skip sub-paths already covered
+        // by a workspace root copy (e.g. don't copy sub-crate/ separately
+        // when its parent workspace/ is already being copied).
+        let roots: Vec<&PathBuf> = external_deps.keys().collect();
+        for (abs_path, sanitised) in &external_deps {
+            let dominated = roots
+                .iter()
+                .any(|r| *r != abs_path && abs_path.starts_with(r));
+            if dominated {
+                continue;
+            }
+            let ext_dest = dest.join(sanitised);
+            copy_source_to_dest(abs_path, &ext_dest)
+                .with_context(|| format!("Failed to copy extra source: {}", abs_path.display()))?;
+        }
+        rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
     }
 
     add_to_nix_store(&dest.to_string_lossy())
@@ -358,6 +1034,39 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
 
     log::info!("Source: {} files via git2", files.len());
     Ok(Some(files))
+}
+
+/// Read extra-includes glob patterns from `[workspace.metadata.schnee]` or
+/// `[package.metadata.schnee]` in the given Cargo.toml.
+fn read_extra_includes(manifest_path: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(manifest_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = doc
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("extra-includes"))
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            doc.get("package")
+                .and_then(|p| p.get("metadata"))
+                .and_then(|m| m.get("schnee"))
+                .and_then(|s| s.get("extra-includes"))
+                .and_then(|v| v.as_array())
+        });
+    match arr {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Recursively copy a directory, skipping entries whose names match the exclude list.
@@ -660,6 +1369,7 @@ fn write_profile(
                     shell::DrvKind::BuildScriptRun => " (build script run)",
                     shell::DrvKind::BuildScriptCompile => " (build script)",
                     shell::DrvKind::TestCompile => " (test)",
+                    shell::DrvKind::Check => " (check)",
                     shell::DrvKind::Compile => "",
                 };
                 let label = if version.is_empty() {
@@ -708,6 +1418,9 @@ fn run_build_pipeline(
     release: bool,
     profile_opt: &Option<String>,
     target: &Option<String>,
+    packages: &[String],
+    features: &[String],
+    no_default_features: bool,
     user_intent: UserIntent,
     verify_drv_paths: bool,
     verbose: u8,
@@ -716,9 +1429,8 @@ fn run_build_pipeline(
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
-    let project_dir = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory"))?;
+    let project_dir_buf = resolve_workspace_root(&manifest_path)?;
+    let project_dir = project_dir_buf.as_path();
 
     let profile = if release {
         plan_nix::ProfileConfig::release()
@@ -747,7 +1459,7 @@ fn run_build_pipeline(
 
     // Vendor dependencies — skip if Cargo.lock hasn't changed
     let vendor_start = Instant::now();
-    let lockfile_path = project_dir.join("Cargo.lock");
+    let lockfile_path = find_lockfile(project_dir)?;
     let lockfile_hash = hash_file(&lockfile_path)?;
     let vendor_store = if let Some(dir) = vendor_dir {
         let dir = dir
@@ -785,13 +1497,23 @@ fn run_build_pipeline(
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
     let intent_str = match user_intent {
         UserIntent::Build => "build",
+        UserIntent::Check { .. } => "check",
         UserIntent::Test => "test",
         UserIntent::Bench => "bench",
         _ => "build",
     };
+    let packages_str = packages.join(",");
+    let features_str = features.join(",");
     let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}",
-        lockfile_hash, manifest_hash, profile.name, target_config.target_triple, intent_str
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        lockfile_hash,
+        manifest_hash,
+        profile.name,
+        target_config.target_triple,
+        intent_str,
+        packages_str,
+        features_str,
+        no_default_features,
     );
     let cached_units = if cache.unit_graph_hash.as_deref() == Some(&unit_graph_key) {
         if let (Some(old_src), Some(units)) = (&cache.unit_graph_src_store, &cache.unit_graph) {
@@ -809,6 +1531,16 @@ fn run_build_pipeline(
     } else {
         None
     };
+
+    // Resolve passthrough env vars for build-script derivations.
+    // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
+    // whose values should be forwarded into per-crate build-script derivations.
+    let passthru_envs: Vec<(String, String)> = std::env::var("CARGO_SCHNEE_PASSTHRU_ENVS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|name| std::env::var(name).ok().map(|val| (name.to_string(), val)))
+        .collect();
+
     let (root_drvs, plan_units, cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
@@ -819,6 +1551,10 @@ fn run_build_pipeline(
         &profile,
         &target_config,
         user_intent,
+        packages,
+        features,
+        no_default_features,
+        &passthru_envs,
     )?;
 
     // Update unit graph cache
@@ -901,6 +1637,23 @@ fn run_build_pipeline(
                         shell::status("Compiling", &msg);
                     }
                 }
+                shell::DrvKind::Check => {
+                    let display_key = format!("{}-{}", pkg, version);
+                    if seen_pkgs.insert(display_key) {
+                        let is_project = project_pkg_name.as_deref() == Some(&pkg);
+                        let msg = if !version.is_empty() {
+                            if is_project {
+                                format!("{} v{} ({})", pkg, version, project_dir.display())
+                            } else {
+                                format!("{} v{}", pkg, version)
+                            }
+                        } else {
+                            pkg.clone()
+                        };
+                        progress.clear();
+                        shell::status("Checking", &msg);
+                    }
+                }
                 shell::DrvKind::BuildScriptRun if verbose > 0 => {
                     let msg = if !version.is_empty() {
                         format!("build script for {} v{}", pkg, version)
@@ -937,14 +1690,6 @@ fn run_build_pipeline(
             || trimmed.starts_with("warning: you did not specify")
             || trimmed.starts_with("copying path '")
         {
-        } else if let Some(quoted) = trimmed.strip_prefix("> ") {
-            progress.clear();
-            diagnostics::emit_line(
-                &mut diag_shell,
-                quoted,
-                &src_store_prefix,
-                &project_dir_prefix,
-            );
         } else if !trimmed.is_empty() {
             progress.clear();
             diagnostics::emit_line(
@@ -1198,12 +1943,15 @@ fn main() -> Result<()> {
     let verify_drv_paths = args.verify_drv_paths;
 
     match args.command {
-        SchneeCommand::Build {
+        SchneeCommand::Check {
             ref manifest_path,
             ref vendor_dir,
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
         } => {
             run_build_pipeline(
                 manifest_path,
@@ -1211,6 +1959,35 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
+                UserIntent::Check { test: false },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &interrupted,
+            )?;
+        }
+        SchneeCommand::Build {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref features,
+            no_default_features,
+        } => {
+            run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Build,
                 verify_drv_paths,
                 verbose,
@@ -1225,6 +2002,9 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref bin,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1233,6 +2013,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Build,
                 verify_drv_paths,
                 verbose,
@@ -1289,6 +2072,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1297,6 +2083,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Test,
                 verify_drv_paths,
                 verbose,
@@ -1338,6 +2127,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -1346,6 +2138,9 @@ fn main() -> Result<()> {
                 release,
                 profile,
                 target,
+                package,
+                features,
+                no_default_features,
                 UserIntent::Bench,
                 verify_drv_paths,
                 verbose,
@@ -1392,6 +2187,9 @@ fn main() -> Result<()> {
             release,
             ref profile,
             ref target,
+            ref package,
+            ref features,
+            no_default_features,
         } => {
             let manifest_path = resolve_manifest(manifest_path)?;
             let project_dir = manifest_path
@@ -1441,9 +2239,24 @@ fn main() -> Result<()> {
                 &profile_cfg,
                 &target_config,
                 UserIntent::Build,
+                package,
+                features,
+                no_default_features,
+                &[],
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
+        }
+        SchneeCommand::Clippy => {
+            anyhow::bail!(
+                "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
+            );
+        }
+        SchneeCommand::Doc => {
+            anyhow::bail!("cargo schnee doc is not yet implemented (needs rustdoc integration)");
+        }
+        SchneeCommand::Fix => {
+            anyhow::bail!("cargo schnee fix is not yet implemented (needs rustfix integration)");
         }
         SchneeCommand::Plan { ref manifest_path } => {
             let manifest_path = resolve_manifest(manifest_path)?;
@@ -1467,6 +2280,10 @@ fn main() -> Result<()> {
                 &default_profile,
                 &default_target,
                 UserIntent::Build,
+                &[],
+                &[],
+                false,
+                &[],
             )?;
             // Output the root .drv paths
             for (drv_path, _) in &root_drvs {
@@ -1550,5 +2367,156 @@ version = "1.2.3"
         let manifest = dir.path().join("Cargo.toml");
         std::fs::write(&manifest, "[dependencies]\n").unwrap();
         assert_eq!(read_package_version(&manifest), None);
+    }
+
+    #[test]
+    fn sanitise_strips_dot_dot() {
+        assert_eq!(sanitise_extra_source_name("../foo").unwrap(), "foo");
+        assert_eq!(
+            sanitise_extra_source_name("../../bar/baz").unwrap(),
+            "bar/baz"
+        );
+    }
+
+    #[test]
+    fn sanitise_rejects_no_dot_dot() {
+        assert!(sanitise_extra_source_name("foo").is_err());
+        assert!(sanitise_extra_source_name("./foo").is_err());
+    }
+
+    #[test]
+    fn relative_path_sibling() {
+        let from = Path::new("/a/b/project");
+        let to = Path::new("/a/b/sibling");
+        assert_eq!(relative_path(from, to), PathBuf::from("../sibling"));
+    }
+
+    #[test]
+    fn relative_path_deeper() {
+        let from = Path::new("/a/b/project/crates/foo");
+        let to = Path::new("/a/b/sibling");
+        assert_eq!(relative_path(from, to), PathBuf::from("../../../sibling"));
+    }
+
+    #[test]
+    fn relative_path_same() {
+        let p = Path::new("/a/b/c");
+        assert_eq!(relative_path(p, p), PathBuf::from("."));
+    }
+
+    #[test]
+    #[ignore] // requires tests/fixtures/ which is not in the Nix build source
+    fn find_external_path_deps_fixture() {
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-path-dep");
+        let deps = find_external_path_deps(&fixture_dir).unwrap();
+        assert_eq!(deps.len(), 1, "expected 1 external dep, got {:?}", deps);
+        // The value should be the sanitised name
+        let names: Vec<_> = deps.values().collect();
+        assert!(
+            names.contains(&&"external-dep-lib".to_string()),
+            "expected 'external-dep-lib' in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn update_workspace_exclude_adds_top_level_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_toml = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &root_toml,
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"target\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        let mut mappings = HashMap::new();
+        mappings.insert(PathBuf::from("/abs/my-lib"), "my-lib".to_string());
+        mappings.insert(PathBuf::from("/abs/other"), "other/sub".to_string());
+
+        update_workspace_exclude(&root_toml, &mappings).unwrap();
+
+        let content = std::fs::read_to_string(&root_toml).unwrap();
+        let doc: toml::Value = toml::from_str(&content).unwrap();
+        let exclude = doc["workspace"]["exclude"].as_array().unwrap();
+        let exclude_strs: Vec<&str> = exclude.iter().filter_map(|v| v.as_str()).collect();
+
+        assert!(
+            exclude_strs.contains(&"target"),
+            "should preserve existing excludes: {:?}",
+            exclude_strs
+        );
+        assert!(
+            exclude_strs.contains(&"my-lib"),
+            "should add top-level dir: {:?}",
+            exclude_strs
+        );
+        // "other/sub" should be excluded as "other" (top-level component only)
+        assert!(
+            exclude_strs.contains(&"other"),
+            "should use top-level component, not full path: {:?}",
+            exclude_strs
+        );
+        assert!(
+            !exclude_strs.contains(&"other/sub"),
+            "should NOT use full sanitised path: {:?}",
+            exclude_strs
+        );
+    }
+
+    #[test]
+    fn rewrite_cargo_tomls_with_workspace_glob() {
+        // Simulates the scenario: workspace with members=["*"], an external
+        // dep directory copied into the tree. Without proper exclude, cargo
+        // would try to load it as a workspace member and fail.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let project_dir = dir.path(); // project_dir == dest for this test
+
+        // Root workspace Cargo.toml with glob members
+        std::fs::write(
+            dest.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"target\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        // A member crate with an external path dep
+        std::fs::create_dir_all(dest.join("app/src")).unwrap();
+        std::fs::write(
+            dest.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nmy-lib = { path = \"../../my-lib\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dest.join("app/src/main.rs"), "fn main() {}\n").unwrap();
+
+        // Simulate the external dep already copied in
+        std::fs::create_dir_all(dest.join("my-lib/src")).unwrap();
+        std::fs::write(
+            dest.join("my-lib/Cargo.toml"),
+            "[package]\nname = \"my-lib\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(dest.join("my-lib/src/lib.rs"), "").unwrap();
+
+        // Build mappings: canonical path -> sanitised name
+        let canonical = project_dir.join("../../my-lib").canonicalize().unwrap_or(
+            // In test, the path doesn't exist on disk, so use the resolved path directly
+            project_dir.join("../../my-lib"),
+        );
+        let mut mappings = HashMap::new();
+        mappings.insert(canonical, "my-lib".to_string());
+
+        rewrite_cargo_tomls(dest, project_dir, &mappings).unwrap();
+
+        // Verify [workspace].exclude contains "my-lib"
+        let root_content = std::fs::read_to_string(dest.join("Cargo.toml")).unwrap();
+        let root_doc: toml::Value = toml::from_str(&root_content).unwrap();
+        let exclude = root_doc["workspace"]["exclude"].as_array().unwrap();
+        let exclude_strs: Vec<&str> = exclude.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            exclude_strs.contains(&"my-lib"),
+            "workspace.exclude should contain 'my-lib': {:?}",
+            exclude_strs
+        );
     }
 }

@@ -42,7 +42,7 @@ fn run_schnee_build(manifest_path: &Path) -> (String, String) {
 fn ensure_repo(name: &str, url: &str, git_ref: &str) -> PathBuf {
     let cache_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join(".repos");
+        .join("repos");
     let repo_dir = cache_dir.join(format!("{}-{}", name, git_ref));
 
     if repo_dir.join(".git").exists() {
@@ -63,6 +63,16 @@ fn ensure_repo(name: &str, url: &str, git_ref: &str) -> PathBuf {
         url,
         git_ref
     );
+
+    // Ensure the cloned repo has a [workspace] marker so cargo doesn't walk up
+    // to the cargo-schnee project root when running `cargo vendor` etc.
+    let cargo_toml = repo_dir.join("Cargo.toml");
+    if cargo_toml.exists() {
+        let contents = std::fs::read_to_string(&cargo_toml).unwrap();
+        if !contents.contains("[workspace]") {
+            std::fs::write(&cargo_toml, format!("[workspace]\n\n{contents}")).unwrap();
+        }
+    }
 
     repo_dir
 }
@@ -183,6 +193,41 @@ fn fixture_workspace_advanced() {
         stdout.contains("answer=42"),
         "external dep failed: {}",
         stdout
+    );
+}
+
+// Workspace using members = ["*"] glob pattern
+#[test]
+#[ignore]
+fn fixture_workspace_glob_members() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let alpha = fixture_dir.join("target/debug/alpha");
+    let beta = fixture_dir.join("target/debug/beta");
+    assert!(
+        alpha.exists(),
+        "alpha binary not found at {}",
+        alpha.display()
+    );
+    assert!(beta.exists(), "beta binary not found at {}", beta.display());
+
+    let output = Command::new(&alpha).output().expect("Failed to run alpha");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from alpha"),
+        "Unexpected alpha output"
+    );
+
+    let output = Command::new(&beta).output().expect("Failed to run beta");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from beta"),
+        "Unexpected beta output"
     );
 }
 
@@ -311,6 +356,456 @@ fn concurrent_builds() {
     t2.join().expect("workspace build thread panicked");
 }
 
+// Verify that the pre-flight system library check emits a warning when a
+// -sys crate's `links` value isn't discoverable via pkg-config.
+#[test]
+#[ignore]
+fn fixture_sys_lib_check_warning() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sys-lib-check");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    let (_stdout, stderr) = run_schnee_build(&manifest);
+
+    // The fake-sys crate declares `links = "nonexistent_test_lib_xyz"` which
+    // cannot exist in any pkg-config database.  cargo-schnee should warn.
+    assert!(
+        stderr.contains("nonexistent_test_lib_xyz"),
+        "Expected warning about missing system library 'nonexistent_test_lib_xyz' in stderr:\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("not found via pkg-config"),
+        "Expected actionable pkg-config hint in stderr:\n{}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("buildInputs"),
+        "Expected buildInputs suggestion in stderr:\n{}",
+        stderr,
+    );
+
+    // The build should still succeed (build script is a no-op).
+    let binary = fixture_dir.join("target/debug/sys-lib-check-app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lib=fake-sys"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+// Cross-compilation: build minimal-bin for aarch64-unknown-linux-gnu.
+// Requires a Rust toolchain with aarch64 target and aarch64-linux-gnu cross-linker.
+#[test]
+#[ignore]
+fn fixture_cross_compile_aarch64() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "cross build failed:\n{}", stderr,);
+
+    // Binary should be in target/{triple}/debug/
+    let binary = fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/minimal-bin");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
+    );
+
+    // Verify it's an aarch64 ELF
+    let file_output = Command::new("file").arg(&binary).output().unwrap();
+    let file_str = String::from_utf8_lossy(&file_output.stdout);
+    assert!(
+        file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
+        "Binary is not aarch64: {}",
+        file_str
+    );
+}
+
+/// External path dependency: project depends on a sibling crate outside its
+/// directory. cargo-schnee should auto-detect the external dep, copy it into
+/// the store tree, and rewrite Cargo.toml paths.
+#[test]
+#[ignore]
+fn fixture_external_path_dep() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-path-dep");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    // Verify the binary was produced
+    let binary = fixture_dir.join("target/debug/external-path-dep");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    // Verify it runs and uses the external lib
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from external-dep-lib"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// Workspace with `members = ["*"]` and an external path dependency.
+/// This catches regressions where external deps copied into the store tree
+/// are matched by the workspace glob but not excluded, causing cargo to
+/// fail loading them as workspace members.
+#[test]
+#[ignore]
+fn fixture_workspace_glob_external() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob-external");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    // Verify the binary was produced
+    let binary = fixture_dir.join("target/debug/app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    // Verify it runs and uses the external lib
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from external-dep-lib"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// Same as fixture_workspace_glob_external but invoked from the member's
+/// manifest instead of the workspace root. Catches the bug where Cargo.lock
+/// isn't found because it lives at the workspace root, not in the member dir.
+#[test]
+#[ignore]
+fn fixture_workspace_glob_external_from_member() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-glob-external");
+    let manifest = fixture_dir.join("app/Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from external-dep-lib"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// Build script that writes to $HOME. In a Nix sandbox $HOME is normally
+/// unwritable (/homeless-shelter). cargo-schnee sets HOME=$TMPDIR so that
+/// crates spawning embedded engines or writing temp files under $HOME work.
+#[test]
+#[ignore]
+fn fixture_build_script_home() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build-script-home");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/build-script-home");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("build-script-home ok"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// Build script that copies directory trees from CARGO_MANIFEST_DIR (Nix store)
+/// preserving source permissions. Directories in the Nix store have 555 perms,
+/// so the copy creates read-only destination dirs. Writing into them must still
+/// succeed — cargo-schnee needs to ensure the build script environment handles this.
+#[test]
+#[ignore]
+fn fixture_build_script_copy() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build-script-copy");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/build-script-copy");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("build-script-copy ok"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// Extra includes: gitignored generated files specified via
+/// `[package.metadata.schnee] extra-includes` are copied into the store.
+/// The test creates the generated file before building (simulating a pre-build
+/// step that produces gitignored output).
+#[test]
+#[ignore]
+fn fixture_extra_includes() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extra-includes");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    // Simulate a pre-build step: create the gitignored generated file
+    let generated_dir = fixture_dir.join("src/generated");
+    std::fs::create_dir_all(&generated_dir).expect("create generated dir");
+    std::fs::write(generated_dir.join("data.html"), "<p>generated</p>\n")
+        .expect("write generated file");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/extra-includes");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("<p>generated</p>"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+/// External path dep pointing at a sub-crate inside another workspace.
+/// The sub-crate inherits `edition.workspace = true` from its parent workspace
+/// root. cargo-schnee must copy the entire external workspace (not just the
+/// sub-crate) so that workspace inheritance still resolves.
+#[test]
+#[ignore]
+fn fixture_external_ws_subcrate() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/external-ws-subcrate");
+    let manifest = fixture_dir.join("project/Cargo.toml");
+
+    clean_target(&fixture_dir.join("project"));
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("project/target/debug/ws-subcrate-project");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from sub-crate"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Example tests
+// ---------------------------------------------------------------------------
+
+// Simple single-crate example with serde dependency
+#[test]
+#[ignore]
+fn example_simple() {
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/simple");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/test-project");
+    assert!(
+        binary.exists(),
+        "test-project binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run test-project");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"name\": \"test\"") && stdout.contains("430"),
+        "Unexpected simple example output: {}",
+        stdout
+    );
+}
+
+// Cross-compilation example (native build only — verifies the crate compiles)
+#[test]
+#[ignore]
+fn example_cross() {
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/cross");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/cross-example");
+    assert!(
+        binary.exists(),
+        "cross-example binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run cross-example");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello from cargo-schnee cross-compilation!"),
+        "Unexpected cross example output: {}",
+        stdout
+    );
+}
+
+// build-package example: workspace with two binary crates and serde deps
+#[test]
+#[ignore]
+fn example_build_package() {
+    let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    // Verify both workspace binaries were produced
+    let greeter = example_dir.join("target/debug/greeter");
+    let formatter = example_dir.join("target/debug/formatter");
+    assert!(
+        greeter.exists(),
+        "greeter binary not found at {}",
+        greeter.display()
+    );
+    assert!(
+        formatter.exists(),
+        "formatter binary not found at {}",
+        formatter.display()
+    );
+
+    // greeter outputs JSON with a greeting message
+    let output = Command::new(&greeter)
+        .output()
+        .expect("Failed to run greeter");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from cargo-schnee buildPackage"),
+        "Unexpected greeter output: {}",
+        stdout
+    );
+
+    // formatter reads JSON from stdin and formats it
+    let output = Command::new(&formatter)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"message\": \"test\"}")
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("Failed to run formatter");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[formatted] test"),
+        "Unexpected formatter output: {}",
+        stdout
+    );
+}
+
+// build-package-cross example: lib.buildPackage with hostPkgs (native build only)
+#[test]
+#[ignore]
+fn example_build_package_cross() {
+    let example_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/build-package-cross");
+    let manifest = example_dir.join("Cargo.toml");
+
+    clean_target(&example_dir);
+    run_schnee_build(&manifest);
+
+    let binary = example_dir.join("target/debug/build-package-cross-example");
+    assert!(
+        binary.exists(),
+        "build-package-cross-example binary not found at {}",
+        binary.display()
+    );
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run build-package-cross-example");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Hello from cargo-schnee cross-compilation!"),
+        "Unexpected build-package-cross example output: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GitHub project tests
 // ---------------------------------------------------------------------------
@@ -374,46 +869,5 @@ fn github_just_workspace() {
         stdout.contains("just"),
         "Unexpected version output: {}",
         stdout
-    );
-}
-
-// Cross-compilation: build minimal-bin for aarch64-unknown-linux-gnu.
-// Requires a Rust toolchain with aarch64 target and aarch64-linux-gnu cross-linker.
-#[test]
-#[ignore]
-fn fixture_cross_compile_aarch64() {
-    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
-    let manifest = fixture_dir.join("Cargo.toml");
-
-    clean_target(&fixture_dir);
-
-    let output = Command::new(cargo_schnee_bin())
-        .arg("schnee")
-        .arg("build")
-        .arg("--target")
-        .arg("aarch64-unknown-linux-gnu")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .output()
-        .expect("Failed to execute cargo-schnee with --target");
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "cross build failed:\n{}", stderr,);
-
-    // Binary should be in target/{triple}/debug/
-    let binary = fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/minimal-bin");
-    assert!(
-        binary.exists(),
-        "Cross-compiled binary not found at {}",
-        binary.display()
-    );
-
-    // Verify it's an aarch64 ELF
-    let file_output = Command::new("file").arg(&binary).output().unwrap();
-    let file_str = String::from_utf8_lossy(&file_output.stdout);
-    assert!(
-        file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
-        "Binary is not aarch64: {}",
-        file_str
     );
 }
