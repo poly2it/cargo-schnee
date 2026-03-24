@@ -801,6 +801,7 @@ pub fn run_plan_nix(
                     &cfg_envs,
                     &custom_sys_env,
                     passthru_envs,
+                    &vendor_dir.to_string_lossy(),
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

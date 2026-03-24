@@ -46,6 +46,7 @@ pub(super) fn construct_derivation(
     cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
+    vendor_store: &str,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -172,6 +173,13 @@ pub(super) fn construct_derivation(
         for path in sys_build_closure {
             input_srcs.insert(path.clone());
         }
+    }
+
+    // Build scripts may reference vendor crate source files at runtime
+    // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
+    // Include the vendor dir so the Nix sandbox allows access.
+    if unit.kind == UnitKind::BuildScriptRun && !vendor_store.is_empty() {
+        input_srcs.insert(vendor_store.to_string());
     }
 
     collect_store_paths(&script, &mut input_srcs);
