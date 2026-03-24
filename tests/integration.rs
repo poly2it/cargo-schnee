@@ -560,6 +560,35 @@ fn fixture_build_script_home() {
     );
 }
 
+/// Build script that copies directory trees from CARGO_MANIFEST_DIR (Nix store)
+/// preserving source permissions. Directories in the Nix store have 555 perms,
+/// so the copy creates read-only destination dirs. Writing into them must still
+/// succeed — cargo-schnee needs to ensure the build script environment handles this.
+#[test]
+#[ignore]
+fn fixture_build_script_copy() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build-script-copy");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/build-script-copy");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("build-script-copy ok"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the
@@ -616,7 +645,7 @@ fn example_simple() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("\"name\": \"test\"") && stdout.contains("421"),
+        stdout.contains("\"name\": \"test\"") && stdout.contains("430"),
         "Unexpected simple example output: {}",
         stdout
     );

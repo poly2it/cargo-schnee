@@ -554,8 +554,37 @@ fn build_run_script(
     script.push_str("export HOME=$TMPDIR && ");
     script.push_str("_bs_workdir=$TMPDIR/workdir && ");
     script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
+    // Update CARGO_MANIFEST_DIR to the writable copy so build scripts that
+    // read assets via std::env::var("CARGO_MANIFEST_DIR") get a writable path.
+    script.push_str("export CARGO_MANIFEST_DIR=$_bs_workdir && ");
+    script.push_str("export CARGO_MANIFEST_PATH=$_bs_workdir/Cargo.toml && ");
+    // Build scripts that copy directory trees from Nix store paths (vendor deps)
+    // can preserve the read-only (555) directory permissions, making destination
+    // dirs unwritable. This LD_PRELOAD shim intercepts chmod/fchmod to ensure
+    // directories always retain owner-write permission.
+    script.push_str(concat!(
+        r#"cat > $TMPDIR/_wdirs.c << 'WDIRS_EOF'"#,
+        "\n",
+        "#define _GNU_SOURCE\n",
+        "#include <dlfcn.h>\n",
+        "#include <sys/stat.h>\n",
+        "int chmod(const char *p, mode_t m) {\n",
+        "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"chmod\");\n",
+        "  struct stat s; if(f&&stat(p,&s)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
+        "  return f(p,m); }\n",
+        "int fchmod(int d, mode_t m) {\n",
+        "  int (*f)(int,mode_t)=dlsym(RTLD_NEXT,\"fchmod\");\n",
+        "  struct stat s; if(f&&fstat(d,&s)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
+        "  return f(d,m); }\n",
+        "int fchmodat(int d,const char *p, mode_t m, int fl) {\n",
+        "  int (*f)(int,const char*,mode_t,int)=dlsym(RTLD_NEXT,\"fchmodat\");\n",
+        "  struct stat s; if(f&&fstatat(d,p,&s,fl)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
+        "  return f(d,p,m,fl); }\n",
+        "WDIRS_EOF\n",
+    ));
+    script.push_str("cc -shared -fPIC -o $TMPDIR/_wdirs.so $TMPDIR/_wdirs.c -ldl && ");
     script.push_str(&format!(
-        "cd $_bs_workdir && {}/{} > $out/output",
+        "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
     ));
 
