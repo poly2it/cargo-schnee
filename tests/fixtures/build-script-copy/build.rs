@@ -1,16 +1,21 @@
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Recursive directory copy that preserves source permissions.
-/// This mirrors what crates like pglite-oxide do internally — they copy
-/// assets from their source tree into a temp dir. When the source is in
-/// the read-only Nix store, directories have 555 permissions which get
-/// preserved, making the destination dirs read-only.
+/// Recursive directory copy that preserves source permissions via mkdir mode.
+/// Some crates use DirBuilder::mode() to create destination directories with
+/// the source directory's permission bits, bypassing chmod entirely.
+/// When the source is in the read-only Nix store, directories have 555
+/// permissions which get applied to mkdir, making the destination dirs
+/// read-only.
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    // Mimic permission-preserving copy: set dst dir perms to match source
     let src_perms = fs::metadata(src)?.permissions();
-    fs::set_permissions(dst, src_perms)?;
+    // Create directory with source permissions via mkdir(path, mode)
+    // This bypasses chmod — the permissions are set at creation time.
+    fs::DirBuilder::new()
+        .mode(src_perms.mode())
+        .recursive(true)
+        .create(dst)?;
 
     for entry in fs::read_dir(src)? {
         let entry = entry?;

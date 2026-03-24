@@ -560,14 +560,15 @@ fn build_run_script(
     script.push_str("export CARGO_MANIFEST_PATH=$_bs_workdir/Cargo.toml && ");
     // Build scripts that copy directory trees from Nix store paths (vendor deps)
     // can preserve the read-only (555) directory permissions, making destination
-    // dirs unwritable. This LD_PRELOAD shim intercepts chmod/fchmod to ensure
-    // directories always retain owner-write permission.
+    // dirs unwritable. This LD_PRELOAD shim intercepts chmod/fchmod/mkdir to
+    // ensure directories always retain owner-write permission.
     script.push_str(concat!(
         r#"cat > $TMPDIR/_wdirs.c << 'WDIRS_EOF'"#,
         "\n",
         "#define _GNU_SOURCE\n",
         "#include <dlfcn.h>\n",
         "#include <sys/stat.h>\n",
+        "#include <fcntl.h>\n",
         "int chmod(const char *p, mode_t m) {\n",
         "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"chmod\");\n",
         "  struct stat s; if(f&&stat(p,&s)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
@@ -580,6 +581,12 @@ fn build_run_script(
         "  int (*f)(int,const char*,mode_t,int)=dlsym(RTLD_NEXT,\"fchmodat\");\n",
         "  struct stat s; if(f&&fstatat(d,p,&s,fl)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
         "  return f(d,p,m,fl); }\n",
+        "int mkdir(const char *p, mode_t m) {\n",
+        "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdir\");\n",
+        "  return f(p,m|0200); }\n",
+        "int mkdirat(int d, const char *p, mode_t m) {\n",
+        "  int (*f)(int,const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdirat\");\n",
+        "  return f(d,p,m|0200); }\n",
         "WDIRS_EOF\n",
     ));
     script.push_str("cc -shared -fPIC -o $TMPDIR/_wdirs.so $TMPDIR/_wdirs.c -ldl && ");
