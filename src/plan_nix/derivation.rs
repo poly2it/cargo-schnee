@@ -558,41 +558,28 @@ fn build_run_script(
     // read assets via std::env::var("CARGO_MANIFEST_DIR") get a writable path.
     script.push_str("export CARGO_MANIFEST_DIR=$_bs_workdir && ");
     script.push_str("export CARGO_MANIFEST_PATH=$_bs_workdir/Cargo.toml && ");
-    // Build scripts that copy directory trees from Nix store paths (vendor deps)
-    // can preserve the read-only (555) directory permissions, making destination
-    // dirs unwritable. This LD_PRELOAD shim intercepts chmod/fchmod/mkdir to
-    // ensure directories always retain owner-write permission.
+    // Build scripts that copy files from Nix store paths (vendor deps) can
+    // end up with read-only (444/555) permissions on destinations, because
+    // fs::copy preserves source permissions via fchmod. When multiple threads
+    // copy to the same location, the second thread can't overwrite a 444 file.
+    // This LD_PRELOAD shim ensures all files/dirs always retain owner-write.
     script.push_str(concat!(
         r#"cat > $TMPDIR/_wdirs.c << 'WDIRS_EOF'"#,
         "\n",
         "#define _GNU_SOURCE\n",
         "#include <dlfcn.h>\n",
         "#include <sys/stat.h>\n",
-        "#include <fcntl.h>\n",
-        "#include <stdio.h>\n",
-        "__attribute__((constructor)) void _wdirs_init(void) {\n",
-        "  fprintf(stderr, \"_wdirs shim loaded\\n\"); }\n",
         "int chmod(const char *p, mode_t m) {\n",
         "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"chmod\");\n",
-        "  mode_t orig=m;\n",
-        "  struct stat s; if(f&&stat(p,&s)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
-        "  if(m!=orig)fprintf(stderr,\"_wdirs: chmod %s %03o->%03o\\n\",p,orig,m);\n",
-        "  return f(p,m); }\n",
+        "  return f(p,m|0200); }\n",
         "int fchmod(int d, mode_t m) {\n",
         "  int (*f)(int,mode_t)=dlsym(RTLD_NEXT,\"fchmod\");\n",
-        "  mode_t orig=m;\n",
-        "  struct stat s; if(f&&fstat(d,&s)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
-        "  if(m!=orig)fprintf(stderr,\"_wdirs: fchmod fd=%d %03o->%03o\\n\",d,orig,m);\n",
-        "  return f(d,m); }\n",
+        "  return f(d,m|0200); }\n",
         "int fchmodat(int d,const char *p, mode_t m, int fl) {\n",
         "  int (*f)(int,const char*,mode_t,int)=dlsym(RTLD_NEXT,\"fchmodat\");\n",
-        "  mode_t orig=m;\n",
-        "  struct stat s; if(f&&fstatat(d,p,&s,fl)==0&&S_ISDIR(s.st_mode))m|=0200;\n",
-        "  if(m!=orig)fprintf(stderr,\"_wdirs: fchmodat %s %03o->%03o\\n\",p,orig,m);\n",
-        "  return f(d,p,m,fl); }\n",
+        "  return f(d,p,m|0200,fl); }\n",
         "int mkdir(const char *p, mode_t m) {\n",
         "  int (*f)(const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdir\");\n",
-        "  fprintf(stderr,\"_wdirs: mkdir %s %03o->%03o\\n\",p,m,m|0200);\n",
         "  return f(p,m|0200); }\n",
         "int mkdirat(int d, const char *p, mode_t m) {\n",
         "  int (*f)(int,const char*,mode_t)=dlsym(RTLD_NEXT,\"mkdirat\");\n",
