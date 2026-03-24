@@ -540,6 +540,10 @@ fn build_run_script(
         }
     }
 
+    // Ensure build scripts have a writable HOME (some crates spawn embedded
+    // engines or write temp files to $HOME, which doesn't exist in the sandbox).
+    script.push_str("export HOME=$TMPDIR && ");
+
     // Run the build script from its manifest dir (cargo convention)
     script.push_str(&format!(
         "cd $CARGO_MANIFEST_DIR && {}/{} > $out/output",

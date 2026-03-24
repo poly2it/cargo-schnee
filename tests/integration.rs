@@ -532,6 +532,34 @@ fn fixture_workspace_glob_external_from_member() {
     );
 }
 
+/// Build script that writes to $HOME. In a Nix sandbox $HOME is normally
+/// unwritable (/homeless-shelter). cargo-schnee sets HOME=$TMPDIR so that
+/// crates spawning embedded engines or writing temp files under $HOME work.
+#[test]
+#[ignore]
+fn fixture_build_script_home() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build-script-home");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/build-script-home");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("build-script-home ok"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the
