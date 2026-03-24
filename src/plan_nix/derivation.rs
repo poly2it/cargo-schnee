@@ -545,7 +545,7 @@ fn build_run_script(
     // files relative to CWD (e.g. embedded DB engines) both work.
     script.push_str("export HOME=$TMPDIR && ");
     script.push_str("_bs_workdir=$TMPDIR/workdir && ");
-    script.push_str("cp -r $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
+    script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
     script.push_str(&format!(
         "cd $_bs_workdir && {}/{} > $out/output",
         bs_placeholder, bs_binary,
