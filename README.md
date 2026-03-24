@@ -377,8 +377,8 @@ cross builds. Permissions are adjusted from the Nix store's read-only
 ## Usage
 
 The recommended way to use cargo-schnee is through a cargo wrapper that
-transparently redirects `cargo build`, `cargo run`, `cargo test`, and
-`cargo bench` to their `cargo schnee` equivalents. The wrapper also forwards
+transparently redirects `cargo build`, `cargo check`, `cargo run`, `cargo test`,
+and `cargo bench` to their `cargo schnee` equivalents. The wrapper also forwards
 `-p`/`--package`, `--features`, `--bin`, and `--no-default-features`. The
 [simple example](examples/simple/) demonstrates this approach with a
 `devShell` and both packaging methods described below. For development shells, create the wrapper via
@@ -401,6 +401,7 @@ in {
 ```sh
 # With the wrapper, regular cargo commands use cargo-schnee automatically.
 cargo build
+cargo check
 cargo build --release
 cargo build --profile bench
 
@@ -476,6 +477,23 @@ The key is the crate's
 value as declared in its `Cargo.toml`, and the value is the environment variable to set
 to `1` during the build script run.
 
+### Including generated files
+
+By default, cargo-schnee only includes files tracked by git in the Nix store
+source tree. If your build produces generated source files that are gitignored
+but needed for compilation, for example from code generators or proto compilation,
+list them with glob patterns in `[workspace.metadata.schnee]` or
+`[package.metadata.schnee]`:
+
+```toml
+[workspace.metadata.schnee]
+extra-includes = ["src/generated/**/*.rs", "proto/out/*.rs"]
+```
+
+Files matching these patterns are added to the source tree even if they appear
+in `.gitignore`. Files outside the project directory are supported and are
+stored with a `_parent` prefix in the Nix store tree.
+
 ### Packaging with `lib.buildPackage`
 
 For straightforward packaging, `lib.buildPackage` handles all the toolchain
@@ -512,9 +530,12 @@ cargo-schnee.lib.buildPackage {
 ```
 
 Other supported attributes include `rustToolchain`, `buildInputs`,
-`nativeBuildInputs`, `cargoExtraArgs`, `env`, `buildType`, and `meta`. See
-[`examples/build-package/`](examples/build-package/) for a workspace example
-and [`examples/build-package-cross/`](examples/build-package-cross/) for
+`nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
+`wrapBinaries`, `buildType`, `preBuild`, `postBuild`, `postInstall`,
+`postFixup`, and `meta`. Unrecognised attributes are passed through to
+`buildRustPackage`. See [`examples/build-package/`](examples/build-package/)
+for a workspace example and
+[`examples/build-package-cross/`](examples/build-package-cross/) for
 cross-compilation.
 
 ### Packaging with `buildRustPackage`
