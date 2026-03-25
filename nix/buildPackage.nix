@@ -54,21 +54,32 @@ let
   # Members may contain globs (e.g. "crates/*", "*"), so we expand those first.
 
   # Expand a single member pattern into concrete directory paths.
-  # "crates/foo" (no glob) -> [ "crates/foo" ]
-  # "crates/*"             -> list subdirectories of <src>/crates/
-  # "*"                    -> list subdirectories of <src>/
+  # "crates/foo" (no glob)   -> [ "crates/foo" ]
+  # "crates/*"               -> list subdirectories of <src>/crates/
+  # "*"                      -> list subdirectories of <src>/
+  # "crates/*/sub"           -> list <src>/crates/X/sub for each X
+  #
+  # Only a single '*' segment is supported (matching Cargo's glob behaviour).
   expandMember = m:
     let
-      # Split on the first '*' to get the prefix directory and check if it's a glob.
       hasGlob = lib.hasInfix "*" m;
-      # For "crates/*" the parent is "crates", for "*" the parent is "".
-      parent = lib.removeSuffix "/*" m;
-      parentDir = if parent == "*" || parent == "" then src else src + "/${parent}";
+      # Split the pattern into segments around the glob.
+      parts = lib.splitString "/*" m;
+      # prefix: everything before the glob ("crates" for "crates/*", "" for "*")
+      prefix = builtins.head parts;
+      # suffix: everything after the glob ("/sub" for "crates/*/sub", "" for "crates/*")
+      suffix = lib.concatStrings (builtins.tail parts);
+      # Trim leading "/" from suffix if present
+      cleanSuffix = lib.removePrefix "/" suffix;
+      parentDir = if prefix == "*" || prefix == "" then src else src + "/${prefix}";
       entries = builtins.readDir parentDir;
       dirs = lib.filterAttrs (_: type: type == "directory") entries;
       expanded = builtins.filter (p: builtins.pathExists (src + "/${p}/Cargo.toml")) (
         map (name:
-          if parent == "*" || parent == "" then name else "${parent}/${name}"
+          let
+            base = if prefix == "*" || prefix == "" then name else "${prefix}/${name}";
+          in
+            if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
         ) (builtins.attrNames dirs)
       );
     in
@@ -300,6 +311,9 @@ let
   extraAttrs = removeAttrs args consumedKeys;
 
 in
+  assert lib.assertMsg (!(wrapBinaries && isWindows))
+    "cargo-schnee buildPackage: wrapBinaries is not supported for Windows targets (dontFixup is required for PE binaries)";
+
   schneeRustPlatform.buildRustPackage (vendorArgs // extraAttrs // {
     pname = finalPname;
     version = finalVersion;

@@ -367,18 +367,36 @@ fn add_to_nix_store(path: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// Strip `../` prefixes from a relative path to produce an in-tree name.
+/// Strip leading `../` components from a relative path to produce an in-tree name.
 /// Mirrors `sanitiseName` in `buildPackage.nix`.
 /// e.g. `../my-lib` → `my-lib`, `../../foo/bar` → `foo/bar`
+///
+/// Uses proper path component parsing rather than naive string replacement so
+/// that paths like `../foo/../bar` are handled correctly (→ `foo/../bar`; only
+/// leading `..` components are stripped).
 fn sanitise_extra_source_name(rel_path: &str) -> Result<String> {
-    let stripped = rel_path.replace("../", "");
-    if stripped == rel_path || stripped.is_empty() {
+    use std::path::Component;
+    let path = Path::new(rel_path);
+    let components: Vec<_> = path.components().collect();
+    let leading_parent_count = components
+        .iter()
+        .take_while(|c| matches!(c, Component::ParentDir))
+        .count();
+    if leading_parent_count == 0 {
         anyhow::bail!(
-            "Extra source path must contain '../' components: {}",
+            "Extra source path must start with '../' components: {}",
             rel_path
         );
     }
-    Ok(stripped)
+    let remaining: PathBuf = components[leading_parent_count..].iter().collect();
+    let result = remaining.to_string_lossy().to_string();
+    if result.is_empty() {
+        anyhow::bail!(
+            "Extra source path has no name after stripping '../': {}",
+            rel_path
+        );
+    }
+    Ok(result)
 }
 
 /// Compute a relative path from `from` directory to `to` path.
@@ -585,23 +603,38 @@ fn collect_external_from_table(
     }
 }
 
-/// Check if `path` is a sub-crate inside a workspace by looking at the
-/// immediate parent directory for a `Cargo.toml` with a `[workspace]` section.
+/// Walk up from `path` looking for an enclosing workspace root (a directory
+/// with a `Cargo.toml` containing a `[workspace]` section).  Stops before
+/// reaching `stop_at` (the project root) to avoid matching the project itself.
 /// Returns the workspace root directory if found.
-fn find_enclosing_workspace_root(path: &Path, _stop_at: &Path) -> Option<PathBuf> {
+fn find_enclosing_workspace_root(path: &Path, stop_at: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() {
         path.to_path_buf()
     } else {
         path.parent()?.to_path_buf()
     };
-    let parent = dir.parent()?;
-    let manifest = parent.join("Cargo.toml");
-    if manifest.exists()
-        && let Ok(content) = std::fs::read_to_string(&manifest)
-        && let Ok(doc) = toml::from_str::<toml::Value>(&content)
-        && doc.get("workspace").is_some()
-    {
-        return Some(parent.to_path_buf());
+    let stop_canonical = stop_at.canonicalize().unwrap_or_else(|_| stop_at.to_path_buf());
+    let mut candidate = dir.parent()?.to_path_buf();
+    loop {
+        // Don't match the project directory itself or anything above it
+        let candidate_canonical = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        if candidate_canonical == stop_canonical || !candidate_canonical.starts_with("/") {
+            break;
+        }
+        let manifest = candidate.join("Cargo.toml");
+        if manifest.exists()
+            && let Ok(content) = std::fs::read_to_string(&manifest)
+            && let Ok(doc) = toml::from_str::<toml::Value>(&content)
+            && doc.get("workspace").is_some()
+        {
+            return Some(candidate);
+        }
+        candidate = match candidate.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
     }
     None
 }
@@ -1863,8 +1896,9 @@ fn run_build_pipeline(
             let fname = entry.file_name().to_string_lossy().to_string();
             if is_windows_target {
                 // Windows PE binaries don't have Unix execute bits.
-                // Detect executables by .exe extension instead.
-                if fname.ends_with(".exe") {
+                // Detect executables by .exe extension; also recognise .dll
+                // (cdylib crates) so they get a clean-named link too.
+                if fname.ends_with(".exe") || fname.ends_with(".dll") {
                     bin_file = Some(dest);
                 }
             } else {
@@ -1879,9 +1913,13 @@ fn run_build_pipeline(
             }
         }
         if let Some(ref bin_path) = bin_file {
-            // For Windows targets, append .exe to the clean target name
-            let clean_name = if is_windows_target {
-                format!("{}.exe", target_name)
+            // For Windows targets, use the correct extension (.exe or .dll)
+            let bin_ext = bin_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let clean_name = if is_windows_target && !bin_ext.is_empty() {
+                format!("{}.{}", target_name, bin_ext)
             } else {
                 target_name.to_string()
             };
@@ -2465,6 +2503,15 @@ version = "1.2.3"
         assert_eq!(
             sanitise_extra_source_name("../../bar/baz").unwrap(),
             "bar/baz"
+        );
+    }
+
+    #[test]
+    fn sanitise_handles_intermediate_dot_dot() {
+        // Only leading ../ components are stripped; intermediate ones are preserved
+        assert_eq!(
+            sanitise_extra_source_name("../foo/../bar").unwrap(),
+            "foo/../bar"
         );
     }
 

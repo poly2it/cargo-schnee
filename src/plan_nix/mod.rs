@@ -461,7 +461,13 @@ pub fn run_plan_nix(
             0,
             false,
             None,
-            false, // frozen: false to tolerate superset Cargo.lock (workspace subsets)
+            // frozen: false — when building a workspace subset (e.g. -p foo), the
+            // Cargo.lock may contain entries for sibling crates that aren't part of
+            // this resolve.  frozen=true would reject the lock as "out of date".
+            // This is safe because: (1) the Nix sandbox prevents network access so
+            // no new crates can be fetched, and (2) deps are pre-vendored so the
+            // resolve is fully offline regardless.
+            false,
             true,
             true,
             &Some(target_dir.to_string_lossy().to_string().into()),

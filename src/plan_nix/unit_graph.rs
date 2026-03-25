@@ -762,6 +762,12 @@ fn find_missing_feature_deps(
 /// `cfg(any())`-gated deps injected by `find_missing_feature_deps`).  The
 /// toposort order may therefore place a dependency *after* its dependent,
 /// and a single pass would read the dependency's uninitialised level.
+///
+/// Complexity: O(n * d) per iteration where n = number of units and d = max
+/// edges per unit.  The loop converges in at most O(depth) iterations where
+/// depth is the longest dependency chain, giving O(n * d * depth) worst case.
+/// In practice crate graphs are wide rather than deep, so this converges in
+/// very few iterations (typically 1-3 beyond the initial pass).
 pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
