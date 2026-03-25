@@ -529,14 +529,16 @@ cargo-schnee.lib.buildPackage {
 }
 ```
 
-Other supported attributes include `rustToolchain`, `buildInputs`,
+Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
 `wrapBinaries`, `buildType`, `preBuild`, `postBuild`, `postInstall`,
 `postFixup`, and `meta`. Unrecognised attributes are passed through to
 `buildRustPackage`. See [`examples/build-package/`](examples/build-package/)
-for a workspace example and
+for a workspace example,
 [`examples/build-package-cross/`](examples/build-package-cross/) for
-cross-compilation.
+cross-compilation, and
+[`examples/build-package-cross-windows/`](examples/build-package-cross-windows/)
+for Windows cross-compilation.
 
 ### Packaging with `buildRustPackage`
 

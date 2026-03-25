@@ -101,6 +101,8 @@
               # The sandbox sets HOME=/homeless-shelter which doesn't exist.
               export HOME="$TMPDIR/wine-home"
               mkdir -p "$HOME"
+              # Fully headless: disconnect from both X11 and Wayland.
+              unset WAYLAND_DISPLAY
               cargo test --release --target x86_64-pc-windows-msvc
               runHook postCheck
             '';
