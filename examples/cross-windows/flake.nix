@@ -67,6 +67,7 @@
               pkgs.nix
               pkgs.llvmPackages.bintools-unwrapped # lld-link
               pkgs.llvmPackages.clang-unwrapped    # clang-cl
+              pkgs.wineWow64Packages.stable       # run tests via Wine
             ];
 
             requiredSystemFeatures = [ "recursive-nix" ];
@@ -75,18 +76,33 @@
             # Cross-compilation environment
             XWIN_DIR = "${winSdk}";
             CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link";
+            CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER = "wine";
+
+            # Run Wine headless: suppress Mono/Gecko installer dialogs
+            WINEDLLOVERRIDES = "mscoree=d;mshtml=d";
+            DISPLAY = "";
 
             # Disable cargo-auditable: its wrapper bypasses our cargo wrapper.
             auditable = false;
 
-            # Override build/install phases: there is no pkgsCross.msvc stdenv,
-            # so we pass --target manually. cargo on PATH is the schnee wrapper
-            # from rustPlatform, which intercepts `cargo build` and runs
-            # cargo-schnee instead.
+            # Override build/install/check phases: there is no pkgsCross.msvc
+            # stdenv, so we pass --target manually. cargo on PATH is the schnee
+            # wrapper from rustPlatform, which intercepts cargo subcommands and
+            # runs cargo-schnee instead.
             buildPhase = ''
               runHook preBuild
               cargo build --release --target x86_64-pc-windows-msvc
               runHook postBuild
+            '';
+
+            checkPhase = ''
+              runHook preCheck
+              # Wine needs a writable HOME to create its WINEPREFIX (~/.wine).
+              # The sandbox sets HOME=/homeless-shelter which doesn't exist.
+              export HOME="$TMPDIR/wine-home"
+              mkdir -p "$HOME"
+              cargo test --release --target x86_64-pc-windows-msvc
+              runHook postCheck
             '';
 
             installPhase = ''
@@ -100,7 +116,7 @@
             # Skip fixup: patchelf/strip don't work on PE binaries
             dontFixup = true;
 
-            doCheck = false;
+            doCheck = true;
           };
 
           devShells.default = pkgs.mkShell {
@@ -108,6 +124,7 @@
               schneeToolchain
               pkgs.llvmPackages.bintools-unwrapped # provides lld-link
               pkgs.llvmPackages.clang-unwrapped    # provides clang-cl
+              pkgs.wineWow64Packages.stable       # run .exe via Wine
               pkgs.nix
             ];
 
@@ -116,6 +133,10 @@
 
             # Tell cargo/rustc to use lld-link for the MSVC target
             CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link";
+
+            # Run cross-compiled Windows binaries via Wine (headless)
+            CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER = "wine";
+            WINEDLLOVERRIDES = "mscoree=d;mshtml=d";
 
             # For build scripts using the `cc` crate: forward CC/AR into derivations
             CARGO_SCHNEE_PASSTHRU_ENVS = "CC_x86_64_pc_windows_msvc AR_x86_64_pc_windows_msvc";

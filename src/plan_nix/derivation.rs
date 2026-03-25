@@ -253,6 +253,11 @@ fn build_compile_script(
                 let linker = format!("{}/lld-link", cc_bin_dir);
                 parts.push("-C".into());
                 parts.push(format!("linker={}", linker));
+                // Statically link the MSVC CRT — the runtime DLLs
+                // (vcruntime140.dll, ucrtbase.dll) aren't available when
+                // cross-compiling from Linux.
+                parts.push("-C".into());
+                parts.push("target-feature=+crt-static".into());
                 // Add Windows SDK library search paths
                 for lib_dir in win_sdk_lib_dirs {
                     parts.push("-L".into());

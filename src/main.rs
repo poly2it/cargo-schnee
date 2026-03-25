@@ -1404,6 +1404,85 @@ fn write_profile(
     Ok(())
 }
 
+/// Look up `CARGO_TARGET_{TRIPLE}_RUNNER` env var (e.g. `wine64` for Windows targets).
+/// Returns `(program, prefix_args)` if set, or `None` for direct execution.
+fn resolve_runner(target: &Option<String>) -> Option<(String, Vec<String>)> {
+    let triple = target.as_ref()?;
+    let env_key = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        triple.to_uppercase().replace('-', "_")
+    );
+    let runner = std::env::var(&env_key).ok()?;
+    let parts: Vec<String> = runner.split_whitespace().map(String::from).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some((parts[0].clone(), parts[1..].to_vec()))
+}
+
+/// Check whether `--target` specifies a cross-compilation target (differs from host).
+fn is_cross_target(target: &Option<String>) -> bool {
+    let Some(triple) = target.as_ref() else {
+        return false;
+    };
+    let host = format!("{}-unknown-linux-gnu", std::env::consts::ARCH);
+    triple != &host
+}
+
+/// Compute the binary filename for a given target name, appending `.exe` for Windows targets.
+fn binary_name(target_name: &str, target: &Option<String>) -> String {
+    let is_windows = target
+        .as_ref()
+        .map(|t| t.contains("windows"))
+        .unwrap_or(false);
+    if is_windows {
+        format!("{target_name}.exe")
+    } else {
+        target_name.to_string()
+    }
+}
+
+/// Execute a binary, optionally through a runner (e.g. Wine for cross-compiled Windows binaries).
+/// Errors with a helpful message if cross-compiling without a runner set.
+/// When using a runner, its stderr is captured and only shown if the process fails.
+fn run_binary(
+    binary_path: &Path,
+    args: &[String],
+    target: &Option<String>,
+) -> Result<std::process::ExitStatus> {
+    let runner = resolve_runner(target);
+    if runner.is_none() && is_cross_target(target) {
+        let triple = target.as_ref().unwrap();
+        let env_key = format!(
+            "CARGO_TARGET_{}_RUNNER",
+            triple.to_uppercase().replace('-', "_")
+        );
+        anyhow::bail!(
+            "cannot execute cross-compiled binary for target `{triple}`\n\
+             Set {env_key} to a runner (e.g. `wine64` for Windows targets)"
+        );
+    }
+    if let Some((ref prog, ref prefix_args)) = runner {
+        let mut cmd = Command::new(prog);
+        cmd.args(prefix_args).arg(binary_path).args(args);
+        // Suppress Wine debug noise (fixme, err, etc.) unless the user
+        // has explicitly configured WINEDEBUG.
+        if std::env::var_os("WINEDEBUG").is_none() {
+            cmd.env("WINEDEBUG", "-all");
+        }
+        let status = cmd
+            .status()
+            .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+        Ok(status)
+    } else {
+        let status = Command::new(binary_path)
+            .args(args)
+            .status()
+            .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+        Ok(status)
+    }
+}
+
 struct BuildResult {
     /// Root derivation paths with target names and unit kinds
     root_drvs: Vec<(String, String, plan_nix::UnitKind)>,
@@ -2075,12 +2154,10 @@ fn main() -> Result<()> {
                 );
             };
 
-            let binary_path = result.target_debug.join(target_name);
+            let bin_name = binary_name(target_name, target);
+            let binary_path = result.target_debug.join(&bin_name);
             shell::status("Running", &format!("`{}`", binary_path.display()));
-            let status = Command::new(&binary_path)
-                .args(args)
-                .status()
-                .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+            let status = run_binary(&binary_path, args, target)?;
             std::process::exit(status.code().unwrap_or(1));
         }
         SchneeCommand::Test {
@@ -2124,12 +2201,10 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for (_, target_name, _) in &test_roots {
-                let binary_path = result.target_debug.join(target_name);
+                let bin_name = binary_name(target_name, target);
+                let binary_path = result.target_debug.join(&bin_name);
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
-                let status = Command::new(&binary_path)
-                    .args(args)
-                    .status()
-                    .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+                let status = run_binary(&binary_path, args, target)?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2179,17 +2254,15 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for (_, target_name, _) in &bench_roots {
-                let binary_path = result.target_debug.join(target_name);
+                let bin_name = binary_name(target_name, target);
+                let binary_path = result.target_debug.join(&bin_name);
                 shell::status(
                     "Running",
                     &format!("benchmarks in `{}`", binary_path.display()),
                 );
                 let mut bench_args = vec!["--bench".to_string()];
                 bench_args.extend(args.iter().cloned());
-                let status = Command::new(&binary_path)
-                    .args(&bench_args)
-                    .status()
-                    .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+                let status = run_binary(&binary_path, &bench_args, target)?;
                 if !status.success() {
                     any_failed = true;
                 }
