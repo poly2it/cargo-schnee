@@ -41,8 +41,68 @@
           # Windows SDK (MSVC CRT + Windows SDK headers/libs)
           # Requires: config.microsoftVisualStudioLicenseAccepted = true
           winSdk = pkgs.windows.sdk;
+
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = schneeToolchain;
+            rustc = schneeToolchain;
+          };
+
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+            ];
+          };
         in
         {
+          packages.default = rustPlatform.buildRustPackage {
+            pname = "cross-windows-example";
+            version = "0.1.0";
+            inherit src;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = [
+              pkgs.nix
+              pkgs.llvmPackages.bintools-unwrapped # lld-link
+              pkgs.llvmPackages.clang-unwrapped    # clang-cl
+            ];
+
+            requiredSystemFeatures = [ "recursive-nix" ];
+            NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
+
+            # Cross-compilation environment
+            XWIN_DIR = "${winSdk}";
+            CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link";
+
+            # Disable cargo-auditable: its wrapper bypasses our cargo wrapper.
+            auditable = false;
+
+            # Override build/install phases: there is no pkgsCross.msvc stdenv,
+            # so we pass --target manually. cargo on PATH is the schnee wrapper
+            # from rustPlatform, which intercepts `cargo build` and runs
+            # cargo-schnee instead.
+            buildPhase = ''
+              runHook preBuild
+              cargo build --release --target x86_64-pc-windows-msvc
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/bin
+              cp target/x86_64-pc-windows-msvc/release/*.exe $out/bin/
+              cp target/x86_64-pc-windows-msvc/release/*.pdb $out/bin/ 2>/dev/null || true
+              runHook postInstall
+            '';
+
+            # Skip fixup: patchelf/strip don't work on PE binaries
+            dontFixup = true;
+
+            doCheck = false;
+          };
+
           devShells.default = pkgs.mkShell {
             buildInputs = [
               schneeToolchain
@@ -68,6 +128,7 @@
 
     in
     {
+      packages = forAllSystems (system: (mkSystem system).packages);
       devShells = forAllSystems (system: (mkSystem system).devShells);
     };
 }
