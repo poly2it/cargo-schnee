@@ -30,4 +30,4 @@ fs2 = "0.4"
 proptest = "1"
 
 [workspace]
-exclude = ["tests/fixtures/*", "examples/simple", "examples/cross", "examples/build-package", "examples/build-package-cross"]
+exclude = ["tests/fixtures/*", "examples/simple", "examples/cross", "examples/cross-windows", "examples/build-package", "examples/build-package-cross"]

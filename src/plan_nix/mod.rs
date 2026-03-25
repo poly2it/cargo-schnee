@@ -88,6 +88,29 @@ impl TargetConfig {
     pub fn is_cross(&self) -> bool {
         self.host_triple != self.target_triple
     }
+
+    pub fn is_msvc(&self) -> bool {
+        self.target_triple.contains("msvc")
+    }
+
+    pub fn is_windows(&self) -> bool {
+        self.target_triple.contains("windows")
+    }
+
+    /// Map the target architecture to Microsoft's notation for Windows SDK paths.
+    /// Returns None for non-Windows targets.
+    pub fn ms_arch(&self) -> Option<&'static str> {
+        if !self.is_windows() {
+            return None;
+        }
+        let arch = self.target_triple.split('-').next().unwrap_or("");
+        Some(match arch {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            "i686" | "i586" => "x86",
+            _ => "x64",
+        })
+    }
 }
 
 /// Extract CARGO_CFG_* env vars from `rustc --print cfg` output for a target.
@@ -601,6 +624,38 @@ pub fn run_plan_nix(
         (host_cc_bin_dir.clone(), host_cc_store.clone())
     };
 
+    // For MSVC cross-compilation, resolve Windows SDK paths from XWIN_DIR
+    let (win_sdk_lib_dirs, win_sdk_store) = if target.is_msvc() {
+        let xwin_dir = std::env::var("XWIN_DIR").map_err(|_| {
+            anyhow::anyhow!(
+                "XWIN_DIR environment variable not set. \
+                 Point it to the pkgs.windows.sdk output \
+                 (e.g. XWIN_DIR=${{pkgs.windows.sdk}} in your devShell)."
+            )
+        })?;
+        let xwin_dir = PathBuf::from(&xwin_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&xwin_dir));
+        let ms_arch = target.ms_arch().unwrap_or("x64");
+        let lib_dirs = vec![
+            format!("{}/crt/lib/{}", xwin_dir.display(), ms_arch),
+            format!("{}/sdk/lib/um/{}", xwin_dir.display(), ms_arch),
+            format!("{}/sdk/lib/ucrt/{}", xwin_dir.display(), ms_arch),
+        ];
+        // Derive the Nix store root from the XWIN_DIR path
+        let xwin_str = xwin_dir.to_string_lossy();
+        let store = if let Some(after_prefix) = xwin_str.strip_prefix("/nix/store/")
+            && let Some(end) = after_prefix.find('/')
+        {
+            format!("/nix/store/{}", &after_prefix[..end])
+        } else {
+            xwin_str.to_string()
+        };
+        (lib_dirs, Some(store))
+    } else {
+        (Vec::new(), None)
+    };
+
     // Collect system build environment for -sys build scripts.
     let pkg_config_path_env = {
         let for_target = std::env::var("PKG_CONFIG_PATH_FOR_TARGET").unwrap_or_default();
@@ -623,6 +678,11 @@ pub fn run_plan_nix(
     closure_store_paths.push(host_cc_store.clone());
     if target.is_cross() && target_cc_store != host_cc_store {
         closure_store_paths.push(target_cc_store.clone());
+    }
+    if let Some(ref sdk_store) = win_sdk_store {
+        if !closure_store_paths.contains(sdk_store) {
+            closure_store_paths.push(sdk_store.clone());
+        }
     }
     // PKG_CONFIG_PATH entries
     let mut sys_store_roots: Vec<String> = Vec::new();
@@ -712,6 +772,10 @@ pub fn run_plan_nix(
         .get(&target_cc_store)
         .cloned()
         .unwrap_or_default();
+    let win_sdk_closure: Vec<String> = win_sdk_store
+        .as_ref()
+        .and_then(|s| closure_cache.get(s).cloned())
+        .unwrap_or_default();
 
     let mut sys_build_closure: Vec<String> = Vec::new();
     for root in &sys_store_roots {
@@ -782,11 +846,15 @@ pub fn run_plan_nix(
                 // Select host or target linker based on unit classification.
                 // system is always host — derivations run on the build machine,
                 // rustc's --target flag handles cross-compilation.
-                let (unit_cc_bin_dir, unit_cc_closure) = if nix_units[i].for_host {
-                    (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
-                } else {
-                    (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
-                };
+                // BuildScriptRun always executes on the host and needs the host
+                // cc (even though for_host is false — that flag describes what
+                // the output targets, not the execution environment).
+                let (unit_cc_bin_dir, unit_cc_closure) =
+                    if nix_units[i].for_host || nix_units[i].kind == UnitKind::BuildScriptRun {
+                        (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
+                    } else {
+                        (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
+                    };
                 let json = construct_derivation(
                     &nix_units,
                     i,
@@ -811,6 +879,8 @@ pub fn run_plan_nix(
                     &custom_sys_env,
                     passthru_envs,
                     &vendor_dir.to_string_lossy(),
+                    &win_sdk_lib_dirs,
+                    &win_sdk_closure,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

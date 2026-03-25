@@ -47,6 +47,8 @@ pub(super) fn construct_derivation(
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
     vendor_store: &str,
+    win_sdk_lib_dirs: &[String],
+    win_sdk_closure: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -81,6 +83,7 @@ pub(super) fn construct_derivation(
                 cc_bin_dir,
                 profile,
                 target,
+                win_sdk_lib_dirs,
             )?
         }
     };
@@ -174,6 +177,12 @@ pub(super) fn construct_derivation(
             input_srcs.insert(path.clone());
         }
     }
+    // Windows SDK closure for MSVC linking
+    if unit.needs_linker && !unit.for_host && !win_sdk_closure.is_empty() {
+        for path in win_sdk_closure {
+            input_srcs.insert(path.clone());
+        }
+    }
 
     // Build scripts may reference vendor crate source files at runtime
     // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
@@ -213,6 +222,7 @@ fn build_compile_script(
     cc_bin_dir: &str,
     profile: &ProfileConfig,
     target: &TargetConfig,
+    win_sdk_lib_dirs: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -236,12 +246,24 @@ fn build_compile_script(
     if target.is_cross() && !unit.for_host {
         parts.push("--target".into());
         parts.push(target.target_triple.clone());
-        // Explicitly tell rustc which linker to use for the target, since
-        // the cross-linker is not named `cc`.
+        // Explicitly tell rustc which linker to use for the target.
         if unit.needs_linker {
-            let linker = format!("{}/{}-gcc", cc_bin_dir, target.target_triple);
-            parts.push("-C".into());
-            parts.push(format!("linker={}", linker));
+            if target.is_msvc() {
+                // MSVC: use lld-link (found in cc_bin_dir via find_cross_linker)
+                let linker = format!("{}/lld-link", cc_bin_dir);
+                parts.push("-C".into());
+                parts.push(format!("linker={}", linker));
+                // Add Windows SDK library search paths
+                for lib_dir in win_sdk_lib_dirs {
+                    parts.push("-L".into());
+                    parts.push(format!("native={}", lib_dir));
+                }
+            } else {
+                // GNU: use {triple}-gcc
+                let linker = format!("{}/{}-gcc", cc_bin_dir, target.target_triple);
+                parts.push("-C".into());
+                parts.push(format!("linker={}", linker));
+            }
         }
     }
 

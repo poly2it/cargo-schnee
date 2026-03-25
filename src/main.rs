@@ -1608,6 +1608,7 @@ fn run_build_pipeline(
     let mut diag_shell = cargo::core::shell::Shell::new();
     let src_store_prefix = format!("{}/", src_store);
     let project_dir_prefix = format!("{}/", project_dir.display());
+    let mut nix_error_lines: Vec<String> = Vec::new();
 
     for line in reader.lines().map_while(Result::ok) {
         if interrupted.load(Ordering::Relaxed) {
@@ -1685,12 +1686,13 @@ fn run_build_pipeline(
                     total_drv_count = Some(1);
                 }
             }
-        } else if trimmed.starts_with("/nix/store/")
-            || trimmed.starts_with("resolved derivation:")
+        } else if trimmed.starts_with("resolved derivation:")
             || trimmed.starts_with("warning: you did not specify")
             || trimmed.starts_with("copying path '")
+            || (trimmed.starts_with("/nix/store/") && !trimmed.contains("failed"))
         {
         } else if !trimmed.is_empty() {
+            nix_error_lines.push(trimmed.to_string());
             progress.clear();
             diagnostics::emit_line(
                 &mut diag_shell,
@@ -1711,15 +1713,20 @@ fn run_build_pipeline(
         .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))?;
 
     if !child_status.success() {
+        let error_detail = if nix_error_lines.is_empty() {
+            String::new()
+        } else {
+            format!("\nNix output:\n  {}", nix_error_lines.join("\n  "))
+        };
         anyhow::bail!(
-            "nix-store --realise failed (exit code: {}).\n\
+            "nix-store --realise failed (exit code: {}).{}\n\
              If you see 'ca-derivations' errors, ensure your nix.conf includes:\n  \
              experimental-features = nix-command flakes ca-derivations\n\
-             Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\".\n\
-             Run with -vv for detailed Nix build logs.",
+             Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\".",
             child_status
                 .code()
-                .map_or("signal".to_string(), |c| c.to_string())
+                .map_or("signal".to_string(), |c| c.to_string()),
+            error_detail
         );
     }
     let out_paths: Vec<String> = stdout_content
@@ -1758,6 +1765,7 @@ fn run_build_pipeline(
         })?;
 
         let mut bin_file = None;
+        let is_windows_target = target_config.is_windows();
         for entry in std::fs::read_dir(out_path)? {
             let entry = entry?;
             let dest = target_debug.join(entry.file_name());
@@ -1773,23 +1781,32 @@ fn run_build_pipeline(
                     dest.display()
                 )
             })?;
-            {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if is_windows_target {
+                // Windows PE binaries don't have Unix execute bits.
+                // Detect executables by .exe extension instead.
+                if fname.ends_with(".exe") {
+                    bin_file = Some(dest);
+                }
+            } else {
                 use std::os::unix::fs::PermissionsExt;
                 let src_mode = std::fs::metadata(entry.path())?.permissions().mode();
                 let is_exec = src_mode & 0o111 != 0;
                 let new_mode = if is_exec { 0o755 } else { 0o644 };
                 std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(new_mode))?;
-            }
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&dest)?.permissions().mode();
-                if mode & 0o111 != 0 {
+                if is_exec {
                     bin_file = Some(dest);
                 }
             }
         }
         if let Some(ref bin_path) = bin_file {
-            let clean_dest = target_debug.join(target_name);
+            // For Windows targets, append .exe to the clean target name
+            let clean_name = if is_windows_target {
+                format!("{}.exe", target_name)
+            } else {
+                target_name.to_string()
+            };
+            let clean_dest = target_debug.join(&clean_name);
             if clean_dest != *bin_path {
                 if clean_dest.exists()
                     && let Err(e) = std::fs::remove_file(&clean_dest)

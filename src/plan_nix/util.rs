@@ -56,7 +56,8 @@ pub(super) fn which_command(name: &str) -> Result<PathBuf> {
 }
 
 /// Find a cross-compilation linker for the given target triple.
-/// Checks CARGO_TARGET_{TRIPLE}_LINKER env var, then searches PATH for {triple}-gcc/cc.
+/// Checks CARGO_TARGET_{TRIPLE}_LINKER env var, then searches PATH.
+/// For MSVC targets, searches for lld-link; for GNU targets, searches for {triple}-gcc/cc.
 pub(super) fn find_cross_linker(target_triple: &str) -> Result<PathBuf> {
     let env_key = format!(
         "CARGO_TARGET_{}_LINKER",
@@ -67,25 +68,48 @@ pub(super) fn find_cross_linker(target_triple: &str) -> Result<PathBuf> {
         if path.exists() {
             return Ok(path);
         }
+        // The env var might be a bare command name — try PATH lookup
+        if let Ok(resolved) = which_command_no_deref(&linker) {
+            return Ok(resolved);
+        }
         anyhow::bail!(
             "Cross-linker specified by {} = '{}' not found",
             env_key,
             linker
         );
     }
-    for suffix in &["gcc", "cc"] {
-        let name = format!("{}-{}", target_triple, suffix);
+    let is_msvc = target_triple.contains("msvc");
+    let candidates: &[&str] = if is_msvc {
+        &["lld-link", "rust-lld"]
+    } else {
+        &["gcc", "cc"]
+    };
+    for suffix in candidates {
+        let name = if is_msvc {
+            suffix.to_string()
+        } else {
+            format!("{}-{}", target_triple, suffix)
+        };
         if let Ok(path) = which_command_no_deref(&name) {
             return Ok(path);
         }
     }
-    anyhow::bail!(
-        "Cross-linker not found for target {}. \
-         Set {} or add {}-gcc to PATH.",
-        target_triple,
-        env_key,
-        target_triple
-    );
+    if is_msvc {
+        anyhow::bail!(
+            "Cross-linker not found for target {}. \
+             Set {} or add lld-link to PATH.",
+            target_triple,
+            env_key,
+        );
+    } else {
+        anyhow::bail!(
+            "Cross-linker not found for target {}. \
+             Set {} or add {}-gcc to PATH.",
+            target_triple,
+            env_key,
+            target_triple
+        );
+    }
 }
 
 /// Find a sysroot rlib by name, resolving symlinks to get the real path.
