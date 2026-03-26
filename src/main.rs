@@ -613,14 +613,21 @@ fn find_enclosing_workspace_root(path: &Path, stop_at: &Path) -> Option<PathBuf>
     } else {
         path.parent()?.to_path_buf()
     };
-    let stop_canonical = stop_at.canonicalize().unwrap_or_else(|_| stop_at.to_path_buf());
+    let stop_canonical = stop_at
+        .canonicalize()
+        .unwrap_or_else(|_| stop_at.to_path_buf());
     let mut candidate = dir.parent()?.to_path_buf();
     loop {
-        // Don't match the project directory itself or anything above it
+        // Don't match the project directory itself or anything above it.
+        // Also stop when the candidate is an ancestor of stop_at — any
+        // workspace there would encompass the project itself.
         let candidate_canonical = candidate
             .canonicalize()
             .unwrap_or_else(|_| candidate.clone());
-        if candidate_canonical == stop_canonical || !candidate_canonical.starts_with("/") {
+        if candidate_canonical == stop_canonical
+            || stop_canonical.starts_with(&candidate_canonical)
+            || !candidate_canonical.starts_with("/")
+        {
             break;
         }
         let manifest = candidate.join("Cargo.toml");
@@ -1914,10 +1921,7 @@ fn run_build_pipeline(
         }
         if let Some(ref bin_path) = bin_file {
             // For Windows targets, use the correct extension (.exe or .dll)
-            let bin_ext = bin_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let bin_ext = bin_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let clean_name = if is_windows_target && !bin_ext.is_empty() {
                 format!("{}.{}", target_name, bin_ext)
             } else {

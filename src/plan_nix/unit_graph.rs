@@ -22,7 +22,21 @@ pub(super) fn extract_units_from_bcx(
     // Cargo can create multiple Unit entries for the same crate with different
     // dep_hash/profile values — they compile to the same output, so we merge them.
     let mut key_map: HashMap<Unit, String> = HashMap::new();
-    let mut all_units: Vec<Unit> = bcx.unit_graph.keys().cloned().collect();
+    let mut all_units: Vec<Unit> = bcx
+        .unit_graph
+        .keys()
+        .filter(|u| {
+            // Filter out modes that cargo-schnee cannot handle (they need
+            // rustdoc, not rustc).  Without this filter, Doctest units share
+            // the same compilation_identity as Build units, causing self-edges
+            // in the toposort when Doctest depends on Build.
+            !matches!(
+                u.mode,
+                CompileMode::Doctest | CompileMode::Doc | CompileMode::Docscrape
+            )
+        })
+        .cloned()
+        .collect();
     all_units.sort_by_key(unit_sort_key);
 
     // Group units by their "compilation identity" (what affects rustc output).
@@ -142,7 +156,11 @@ pub(super) fn extract_units_from_bcx(
                 .cloned()
                 .unwrap_or_default();
             for dep in &deps {
-                let dep_key = &key_map[&dep.unit];
+                // Skip deps on filtered-out modes (Doctest, Doc, Docscrape)
+                let dep_key = match key_map.get(&dep.unit) {
+                    Some(k) => k,
+                    None => continue,
+                };
                 if dep.unit.mode == CompileMode::RunCustomBuild {
                     if kind == UnitKind::BuildScriptRun {
                         if let Some(links_name) = dep.unit.pkg.manifest().links() {
@@ -439,6 +457,9 @@ fn compilation_identity(unit: &Unit) -> String {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
         CompileMode::Check { .. } => "-check",
+        CompileMode::Doc => "-doc",
+        CompileMode::Doctest => "-doctest",
+        CompileMode::Docscrape => "-docscrape",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
@@ -490,6 +511,9 @@ fn make_unit_key(unit: &Unit) -> String {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
         CompileMode::Check { .. } => "-check",
+        CompileMode::Doc => "-doc",
+        CompileMode::Doctest => "-doctest",
+        CompileMode::Docscrape => "-docscrape",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
