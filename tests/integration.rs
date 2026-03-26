@@ -653,6 +653,55 @@ fn fixture_external_ws_subcrate() {
     );
 }
 
+// Cross-compilation: proc-macro dependency's build script must see TARGET == HOST.
+// host-probe is only reachable through the proc-macro, so it's always compiled
+// for the host. Its build script asserts TARGET == HOST.
+#[test]
+#[ignore]
+fn fixture_cross_build_script_host_target() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross-bs-host-target");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "cross build with host build script failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    // Binary is cross-compiled for aarch64 — verify it's the right arch
+    let binary = fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/app");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
+    );
+
+    let file_output = Command::new("file").arg(&binary).output().unwrap();
+    let file_str = String::from_utf8_lossy(&file_output.stdout);
+    assert!(
+        file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
+        "Binary is not aarch64: {}",
+        file_str
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Example tests
 // ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ pub(super) fn construct_derivation(
     profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
+    host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
     vendor_store: &str,
@@ -66,6 +67,7 @@ pub(super) fn construct_derivation(
             profile,
             target,
             cfg_envs,
+            host_cfg_envs,
             custom_sys_env,
             passthru_envs,
         )?,
@@ -460,6 +462,7 @@ fn build_run_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
+    host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
 ) -> Result<String> {
@@ -501,8 +504,11 @@ fn build_run_script(
 
     // Tell -sys crates to use pkg-config instead of building bundled C code,
     // but only for the specific build script that needs it.
+    // In cross builds, only host build scripts (for_host) should use the host
+    // pkg-config — target build scripts need target-specific libraries.
     if let Some(links) = unit.links.as_deref()
         && !pkg_config_path.is_empty()
+        && (unit.for_host || !target.is_cross())
     {
         // Check custom overrides first, then built-in table
         let env_var = custom_sys_env
@@ -520,11 +526,18 @@ fn build_run_script(
         }
     }
 
-    // Set standard build script env vars
+    // Set standard build script env vars.
+    // Host-compiled crates (proc-macros and their deps) see TARGET == HOST,
+    // matching cargo's behavior during cross-compilation.
+    let effective_target = if unit.for_host {
+        &target.host_triple
+    } else {
+        &target.target_triple
+    };
     script.push_str("export OUT_DIR=$out/out_dir && ");
     script.push_str(&format!("export RUSTC={} && ", shell_quote(rustc_path)));
     script.push_str(&format!("export HOST={} && ", target.host_triple));
-    script.push_str(&format!("export TARGET={} && ", target.target_triple));
+    script.push_str(&format!("export TARGET={} && ", effective_target));
     script.push_str("export NUM_JOBS=1 && ");
     script.push_str(&format!("export OPT_LEVEL={} && ", profile.opt_level));
     script.push_str(&format!(
@@ -533,8 +546,14 @@ fn build_run_script(
     ));
     script.push_str(&format!("export PROFILE={} && ", profile.name));
 
-    // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals)
-    for (key, val) in cfg_envs {
+    // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals).
+    // Host-compiled crates use the host's cfg values, not the cross target's.
+    let effective_cfg_envs = if unit.for_host {
+        host_cfg_envs
+    } else {
+        cfg_envs
+    };
+    for (key, val) in effective_cfg_envs {
         script.push_str(&format!("export {}={} && ", key, shell_quote(val)));
     }
 

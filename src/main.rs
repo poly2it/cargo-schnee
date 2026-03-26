@@ -1166,6 +1166,10 @@ struct SchneeCache {
     /// Validity is tied to unit_graph_hash (same target triple + toolchain).
     #[serde(default)]
     target_cfg_envs: Option<Vec<(String, String)>>,
+    /// Cached CARGO_CFG_* env vars for the host (from rustc --print cfg for Host).
+    /// Used for build scripts of host-compiled crates during cross-compilation.
+    #[serde(default)]
+    host_cfg_envs: Option<Vec<(String, String)>>,
 }
 
 struct CacheLock {
@@ -1650,6 +1654,11 @@ fn run_build_pipeline(
     } else {
         None
     };
+    let cached_host_cfg_envs = if cached_units.is_some() {
+        cache.host_cfg_envs.clone()
+    } else {
+        None
+    };
 
     // Resolve passthrough env vars for build-script derivations.
     // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
@@ -1660,13 +1669,14 @@ fn run_build_pipeline(
         .filter_map(|name| std::env::var(name).ok().map(|val| (name.to_string(), val)))
         .collect();
 
-    let (root_drvs, plan_units, cfg_envs) = plan_nix::run_plan_nix(
+    let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
         verify_drv_paths,
         &mut cache.tool_closures,
         cached_units,
         cached_cfg_envs,
+        cached_host_cfg_envs,
         &profile,
         &target_config,
         user_intent,
@@ -1690,6 +1700,7 @@ fn run_build_pipeline(
             .collect(),
     );
     cache.target_cfg_envs = Some(cfg_envs);
+    cache.host_cfg_envs = Some(host_cfg_envs);
 
     let plan_duration = plan_start.elapsed();
 
@@ -2361,11 +2372,12 @@ fn main() -> Result<()> {
 
             let src_store = add_project_source_to_store(project_dir)?;
             let mut closure_cache = HashMap::new();
-            let (_, plan_units, _) = plan_nix::run_plan_nix(
+            let (_, plan_units, _, _) = plan_nix::run_plan_nix(
                 Path::new(&src_store),
                 Path::new(&vendor_store),
                 verify_drv_paths,
                 &mut closure_cache,
+                None,
                 None,
                 None,
                 &profile_cfg,
@@ -2402,11 +2414,12 @@ fn main() -> Result<()> {
             let mut closure_cache = HashMap::new();
             let default_profile = plan_nix::ProfileConfig::dev();
             let default_target = plan_nix::TargetConfig::native();
-            let (root_drvs, _, _) = plan_nix::run_plan_nix(
+            let (root_drvs, _, _, _) = plan_nix::run_plan_nix(
                 src,
                 vendor_dir,
                 verify_drv_paths,
                 &mut closure_cache,
+                None,
                 None,
                 None,
                 &default_profile,

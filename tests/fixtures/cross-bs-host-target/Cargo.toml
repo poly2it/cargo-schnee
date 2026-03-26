@@ -1,0 +1,3 @@
+[workspace]
+members = ["app", "my-macro", "host-probe"]
+resolver = "2"

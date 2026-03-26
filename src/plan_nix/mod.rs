@@ -385,6 +385,7 @@ pub fn run_plan_nix(
     closure_cache: &mut HashMap<String, Vec<String>>,
     cached_units: Option<(String, Vec<NixUnit>)>,
     cached_cfg_envs: Option<Vec<(String, String)>>,
+    cached_host_cfg_envs: Option<Vec<(String, String)>>,
     profile: &ProfileConfig,
     target: &TargetConfig,
     user_intent: UserIntent,
@@ -392,7 +393,12 @@ pub fn run_plan_nix(
     features: &[String],
     no_default_features: bool,
     passthru_envs: &[(String, String)],
-) -> Result<(Vec<(String, String)>, Vec<NixUnit>, Vec<(String, String)>)> {
+) -> Result<(
+    Vec<(String, String)>,
+    Vec<NixUnit>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
         anyhow::bail!("No Cargo.toml found at {}", manifest_path.display());
@@ -404,7 +410,9 @@ pub fn run_plan_nix(
 
     let src_str = src.to_string_lossy().to_string();
 
-    let (mut nix_units, cfg_envs) = if let Some((old_src_store, mut units)) = cached_units {
+    let (mut nix_units, cfg_envs, host_cfg_envs) = if let Some((old_src_store, mut units)) =
+        cached_units
+    {
         // Fix up source paths: replace old src_store prefix with current one
         if old_src_store != src_str {
             for unit in &mut units {
@@ -423,13 +431,14 @@ pub fn run_plan_nix(
             unit.drv_path = None;
         }
         let cfg = cached_cfg_envs.unwrap_or_default();
+        let host_cfg = cached_host_cfg_envs.unwrap_or_default();
         info!(
             "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
             units.len(),
             cfg.len(),
             old_src_store != src_str
         );
-        (units, cfg)
+        (units, cfg, host_cfg)
     } else {
         // Write cargo config for vendored sources (unique temp dirs for concurrent safety)
         let cargo_home_tmp = tempfile::Builder::new()
@@ -512,6 +521,14 @@ pub fn run_plan_nix(
         let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir)?;
         let bcx_cfg_envs =
             extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
+        let bcx_host_cfg_envs = if target.is_cross() {
+            extract_cfg_envs(
+                bcx.target_data
+                    .cfg(cargo::core::compiler::CompileKind::Host),
+            )
+        } else {
+            bcx_cfg_envs.clone()
+        };
         drop(bcx);
         info!("Extracted {} units from unit graph", units.len());
 
@@ -520,7 +537,7 @@ pub fn run_plan_nix(
             let _ = std::env::set_current_dir(cwd);
         }
 
-        (units, bcx_cfg_envs)
+        (units, bcx_cfg_envs, bcx_host_cfg_envs)
     };
 
     // Resolve tool paths
@@ -882,6 +899,7 @@ pub fn run_plan_nix(
                     profile,
                     target,
                     &cfg_envs,
+                    &host_cfg_envs,
                     &custom_sys_env,
                     passthru_envs,
                     &vendor_dir.to_string_lossy(),
@@ -1026,8 +1044,13 @@ pub fn run_plan_nix(
             .last()
             .map(|u| u.crate_name.clone())
             .unwrap_or_default();
-        return Ok((vec![(last_drv, last_name)], nix_units, cfg_envs));
+        return Ok((
+            vec![(last_drv, last_name)],
+            nix_units,
+            cfg_envs,
+            host_cfg_envs,
+        ));
     }
 
-    Ok((root_drvs, nix_units, cfg_envs))
+    Ok((root_drvs, nix_units, cfg_envs, host_cfg_envs))
 }
