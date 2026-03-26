@@ -188,8 +188,9 @@ pub(super) fn construct_derivation(
 
     // Build scripts may reference vendor crate source files at runtime
     // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
-    // Include the vendor dir so the Nix sandbox allows access.
-    if unit.kind == UnitKind::BuildScriptRun && !vendor_store.is_empty() {
+    // Linking units also need it: build scripts emit cargo:rustc-link-search
+    // paths pointing into the vendor store (e.g. pre-built .lib files).
+    if (unit.kind == UnitKind::BuildScriptRun || unit.needs_linker) && !vendor_store.is_empty() {
         input_srcs.insert(vendor_store.to_string());
     }
 
@@ -601,6 +602,9 @@ fn build_run_script(
     // files relative to CWD (cargo convention) AND scripts that write temp
     // files relative to CWD (e.g. embedded DB engines) both work.
     script.push_str("export HOME=$TMPDIR && ");
+    // Remember the original (Nix store) manifest dir so we can rewrite
+    // workdir paths back to it in the build script output.
+    script.push_str("_orig_manifest_dir=$CARGO_MANIFEST_DIR && ");
     script.push_str("_bs_workdir=$TMPDIR/workdir && ");
     script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
     // Update CARGO_MANIFEST_DIR to the writable copy so build scripts that
@@ -639,6 +643,14 @@ fn build_run_script(
     script.push_str(&format!(
         "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
+    ));
+    // Rewrite workdir paths back to the original Nix store path so that
+    // cargo:rustc-link-search directives survive to the linking derivation.
+    // Use pure bash (no sed) since gnused isn't in the sandbox PATH.
+    script.push_str(concat!(
+        r#" && _tmp=$out/output.tmp && while IFS= read -r _line; do"#,
+        r#" printf '%s\n' "${_line//$_bs_workdir/$_orig_manifest_dir}";"#,
+        r#" done < $out/output > $_tmp && mv $_tmp $out/output"#,
     ));
 
     Ok(script)

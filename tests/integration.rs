@@ -6,6 +6,16 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+/// Guards to serialize tests that share a fixture directory.
+/// Without this, parallel test runs race on clean_target / build / read.
+static MINIMAL_BIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock(m: &'static LazyLock<Mutex<()>>) -> MutexGuard<'static, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Get the path to the cargo-schnee binary built by cargo test.
 fn cargo_schnee_bin() -> PathBuf {
@@ -100,6 +110,7 @@ fn clean_target(project_dir: &Path) {
 #[test]
 #[ignore]
 fn fixture_minimal_binary() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
 
@@ -126,6 +137,7 @@ fn fixture_minimal_binary() {
 #[test]
 #[ignore]
 fn fixture_workspace_binaries() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -235,6 +247,7 @@ fn fixture_workspace_glob_members() {
 #[test]
 #[ignore]
 fn fixture_workspace_warm_rebuild() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -259,6 +272,7 @@ fn fixture_workspace_warm_rebuild() {
 #[test]
 #[ignore]
 fn fixture_minimal_binary_warm_rebuild() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
     let binary = fixture_dir.join("target/debug/minimal-bin");
@@ -278,6 +292,7 @@ fn fixture_minimal_binary_warm_rebuild() {
 #[test]
 #[ignore]
 fn fixture_verify_drv_paths() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
 
@@ -699,6 +714,47 @@ fn fixture_cross_build_script_host_target() {
         file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
         "Binary is not aarch64: {}",
         file_str
+    );
+}
+
+// Cross-compilation: build script emits cargo:rustc-link-search pointing to
+// CARGO_MANIFEST_DIR/lib. The path must survive from the build-script sandbox
+// to the linking derivation (rewritten from /build/workdir/… to store path).
+#[test]
+#[ignore]
+fn fixture_cross_build_script_link_search() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross-bs-link-search");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "cross build with link-search failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    let binary =
+        fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/cross-bs-link-search-app");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
     );
 }
 
