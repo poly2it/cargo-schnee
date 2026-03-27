@@ -1828,14 +1828,18 @@ fn run_build_pipeline(
             || (trimmed.starts_with("/nix/store/") && !trimmed.contains("failed"))
         {
         } else if !trimmed.is_empty() {
-            nix_error_lines.push(trimmed.to_string());
             progress.clear();
-            diagnostics::emit_line(
+            // Nix prefixes "Last N log lines" with "> "; strip before checking
+            let content = trimmed.strip_prefix("> ").unwrap_or(trimmed);
+            let was_diagnostic = diagnostics::emit_line(
                 &mut diag_shell,
-                trimmed,
+                content,
                 &src_store_prefix,
                 &project_dir_prefix,
             );
+            if !was_diagnostic {
+                nix_error_lines.push(trimmed.to_string());
+            }
         }
     }
     progress.clear();

@@ -144,7 +144,7 @@ pub(super) fn extract_units_from_bcx(
             .get(&identity)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let mut dep_extern_map: HashMap<String, String> = HashMap::new();
+        let mut dep_extern_map: HashMap<String, (String, bool)> = HashMap::new();
         let mut build_script_dep: Option<String> = None;
         let mut build_script_compile_key: Option<String> = None;
         let mut links_dep_map: HashMap<String, String> = HashMap::new();
@@ -188,14 +188,23 @@ pub(super) fn extract_units_from_bcx(
                     });
                 } else {
                     let extern_name = dep.extern_crate_name.to_string();
+                    // When a package has both lib and bin targets with the same
+                    // extern name, prefer the lib target — downstream --extern
+                    // needs the .rlib, not the binary.
+                    let dep_is_lib = dep.unit.target.is_lib();
                     dep_extern_map
                         .entry(extern_name)
-                        .and_modify(|existing| {
-                            if *dep_key < *existing {
-                                *existing = dep_key.clone();
+                        .and_modify(|(existing_key, existing_is_lib)| {
+                            if dep_is_lib && !*existing_is_lib {
+                                // Replace bin with lib unconditionally
+                                *existing_key = dep_key.clone();
+                                *existing_is_lib = true;
+                            } else if dep_is_lib == *existing_is_lib && *dep_key < *existing_key {
+                                // Same kind: pick lexicographically smallest
+                                *existing_key = dep_key.clone();
                             }
                         })
-                        .or_insert_with(|| dep_key.clone());
+                        .or_insert_with(|| (dep_key.clone(), dep_is_lib));
                 }
             }
         }
@@ -302,11 +311,14 @@ pub(super) fn extract_units_from_bcx(
                     dep_key,
                     key,
                 );
-                dep_extern_map.insert(extern_name, dep_key);
+                dep_extern_map.insert(extern_name, (dep_key, true));
             }
         }
 
-        let mut dep_extern: Vec<(String, String)> = dep_extern_map.into_iter().collect();
+        let mut dep_extern: Vec<(String, String)> = dep_extern_map
+            .into_iter()
+            .map(|(name, (key, _))| (name, key))
+            .collect();
         let mut links_dep_keys: Vec<(String, String)> = links_dep_map
             .into_iter()
             .map(|(links_name, dep_key)| (dep_key, links_name))
@@ -755,7 +767,7 @@ pub(super) fn toposort(
 /// `(extern_name, dep_unit_key)` pairs it can provide.  Only entries whose
 /// `extern_name` is absent from `dep_extern` are returned.
 fn find_missing_feature_deps(
-    dep_extern: &HashMap<String, String>,
+    dep_extern: &HashMap<String, (String, bool)>,
     enabled_features: &[String],
     feature_dep_activations: &HashMap<String, Vec<(String, String)>>,
 ) -> Vec<(String, String)> {
@@ -1403,8 +1415,8 @@ mod tests {
         // dep:serde, but cargo omits both from the unit graph because serde is
         // under [target.'cfg(any())'.dependencies].
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("equivalent".into(), "equivalent-key".into());
-        dep_extern.insert("hashbrown".into(), "hashbrown-key".into());
+        dep_extern.insert("equivalent".into(), ("equivalent-key".into(), true));
+        dep_extern.insert("hashbrown".into(), ("hashbrown-key".into(), true));
 
         let features = vec!["default".into(), "std".into(), "serde".into()];
 
@@ -1443,7 +1455,7 @@ mod tests {
         // If serde is already in dep_extern (normal case without cfg(any())),
         // no additions should be made.
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("serde".into(), "serde-key".into());
+        dep_extern.insert("serde".into(), ("serde-key".into(), true));
 
         let features = vec!["serde".into()];
         let mut activations = HashMap::new();

@@ -1004,3 +1004,18 @@ fn fixture_test_manifest_dir_writable() {
     clean_target(&fixture_dir);
     run_schnee_test(&manifest);
 }
+
+/// Crate with both lib and bin targets plus integration tests.
+/// Regression test for: rlib artifact missing lib prefix and .rlib extension
+/// when the crate also has a bin target, causing integration tests to fail with
+/// "extern location for X is of an unknown type".
+#[test]
+#[ignore]
+fn fixture_lib_bin_integration_test() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lib-bin-integration");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
+}
