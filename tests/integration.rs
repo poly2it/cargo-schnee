@@ -25,11 +25,23 @@ fn cargo_schnee_bin() -> PathBuf {
 /// Run `cargo-schnee build` on the given manifest path and assert success.
 /// Returns (stdout, stderr) on success.
 fn run_schnee_build(manifest_path: &Path) -> (String, String) {
+    run_schnee_cmd("build", manifest_path, &[])
+}
+
+/// Run `cargo-schnee test` on the given manifest path and assert success.
+/// Returns (stdout, stderr) on success.
+fn run_schnee_test(manifest_path: &Path) -> (String, String) {
+    run_schnee_cmd("test", manifest_path, &[])
+}
+
+/// Run a cargo-schnee subcommand on the given manifest path and assert success.
+fn run_schnee_cmd(subcmd: &str, manifest_path: &Path, extra_args: &[&str]) -> (String, String) {
     let output = Command::new(cargo_schnee_bin())
         .arg("schnee")
-        .arg("build")
+        .arg(subcmd)
         .arg("--manifest-path")
         .arg(manifest_path)
+        .args(extra_args)
         .output()
         .expect("Failed to execute cargo-schnee");
 
@@ -38,7 +50,8 @@ fn run_schnee_build(manifest_path: &Path) -> (String, String) {
 
     assert!(
         output.status.success(),
-        "cargo-schnee build failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        "cargo-schnee {} failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        subcmd,
         manifest_path.display(),
         stdout,
         stderr,
@@ -975,4 +988,19 @@ fn github_just_workspace() {
         "Unexpected version output: {}",
         stdout
     );
+}
+
+/// Test that `cargo schnee test` sets CARGO_MANIFEST_DIR to a writable project
+/// path — both the compile-time `env!()` value and the runtime env var.
+/// Regression test for: test binaries couldn't write to CARGO_MANIFEST_DIR
+/// because it pointed to a read-only nix store path.
+#[test]
+#[ignore]
+fn fixture_test_manifest_dir_writable() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-manifest-dir-writable");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
 }

@@ -50,6 +50,7 @@ pub(super) fn construct_derivation(
     vendor_store: &str,
     win_sdk_lib_dirs: &[String],
     win_sdk_closure: &[String],
+    test_manifest_dir_map: &HashMap<String, String>,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -73,6 +74,11 @@ pub(super) fn construct_derivation(
         )?,
         _ => {
             let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+            let manifest_override = if unit.kind == UnitKind::TestCompile {
+                test_manifest_dir_map.get(&unit.key).map(|s| s.as_str())
+            } else {
+                None
+            };
             build_compile_script(
                 unit,
                 units,
@@ -86,6 +92,7 @@ pub(super) fn construct_derivation(
                 profile,
                 target,
                 win_sdk_lib_dirs,
+                manifest_override,
             )?
         }
     };
@@ -226,6 +233,7 @@ fn build_compile_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
+    manifest_dir_override: Option<&str>,
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -422,9 +430,10 @@ fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
+    let effective_manifest_dir = manifest_dir_override.unwrap_or(&unit.manifest_dir);
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
-        shell_quote(&unit.manifest_dir)
+        shell_quote(effective_manifest_dir)
     ));
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);

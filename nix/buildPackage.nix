@@ -207,12 +207,22 @@ let
   );
 
   # -- install phase ------------------------------------------------------
-  profileDir = if buildType == "release" then "release" else buildType;
+  # Cargo maps the "dev" profile to the "debug" output directory.
+  profileDir =
+    if buildType == "release" then "release"
+    else if buildType == "dev" then "debug"
+    else buildType;
+
+  # Cross-compiled output lands in target/<triple>/<profile>/.
+  releaseDir =
+    if target != null
+    then "target/${target}/${profileDir}"
+    else "target/${profileDir}";
 
   installPhaseWindows = ''
     runHook preInstall
 
-    releaseDir="target/${profileDir}"
+    releaseDir="${releaseDir}"
     mkdir -p $out/bin
 
     for f in "$releaseDir"/*.exe; do
@@ -240,7 +250,7 @@ let
   installPhaseNative = ''
     runHook preInstall
 
-    releaseDir="target/${profileDir}"
+    releaseDir="${releaseDir}"
     mkdir -p $out/bin $out/lib
 
     for f in "$releaseDir"/*; do

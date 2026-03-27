@@ -393,6 +393,7 @@ pub fn run_plan_nix(
     features: &[String],
     no_default_features: bool,
     passthru_envs: &[(String, String)],
+    project_dir: Option<&Path>,
 ) -> Result<(
     Vec<(String, String)>,
     Vec<NixUnit>,
@@ -823,6 +824,25 @@ pub fn run_plan_nix(
     // Pre-flight: warn about system libraries that pkg-config can't find.
     check_system_libraries(&nix_units, &pkg_config_bin, &pkg_config_path_env);
 
+    // For TestCompile units, map CARGO_MANIFEST_DIR back to the original
+    // project directory so that env!("CARGO_MANIFEST_DIR") in test binaries
+    // points to a writable path at runtime (not the read-only nix store).
+    let test_manifest_dir_map: HashMap<String, String> = if let Some(proj) = project_dir {
+        let src_prefix = src.to_string_lossy();
+        let proj_prefix = proj.to_string_lossy();
+        nix_units
+            .iter()
+            .filter(|u| u.kind == UnitKind::TestCompile)
+            .filter_map(|u| {
+                u.manifest_dir
+                    .strip_prefix(src_prefix.as_ref())
+                    .map(|suffix| (u.key.clone(), format!("{}{}", proj_prefix, suffix)))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     // Build key→index map for looking up dep info
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
@@ -905,6 +925,7 @@ pub fn run_plan_nix(
                     &vendor_dir.to_string_lossy(),
                     &win_sdk_lib_dirs,
                     &win_sdk_closure,
+                    &test_manifest_dir_map,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",
