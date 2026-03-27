@@ -321,6 +321,19 @@ fn find_lockfile(project_dir: &Path) -> Result<PathBuf> {
     Ok(local)
 }
 
+/// Read [package].name from a Cargo.toml.
+fn read_package_name(manifest_path: &Path) -> Result<String> {
+    let content = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    doc.get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No [package].name found in {}", manifest_path.display()))
+}
+
 /// Read the binary target name from Cargo.toml (defaults to package name).
 fn read_bin_target_name(manifest_path: &Path) -> Result<String> {
     let content = std::fs::read_to_string(manifest_path)?;
@@ -1559,6 +1572,24 @@ fn run_build_pipeline(
     let manifest_path = resolve_manifest(manifest_path_opt)?;
     let project_dir_buf = resolve_workspace_root(&manifest_path)?;
     let project_dir = project_dir_buf.as_path();
+
+    // When the user's manifest points to a workspace member (not the root)
+    // and no -p packages were given, scope the build to that member — matching
+    // standard `cargo` behaviour of respecting the working directory.
+    let ws_root_manifest = project_dir.join("Cargo.toml");
+    let ws_root_manifest_canon = ws_root_manifest.canonicalize().unwrap_or(ws_root_manifest);
+    let packages = if packages.is_empty() && manifest_path != ws_root_manifest_canon {
+        let pkg_name = read_package_name(&manifest_path)?;
+        log::info!(
+            "Scoping build to package '{}' (manifest at {})",
+            pkg_name,
+            manifest_path.display(),
+        );
+        vec![pkg_name]
+    } else {
+        packages.to_vec()
+    };
+    let packages = &packages[..];
 
     let profile = if release {
         plan_nix::ProfileConfig::release()

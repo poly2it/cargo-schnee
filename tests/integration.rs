@@ -1005,6 +1005,39 @@ fn fixture_test_manifest_dir_writable() {
     run_schnee_test(&manifest);
 }
 
+/// Building from a workspace member's manifest should scope the build to
+/// that member only, matching standard `cargo` behaviour.
+/// Regression test for: cargo test from a subcrate builds the entire workspace.
+#[test]
+#[ignore]
+fn fixture_workspace_member_scoping() {
+    let _g = lock(&WORKSPACE_BINS_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
+
+    clean_target(&fixture_dir);
+
+    // Build from bin-a's manifest (not the workspace root)
+    let manifest = fixture_dir.join("bin-a/Cargo.toml");
+    run_schnee_build(&manifest);
+
+    // bin-a should be built
+    let bin_a = fixture_dir.join("target/debug/bin-a");
+    assert!(
+        bin_a.exists(),
+        "bin-a should be built when scoped to bin-a: {}",
+        bin_a.display()
+    );
+
+    // bin-b should NOT be built (workspace scoping)
+    let bin_b = fixture_dir.join("target/debug/bin-b");
+    assert!(
+        !bin_b.exists(),
+        "bin-b should NOT be built when scoped to bin-a: {}",
+        bin_b.display()
+    );
+}
+
 /// Crate with both lib and bin targets plus integration tests.
 /// Regression test for: rlib artifact missing lib prefix and .rlib extension
 /// when the crate also has a bin target, causing integration tests to fail with
