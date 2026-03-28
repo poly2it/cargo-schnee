@@ -720,10 +720,10 @@ pub fn run_plan_nix(
     if target.is_cross() && target_cc_store != host_cc_store {
         closure_store_paths.push(target_cc_store.clone());
     }
-    if let Some(ref sdk_store) = win_sdk_store {
-        if !closure_store_paths.contains(sdk_store) {
-            closure_store_paths.push(sdk_store.clone());
-        }
+    if let Some(ref sdk_store) = win_sdk_store
+        && !closure_store_paths.contains(sdk_store)
+    {
+        closure_store_paths.push(sdk_store.clone());
     }
     // PKG_CONFIG_PATH entries
     let mut sys_store_roots: Vec<String> = Vec::new();
