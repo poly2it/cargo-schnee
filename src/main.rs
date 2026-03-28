@@ -1884,21 +1884,38 @@ fn run_build_pipeline(
         .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))?;
 
     if !child_status.success() {
-        let error_detail = if nix_error_lines.is_empty() {
-            String::new()
-        } else {
-            format!("\nNix output:\n  {}", nix_error_lines.join("\n  "))
-        };
-        anyhow::bail!(
-            "nix-store --realise failed (exit code: {}).{}\n\
-             If you see 'ca-derivations' errors, ensure your nix.conf includes:\n  \
-             experimental-features = nix-command flakes ca-derivations\n\
-             Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\".",
-            child_status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string()),
-            error_detail
-        );
+        // Extract failed .drv paths from nix output so we can suggest `nix log`.
+        let failed_drvs: Vec<&str> = nix_error_lines
+            .iter()
+            .filter_map(|line| {
+                // nix outputs: builder for '/nix/store/xxx.drv' failed with exit code N
+                let rest = line.strip_prefix("builder for '")?;
+                let drv = rest.split('\'').next()?;
+                if drv.ends_with(".drv") {
+                    Some(drv)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Check for ca-derivations errors specifically.
+        let has_ca_error = nix_error_lines.iter().any(|l| l.contains("ca-derivations"));
+
+        if has_ca_error {
+            anyhow::bail!(
+                "Ensure your nix.conf includes:\n  \
+                 experimental-features = nix-command flakes ca-derivations\n\
+                 Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\"."
+            );
+        }
+        if !failed_drvs.is_empty() {
+            eprintln!("For derivation logs, run:");
+            for drv in &failed_drvs {
+                eprintln!("  nix log {}", drv);
+            }
+        }
+        std::process::exit(1);
     }
     let out_paths: Vec<String> = stdout_content
         .lines()
