@@ -1,6 +1,6 @@
 use super::util::{collect_store_paths, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
-use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
+use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
 use anyhow::{Context, Result};
 use log::debug;
 use sha2::{Digest, Sha256};
@@ -44,9 +44,12 @@ pub(super) fn construct_derivation(
     profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
+    host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
     vendor_store: &str,
+    win_sdk_lib_dirs: &[String],
+    win_sdk_closure: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -64,6 +67,7 @@ pub(super) fn construct_derivation(
             profile,
             target,
             cfg_envs,
+            host_cfg_envs,
             custom_sys_env,
             passthru_envs,
         )?,
@@ -81,6 +85,7 @@ pub(super) fn construct_derivation(
                 cc_bin_dir,
                 profile,
                 target,
+                win_sdk_lib_dirs,
             )?
         }
     };
@@ -174,11 +179,18 @@ pub(super) fn construct_derivation(
             input_srcs.insert(path.clone());
         }
     }
+    // Windows SDK closure for MSVC linking
+    if unit.needs_linker && !unit.for_host && !win_sdk_closure.is_empty() {
+        for path in win_sdk_closure {
+            input_srcs.insert(path.clone());
+        }
+    }
 
     // Build scripts may reference vendor crate source files at runtime
     // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
-    // Include the vendor dir so the Nix sandbox allows access.
-    if unit.kind == UnitKind::BuildScriptRun && !vendor_store.is_empty() {
+    // Linking units also need it: build scripts emit cargo:rustc-link-search
+    // paths pointing into the vendor store (e.g. pre-built .lib files).
+    if (unit.kind == UnitKind::BuildScriptRun || unit.needs_linker) && !vendor_store.is_empty() {
         input_srcs.insert(vendor_store.to_string());
     }
 
@@ -213,6 +225,7 @@ fn build_compile_script(
     cc_bin_dir: &str,
     profile: &ProfileConfig,
     target: &TargetConfig,
+    win_sdk_lib_dirs: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -236,12 +249,29 @@ fn build_compile_script(
     if target.is_cross() && !unit.for_host {
         parts.push("--target".into());
         parts.push(target.target_triple.clone());
-        // Explicitly tell rustc which linker to use for the target, since
-        // the cross-linker is not named `cc`.
+        // Explicitly tell rustc which linker to use for the target.
         if unit.needs_linker {
-            let linker = format!("{}/{}-gcc", cc_bin_dir, target.target_triple);
-            parts.push("-C".into());
-            parts.push(format!("linker={}", linker));
+            if target.is_msvc() {
+                // MSVC: use lld-link (found in cc_bin_dir via find_cross_linker)
+                let linker = format!("{}/lld-link", cc_bin_dir);
+                parts.push("-C".into());
+                parts.push(format!("linker={}", linker));
+                // Statically link the MSVC CRT — the runtime DLLs
+                // (vcruntime140.dll, ucrtbase.dll) aren't available when
+                // cross-compiling from Linux.
+                parts.push("-C".into());
+                parts.push("target-feature=+crt-static".into());
+                // Add Windows SDK library search paths
+                for lib_dir in win_sdk_lib_dirs {
+                    parts.push("-L".into());
+                    parts.push(format!("native={}", lib_dir));
+                }
+            } else {
+                // GNU: use {triple}-gcc
+                let linker = format!("{}/{}-gcc", cc_bin_dir, target.target_triple);
+                parts.push("-C".into());
+                parts.push(format!("linker={}", linker));
+            }
         }
     }
 
@@ -392,9 +422,35 @@ fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
+    // For TestCompile units, use a deterministic /tmp symlink as
+    // CARGO_MANIFEST_DIR. At compile time the symlink points to the store
+    // path so proc macros (e.g. sqlx::migrate!) can read files. At test
+    // runtime the same path is re-symlinked to the writable project dir,
+    // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
+    // a readable+writable location.
+    let tmp_manifest_path;
+    let manifest_dir_for_compile =
+        if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
+            let hash = {
+                let mut hasher = Sha256::new();
+                hasher.update(unit.original_manifest_dir.as_bytes());
+                hex_lower(&hasher.finalize()[..8])
+            };
+            tmp_manifest_path = format!("/tmp/_schnee_md_{}", hash);
+            let ln_path = format!("{}/ln", coreutils_bin_dir);
+            script.push_str(&format!(
+                "{} -sfn {} {} && ",
+                shell_quote(&ln_path),
+                shell_quote(&unit.manifest_dir),
+                shell_quote(&tmp_manifest_path),
+            ));
+            &tmp_manifest_path
+        } else {
+            &unit.manifest_dir
+        };
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
-        shell_quote(&unit.manifest_dir)
+        shell_quote(manifest_dir_for_compile)
     ));
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
@@ -433,6 +489,7 @@ fn build_run_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
+    host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
 ) -> Result<String> {
@@ -474,8 +531,11 @@ fn build_run_script(
 
     // Tell -sys crates to use pkg-config instead of building bundled C code,
     // but only for the specific build script that needs it.
+    // In cross builds, only host build scripts (for_host) should use the host
+    // pkg-config — target build scripts need target-specific libraries.
     if let Some(links) = unit.links.as_deref()
         && !pkg_config_path.is_empty()
+        && (unit.for_host || !target.is_cross())
     {
         // Check custom overrides first, then built-in table
         let env_var = custom_sys_env
@@ -493,11 +553,18 @@ fn build_run_script(
         }
     }
 
-    // Set standard build script env vars
+    // Set standard build script env vars.
+    // Host-compiled crates (proc-macros and their deps) see TARGET == HOST,
+    // matching cargo's behavior during cross-compilation.
+    let effective_target = if unit.for_host {
+        &target.host_triple
+    } else {
+        &target.target_triple
+    };
     script.push_str("export OUT_DIR=$out/out_dir && ");
     script.push_str(&format!("export RUSTC={} && ", shell_quote(rustc_path)));
     script.push_str(&format!("export HOST={} && ", target.host_triple));
-    script.push_str(&format!("export TARGET={} && ", target.target_triple));
+    script.push_str(&format!("export TARGET={} && ", effective_target));
     script.push_str("export NUM_JOBS=1 && ");
     script.push_str(&format!("export OPT_LEVEL={} && ", profile.opt_level));
     script.push_str(&format!(
@@ -506,8 +573,14 @@ fn build_run_script(
     ));
     script.push_str(&format!("export PROFILE={} && ", profile.name));
 
-    // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals)
-    for (key, val) in cfg_envs {
+    // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals).
+    // Host-compiled crates use the host's cfg values, not the cross target's.
+    let effective_cfg_envs = if unit.for_host {
+        host_cfg_envs
+    } else {
+        cfg_envs
+    };
+    for (key, val) in effective_cfg_envs {
         script.push_str(&format!("export {}={} && ", key, shell_quote(val)));
     }
 
@@ -555,6 +628,9 @@ fn build_run_script(
     // files relative to CWD (cargo convention) AND scripts that write temp
     // files relative to CWD (e.g. embedded DB engines) both work.
     script.push_str("export HOME=$TMPDIR && ");
+    // Remember the original (Nix store) manifest dir so we can rewrite
+    // workdir paths back to it in the build script output.
+    script.push_str("_orig_manifest_dir=$CARGO_MANIFEST_DIR && ");
     script.push_str("_bs_workdir=$TMPDIR/workdir && ");
     script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
     // Update CARGO_MANIFEST_DIR to the writable copy so build scripts that
@@ -593,6 +669,14 @@ fn build_run_script(
     script.push_str(&format!(
         "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
+    ));
+    // Rewrite workdir paths back to the original Nix store path so that
+    // cargo:rustc-link-search directives survive to the linking derivation.
+    // Use pure bash (no sed) since gnused isn't in the sandbox PATH.
+    script.push_str(concat!(
+        r#" && _tmp=$out/output.tmp && while IFS= read -r _line; do"#,
+        r#" printf '%s\n' "${_line//$_bs_workdir/$_orig_manifest_dir}";"#,
+        r#" done < $out/output > $_tmp && mv $_tmp $out/output"#,
     ));
 
     Ok(script)

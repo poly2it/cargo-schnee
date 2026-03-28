@@ -6,6 +6,16 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+/// Guards to serialize tests that share a fixture directory.
+/// Without this, parallel test runs race on clean_target / build / read.
+static MINIMAL_BIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock(m: &'static LazyLock<Mutex<()>>) -> MutexGuard<'static, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Get the path to the cargo-schnee binary built by cargo test.
 fn cargo_schnee_bin() -> PathBuf {
@@ -15,11 +25,23 @@ fn cargo_schnee_bin() -> PathBuf {
 /// Run `cargo-schnee build` on the given manifest path and assert success.
 /// Returns (stdout, stderr) on success.
 fn run_schnee_build(manifest_path: &Path) -> (String, String) {
+    run_schnee_cmd("build", manifest_path, &[])
+}
+
+/// Run `cargo-schnee test` on the given manifest path and assert success.
+/// Returns (stdout, stderr) on success.
+fn run_schnee_test(manifest_path: &Path) -> (String, String) {
+    run_schnee_cmd("test", manifest_path, &[])
+}
+
+/// Run a cargo-schnee subcommand on the given manifest path and assert success.
+fn run_schnee_cmd(subcmd: &str, manifest_path: &Path, extra_args: &[&str]) -> (String, String) {
     let output = Command::new(cargo_schnee_bin())
         .arg("schnee")
-        .arg("build")
+        .arg(subcmd)
         .arg("--manifest-path")
         .arg(manifest_path)
+        .args(extra_args)
         .output()
         .expect("Failed to execute cargo-schnee");
 
@@ -28,7 +50,8 @@ fn run_schnee_build(manifest_path: &Path) -> (String, String) {
 
     assert!(
         output.status.success(),
-        "cargo-schnee build failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        "cargo-schnee {} failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        subcmd,
         manifest_path.display(),
         stdout,
         stderr,
@@ -100,6 +123,7 @@ fn clean_target(project_dir: &Path) {
 #[test]
 #[ignore]
 fn fixture_minimal_binary() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
 
@@ -126,6 +150,7 @@ fn fixture_minimal_binary() {
 #[test]
 #[ignore]
 fn fixture_workspace_binaries() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -235,6 +260,7 @@ fn fixture_workspace_glob_members() {
 #[test]
 #[ignore]
 fn fixture_workspace_warm_rebuild() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -259,6 +285,7 @@ fn fixture_workspace_warm_rebuild() {
 #[test]
 #[ignore]
 fn fixture_minimal_binary_warm_rebuild() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
     let binary = fixture_dir.join("target/debug/minimal-bin");
@@ -278,6 +305,7 @@ fn fixture_minimal_binary_warm_rebuild() {
 #[test]
 #[ignore]
 fn fixture_verify_drv_paths() {
+    let _guard = lock(&MINIMAL_BIN_LOCK);
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-bin");
     let manifest = fixture_dir.join("Cargo.toml");
 
@@ -653,6 +681,96 @@ fn fixture_external_ws_subcrate() {
     );
 }
 
+// Cross-compilation: proc-macro dependency's build script must see TARGET == HOST.
+// host-probe is only reachable through the proc-macro, so it's always compiled
+// for the host. Its build script asserts TARGET == HOST.
+#[test]
+#[ignore]
+fn fixture_cross_build_script_host_target() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross-bs-host-target");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "cross build with host build script failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    // Binary is cross-compiled for aarch64 — verify it's the right arch
+    let binary = fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/app");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
+    );
+
+    let file_output = Command::new("file").arg(&binary).output().unwrap();
+    let file_str = String::from_utf8_lossy(&file_output.stdout);
+    assert!(
+        file_str.contains("aarch64") || file_str.contains("ARM aarch64"),
+        "Binary is not aarch64: {}",
+        file_str
+    );
+}
+
+// Cross-compilation: build script emits cargo:rustc-link-search pointing to
+// CARGO_MANIFEST_DIR/lib. The path must survive from the build-script sandbox
+// to the linking derivation (rewritten from /build/workdir/… to store path).
+#[test]
+#[ignore]
+fn fixture_cross_build_script_link_search() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross-bs-link-search");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "cross build with link-search failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    let binary =
+        fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/cross-bs-link-search-app");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Example tests
 // ---------------------------------------------------------------------------
@@ -870,4 +988,67 @@ fn github_just_workspace() {
         "Unexpected version output: {}",
         stdout
     );
+}
+
+/// Test that `cargo schnee test` sets CARGO_MANIFEST_DIR to a writable project
+/// path — both the compile-time `env!()` value and the runtime env var.
+/// Regression test for: test binaries couldn't write to CARGO_MANIFEST_DIR
+/// because it pointed to a read-only nix store path.
+#[test]
+#[ignore]
+fn fixture_test_manifest_dir_writable() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-manifest-dir-writable");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
+}
+
+/// Building from a workspace member's manifest should scope the build to
+/// that member only, matching standard `cargo` behaviour.
+/// Regression test for: cargo test from a subcrate builds the entire workspace.
+#[test]
+#[ignore]
+fn fixture_workspace_member_scoping() {
+    let _g = lock(&WORKSPACE_BINS_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
+
+    clean_target(&fixture_dir);
+
+    // Build from bin-a's manifest (not the workspace root)
+    let manifest = fixture_dir.join("bin-a/Cargo.toml");
+    run_schnee_build(&manifest);
+
+    // bin-a should be built
+    let bin_a = fixture_dir.join("target/debug/bin-a");
+    assert!(
+        bin_a.exists(),
+        "bin-a should be built when scoped to bin-a: {}",
+        bin_a.display()
+    );
+
+    // bin-b should NOT be built (workspace scoping)
+    let bin_b = fixture_dir.join("target/debug/bin-b");
+    assert!(
+        !bin_b.exists(),
+        "bin-b should NOT be built when scoped to bin-a: {}",
+        bin_b.display()
+    );
+}
+
+/// Crate with both lib and bin targets plus integration tests.
+/// Regression test for: rlib artifact missing lib prefix and .rlib extension
+/// when the crate also has a bin target, causing integration tests to fail with
+/// "extern location for X is of an unknown type".
+#[test]
+#[ignore]
+fn fixture_lib_bin_integration_test() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lib-bin-integration");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
 }

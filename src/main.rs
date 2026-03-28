@@ -321,6 +321,19 @@ fn find_lockfile(project_dir: &Path) -> Result<PathBuf> {
     Ok(local)
 }
 
+/// Read [package].name from a Cargo.toml.
+fn read_package_name(manifest_path: &Path) -> Result<String> {
+    let content = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    doc.get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No [package].name found in {}", manifest_path.display()))
+}
+
 /// Read the binary target name from Cargo.toml (defaults to package name).
 fn read_bin_target_name(manifest_path: &Path) -> Result<String> {
     let content = std::fs::read_to_string(manifest_path)?;
@@ -367,18 +380,36 @@ fn add_to_nix_store(path: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// Strip `../` prefixes from a relative path to produce an in-tree name.
+/// Strip leading `../` components from a relative path to produce an in-tree name.
 /// Mirrors `sanitiseName` in `buildPackage.nix`.
 /// e.g. `../my-lib` → `my-lib`, `../../foo/bar` → `foo/bar`
+///
+/// Uses proper path component parsing rather than naive string replacement so
+/// that paths like `../foo/../bar` are handled correctly (→ `foo/../bar`; only
+/// leading `..` components are stripped).
 fn sanitise_extra_source_name(rel_path: &str) -> Result<String> {
-    let stripped = rel_path.replace("../", "");
-    if stripped == rel_path || stripped.is_empty() {
+    use std::path::Component;
+    let path = Path::new(rel_path);
+    let components: Vec<_> = path.components().collect();
+    let leading_parent_count = components
+        .iter()
+        .take_while(|c| matches!(c, Component::ParentDir))
+        .count();
+    if leading_parent_count == 0 {
         anyhow::bail!(
-            "Extra source path must contain '../' components: {}",
+            "Extra source path must start with '../' components: {}",
             rel_path
         );
     }
-    Ok(stripped)
+    let remaining: PathBuf = components[leading_parent_count..].iter().collect();
+    let result = remaining.to_string_lossy().to_string();
+    if result.is_empty() {
+        anyhow::bail!(
+            "Extra source path has no name after stripping '../': {}",
+            rel_path
+        );
+    }
+    Ok(result)
 }
 
 /// Compute a relative path from `from` directory to `to` path.
@@ -585,23 +616,45 @@ fn collect_external_from_table(
     }
 }
 
-/// Check if `path` is a sub-crate inside a workspace by looking at the
-/// immediate parent directory for a `Cargo.toml` with a `[workspace]` section.
+/// Walk up from `path` looking for an enclosing workspace root (a directory
+/// with a `Cargo.toml` containing a `[workspace]` section).  Stops before
+/// reaching `stop_at` (the project root) to avoid matching the project itself.
 /// Returns the workspace root directory if found.
-fn find_enclosing_workspace_root(path: &Path, _stop_at: &Path) -> Option<PathBuf> {
+fn find_enclosing_workspace_root(path: &Path, stop_at: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() {
         path.to_path_buf()
     } else {
         path.parent()?.to_path_buf()
     };
-    let parent = dir.parent()?;
-    let manifest = parent.join("Cargo.toml");
-    if manifest.exists()
-        && let Ok(content) = std::fs::read_to_string(&manifest)
-        && let Ok(doc) = toml::from_str::<toml::Value>(&content)
-        && doc.get("workspace").is_some()
-    {
-        return Some(parent.to_path_buf());
+    let stop_canonical = stop_at
+        .canonicalize()
+        .unwrap_or_else(|_| stop_at.to_path_buf());
+    let mut candidate = dir.parent()?.to_path_buf();
+    loop {
+        // Don't match the project directory itself or anything above it.
+        // Also stop when the candidate is an ancestor of stop_at — any
+        // workspace there would encompass the project itself.
+        let candidate_canonical = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        if candidate_canonical == stop_canonical
+            || stop_canonical.starts_with(&candidate_canonical)
+            || !candidate_canonical.starts_with("/")
+        {
+            break;
+        }
+        let manifest = candidate.join("Cargo.toml");
+        if manifest.exists()
+            && let Ok(content) = std::fs::read_to_string(&manifest)
+            && let Ok(doc) = toml::from_str::<toml::Value>(&content)
+            && doc.get("workspace").is_some()
+        {
+            return Some(candidate);
+        }
+        candidate = match candidate.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
     }
     None
 }
@@ -1102,6 +1155,16 @@ fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
 // Build cache — skip vendoring + derivation registration on unchanged builds
 // ---------------------------------------------------------------------------
 
+/// A single unit-graph cache entry, keyed by
+/// `hash(Cargo.lock + Cargo.toml + profile + target + intent + packages + features)`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct UnitGraphCacheEntry {
+    src_store: String,
+    units: Vec<plan_nix::NixUnit>,
+    target_cfg_envs: Vec<(String, String)>,
+    host_cfg_envs: Vec<(String, String)>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SchneeCache {
     /// SHA-256 of Cargo.lock → vendor nix store path
@@ -1114,18 +1177,11 @@ struct SchneeCache {
     /// Invalidated per-entry: if a store path changes, its old entry is simply unused.
     #[serde(default)]
     tool_closures: HashMap<String, Vec<String>>,
-    /// Unit graph cache: hash(Cargo.lock + Cargo.toml) → cached NixUnit vec.
-    /// The unit graph depends only on manifest metadata and resolved deps, not source content.
+    /// Unit graph cache, keyed by a composite of Cargo.lock, workspace manifests,
+    /// profile, target, intent, packages, and features.  Multiple entries coexist
+    /// so that e.g. `--package X` does not evict the full-workspace entry.
     #[serde(default)]
-    unit_graph_hash: Option<String>,
-    #[serde(default)]
-    unit_graph_src_store: Option<String>,
-    #[serde(default)]
-    unit_graph: Option<Vec<plan_nix::NixUnit>>,
-    /// Cached CARGO_CFG_* env vars for the target (from rustc --print cfg).
-    /// Validity is tied to unit_graph_hash (same target triple + toolchain).
-    #[serde(default)]
-    target_cfg_envs: Option<Vec<(String, String)>>,
+    unit_graphs: HashMap<String, UnitGraphCacheEntry>,
 }
 
 struct CacheLock {
@@ -1404,9 +1460,117 @@ fn write_profile(
     Ok(())
 }
 
+/// Look up `CARGO_TARGET_{TRIPLE}_RUNNER` env var (e.g. `wine64` for Windows targets).
+/// Returns `(program, prefix_args)` if set, or `None` for direct execution.
+fn resolve_runner(target: &Option<String>) -> Option<(String, Vec<String>)> {
+    let triple = target.as_ref()?;
+    let env_key = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        triple.to_uppercase().replace('-', "_")
+    );
+    let runner = std::env::var(&env_key).ok()?;
+    let parts: Vec<String> = runner.split_whitespace().map(String::from).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some((parts[0].clone(), parts[1..].to_vec()))
+}
+
+/// Check whether `--target` specifies a cross-compilation target (differs from host).
+fn is_cross_target(target: &Option<String>) -> bool {
+    let Some(triple) = target.as_ref() else {
+        return false;
+    };
+    let host = format!("{}-unknown-linux-gnu", std::env::consts::ARCH);
+    triple != &host
+}
+
+/// Compute the binary filename for a given target name, appending `.exe` for Windows targets.
+fn binary_name(target_name: &str, target: &Option<String>) -> String {
+    let is_windows = target
+        .as_ref()
+        .map(|t| t.contains("windows"))
+        .unwrap_or(false);
+    if is_windows {
+        format!("{target_name}.exe")
+    } else {
+        target_name.to_string()
+    }
+}
+
+/// Execute a binary, optionally through a runner (e.g. Wine for cross-compiled Windows binaries).
+/// Errors with a helpful message if cross-compiling without a runner set.
+/// When using a runner, its stderr is captured and only shown if the process fails.
+fn run_binary(
+    binary_path: &Path,
+    args: &[String],
+    target: &Option<String>,
+    manifest_dir: Option<&str>,
+) -> Result<std::process::ExitStatus> {
+    let runner = resolve_runner(target);
+    if runner.is_none() && is_cross_target(target) {
+        let triple = target.as_ref().unwrap();
+        let env_key = format!(
+            "CARGO_TARGET_{}_RUNNER",
+            triple.to_uppercase().replace('-', "_")
+        );
+        anyhow::bail!(
+            "cannot execute cross-compiled binary for target `{triple}`\n\
+             Set {env_key} to a runner (e.g. `wine64` for Windows targets)"
+        );
+    }
+    let mut cmd = if let Some((ref prog, ref prefix_args)) = runner {
+        let mut cmd = Command::new(prog);
+        cmd.args(prefix_args).arg(binary_path).args(args);
+        // Suppress Wine debug noise (fixme, err, etc.) unless the user
+        // has explicitly configured WINEDEBUG.
+        if std::env::var_os("WINEDEBUG").is_none() {
+            cmd.env("WINEDEBUG", "-all");
+        }
+        cmd
+    } else {
+        let mut cmd = Command::new(binary_path);
+        cmd.args(args);
+        cmd
+    };
+    // Set CARGO_MANIFEST_DIR so that runtime lookups via std::env::var()
+    // resolve to the writable project directory instead of the nix store.
+    // Also set the working directory to match vanilla cargo behavior.
+    if let Some(dir) = manifest_dir {
+        cmd.env("CARGO_MANIFEST_DIR", dir);
+        cmd.current_dir(dir);
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+    Ok(status)
+}
+
+/// Create a deterministic `/tmp` symlink for CARGO_MANIFEST_DIR.
+///
+/// At compile time the derivation creates the same symlink pointing to the
+/// Nix store path so proc macros can read files. Here at runtime we
+/// re-create it pointing to the writable project directory, so both
+/// `env!("CARGO_MANIFEST_DIR")` (baked at compile time) and
+/// `std::env::var("CARGO_MANIFEST_DIR")` resolve to a readable+writable
+/// location.
+fn schnee_manifest_symlink(project_manifest_dir: &str) -> String {
+    let hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(project_manifest_dir.as_bytes());
+        nix_encoding::hex_lower(&hasher.finalize()[..8])
+    };
+    let tmp_path = format!("/tmp/_schnee_md_{}", hash);
+    // Atomically replace any stale symlink (may point to a store path from
+    // a previous build).
+    let _ = std::fs::remove_file(&tmp_path);
+    let _ = std::os::unix::fs::symlink(project_manifest_dir, &tmp_path);
+    tmp_path
+}
+
 struct BuildResult {
-    /// Root derivation paths with target names and unit kinds
-    root_drvs: Vec<(String, String, plan_nix::UnitKind)>,
+    /// Root derivation paths with target names, unit kinds, and manifest dirs
+    root_drvs: Vec<(String, String, plan_nix::UnitKind, String)>,
     /// target/<profile>/ directory
     target_debug: PathBuf,
 }
@@ -1431,6 +1595,24 @@ fn run_build_pipeline(
     let manifest_path = resolve_manifest(manifest_path_opt)?;
     let project_dir_buf = resolve_workspace_root(&manifest_path)?;
     let project_dir = project_dir_buf.as_path();
+
+    // When the user's manifest points to a workspace member (not the root)
+    // and no -p packages were given, scope the build to that member — matching
+    // standard `cargo` behaviour of respecting the working directory.
+    let ws_root_manifest = project_dir.join("Cargo.toml");
+    let ws_root_manifest_canon = ws_root_manifest.canonicalize().unwrap_or(ws_root_manifest);
+    let packages = if packages.is_empty() && manifest_path != ws_root_manifest_canon {
+        let pkg_name = read_package_name(&manifest_path)?;
+        log::info!(
+            "Scoping build to package '{}' (manifest at {})",
+            pkg_name,
+            manifest_path.display(),
+        );
+        vec![pkg_name]
+    } else {
+        packages.to_vec()
+    };
+    let packages = &packages[..];
 
     let profile = if release {
         plan_nix::ProfileConfig::release()
@@ -1515,22 +1697,13 @@ fn run_build_pipeline(
         features_str,
         no_default_features,
     );
-    let cached_units = if cache.unit_graph_hash.as_deref() == Some(&unit_graph_key) {
-        if let (Some(old_src), Some(units)) = (&cache.unit_graph_src_store, &cache.unit_graph) {
-            log::info!("Unit graph cache hit ({} units)", units.len());
-            Some((old_src.clone(), units.clone()))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let cached_cfg_envs = if cached_units.is_some() {
-        cache.target_cfg_envs.clone()
-    } else {
-        None
-    };
+    let cached_entry = cache.unit_graphs.get(&unit_graph_key);
+    let cached_units = cached_entry.map(|e| {
+        log::info!("Unit graph cache hit ({} units)", e.units.len());
+        (e.src_store.clone(), e.units.clone())
+    });
+    let cached_cfg_envs = cached_entry.map(|e| e.target_cfg_envs.clone());
+    let cached_host_cfg_envs = cached_entry.map(|e| e.host_cfg_envs.clone());
 
     // Resolve passthrough env vars for build-script derivations.
     // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
@@ -1541,13 +1714,14 @@ fn run_build_pipeline(
         .filter_map(|name| std::env::var(name).ok().map(|val| (name.to_string(), val)))
         .collect();
 
-    let (root_drvs, plan_units, cfg_envs) = plan_nix::run_plan_nix(
+    let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
         verify_drv_paths,
         &mut cache.tool_closures,
         cached_units,
         cached_cfg_envs,
+        cached_host_cfg_envs,
         &profile,
         &target_config,
         user_intent,
@@ -1555,22 +1729,26 @@ fn run_build_pipeline(
         features,
         no_default_features,
         &passthru_envs,
+        Some(project_dir),
     )?;
 
     // Update unit graph cache
-    cache.unit_graph_hash = Some(unit_graph_key);
-    cache.unit_graph_src_store = Some(src_store.clone());
-    cache.unit_graph = Some(
-        plan_units
-            .iter()
-            .map(|u| {
-                let mut c = u.clone();
-                c.clear_drv_path();
-                c
-            })
-            .collect(),
+    cache.unit_graphs.insert(
+        unit_graph_key,
+        UnitGraphCacheEntry {
+            src_store: src_store.clone(),
+            units: plan_units
+                .iter()
+                .map(|u| {
+                    let mut c = u.clone();
+                    c.clear_drv_path();
+                    c
+                })
+                .collect(),
+            target_cfg_envs: cfg_envs,
+            host_cfg_envs,
+        },
     );
-    cache.target_cfg_envs = Some(cfg_envs);
 
     let plan_duration = plan_start.elapsed();
 
@@ -1608,6 +1786,7 @@ fn run_build_pipeline(
     let mut diag_shell = cargo::core::shell::Shell::new();
     let src_store_prefix = format!("{}/", src_store);
     let project_dir_prefix = format!("{}/", project_dir.display());
+    let mut nix_error_lines: Vec<String> = Vec::new();
 
     for line in reader.lines().map_while(Result::ok) {
         if interrupted.load(Ordering::Relaxed) {
@@ -1685,19 +1864,24 @@ fn run_build_pipeline(
                     total_drv_count = Some(1);
                 }
             }
-        } else if trimmed.starts_with("/nix/store/")
-            || trimmed.starts_with("resolved derivation:")
+        } else if trimmed.starts_with("resolved derivation:")
             || trimmed.starts_with("warning: you did not specify")
             || trimmed.starts_with("copying path '")
+            || (trimmed.starts_with("/nix/store/") && !trimmed.contains("failed"))
         {
         } else if !trimmed.is_empty() {
             progress.clear();
-            diagnostics::emit_line(
+            // Nix prefixes "Last N log lines" with "> "; strip before checking
+            let content = trimmed.strip_prefix("> ").unwrap_or(trimmed);
+            let was_diagnostic = diagnostics::emit_line(
                 &mut diag_shell,
-                trimmed,
+                content,
                 &src_store_prefix,
                 &project_dir_prefix,
             );
+            if !was_diagnostic {
+                nix_error_lines.push(trimmed.to_string());
+            }
         }
     }
     progress.clear();
@@ -1711,16 +1895,38 @@ fn run_build_pipeline(
         .map_err(|_| anyhow::anyhow!("stdout capture thread panicked"))?;
 
     if !child_status.success() {
-        anyhow::bail!(
-            "nix-store --realise failed (exit code: {}).\n\
-             If you see 'ca-derivations' errors, ensure your nix.conf includes:\n  \
-             experimental-features = nix-command flakes ca-derivations\n\
-             Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\".\n\
-             Run with -vv for detailed Nix build logs.",
-            child_status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string())
-        );
+        // Extract failed .drv paths from nix output so we can suggest `nix log`.
+        let failed_drvs: Vec<&str> = nix_error_lines
+            .iter()
+            .filter_map(|line| {
+                // nix outputs: builder for '/nix/store/xxx.drv' failed with exit code N
+                let rest = line.strip_prefix("builder for '")?;
+                let drv = rest.split('\'').next()?;
+                if drv.ends_with(".drv") {
+                    Some(drv)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Check for ca-derivations errors specifically.
+        let has_ca_error = nix_error_lines.iter().any(|l| l.contains("ca-derivations"));
+
+        if has_ca_error {
+            anyhow::bail!(
+                "Ensure your nix.conf includes:\n  \
+                 experimental-features = nix-command flakes ca-derivations\n\
+                 Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\"."
+            );
+        }
+        if !failed_drvs.is_empty() {
+            eprintln!("For derivation logs, run:");
+            for drv in &failed_drvs {
+                eprintln!("  nix log {}", drv);
+            }
+        }
+        std::process::exit(1);
     }
     let out_paths: Vec<String> = stdout_content
         .lines()
@@ -1758,6 +1964,7 @@ fn run_build_pipeline(
         })?;
 
         let mut bin_file = None;
+        let is_windows_target = target_config.is_windows();
         for entry in std::fs::read_dir(out_path)? {
             let entry = entry?;
             let dest = target_debug.join(entry.file_name());
@@ -1773,23 +1980,34 @@ fn run_build_pipeline(
                     dest.display()
                 )
             })?;
-            {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if is_windows_target {
+                // Windows PE binaries don't have Unix execute bits.
+                // Detect executables by .exe extension; also recognise .dll
+                // (cdylib crates) so they get a clean-named link too.
+                if fname.ends_with(".exe") || fname.ends_with(".dll") {
+                    bin_file = Some(dest);
+                }
+            } else {
                 use std::os::unix::fs::PermissionsExt;
                 let src_mode = std::fs::metadata(entry.path())?.permissions().mode();
                 let is_exec = src_mode & 0o111 != 0;
                 let new_mode = if is_exec { 0o755 } else { 0o644 };
                 std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(new_mode))?;
-            }
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&dest)?.permissions().mode();
-                if mode & 0o111 != 0 {
+                if is_exec {
                     bin_file = Some(dest);
                 }
             }
         }
         if let Some(ref bin_path) = bin_file {
-            let clean_dest = target_debug.join(target_name);
+            // For Windows targets, use the correct extension (.exe or .dll)
+            let bin_ext = bin_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let clean_name = if is_windows_target && !bin_ext.is_empty() {
+                format!("{}.{}", target_name, bin_ext)
+            } else {
+                target_name.to_string()
+            };
+            let clean_dest = target_debug.join(&clean_name);
             if clean_dest != *bin_path {
                 if clean_dest.exists()
                     && let Err(e) = std::fs::remove_file(&clean_dest)
@@ -1879,16 +2097,29 @@ fn run_build_pipeline(
         );
     }
 
-    // Build root_drvs with UnitKind info
-    let root_drvs_with_kind: Vec<(String, String, plan_nix::UnitKind)> = root_drvs
+    // Build root_drvs with UnitKind info and manifest dirs
+    let root_drvs_with_kind: Vec<(String, String, plan_nix::UnitKind, String)> = root_drvs
         .into_iter()
         .map(|(drv_path, target_name)| {
-            let kind = plan_units
+            let unit = plan_units
                 .iter()
-                .find(|u| u.drv_path.as_deref() == Some(&drv_path))
+                .find(|u| u.drv_path.as_deref() == Some(&drv_path));
+            let kind = unit
                 .map(|u| u.kind.clone())
                 .unwrap_or(plan_nix::UnitKind::Compile);
-            (drv_path, target_name, kind)
+            // Map store-path manifest_dir back to the project directory for
+            // runtime CARGO_MANIFEST_DIR (covers std::env::var() lookups).
+            let manifest_dir = unit
+                .map(|u| {
+                    let store_prefix = src_store_prefix.trim_end_matches('/');
+                    if let Some(suffix) = u.manifest_dir.strip_prefix(store_prefix) {
+                        format!("{}{}", project_dir.display(), suffix)
+                    } else {
+                        u.manifest_dir.clone()
+                    }
+                })
+                .unwrap_or_default();
+            (drv_path, target_name, kind, manifest_dir)
         })
         .collect();
 
@@ -2027,20 +2258,20 @@ fn main() -> Result<()> {
             let bin_roots: Vec<_> = result
                 .root_drvs
                 .iter()
-                .filter(|(_, _, kind)| matches!(kind, plan_nix::UnitKind::Compile))
+                .filter(|(_, _, kind, _)| matches!(kind, plan_nix::UnitKind::Compile))
                 .collect();
 
-            let (_, target_name, _) = if let Some(bin_name) = bin {
+            let (_, target_name, _, manifest_dir) = if let Some(bin_name) = bin {
                 bin_roots
                     .iter()
-                    .find(|(_, name, _)| name == bin_name)
+                    .find(|(_, name, _, _)| name == bin_name)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "no bin target named `{}`\navailable targets: {}",
                             bin_name,
                             bin_roots
                                 .iter()
-                                .map(|(_, n, _)| n.as_str())
+                                .map(|(_, n, _, _)| n.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -2052,18 +2283,16 @@ fn main() -> Result<()> {
                     "multiple binary targets found, use --bin to specify one: {}",
                     bin_roots
                         .iter()
-                        .map(|(_, n, _)| n.as_str())
+                        .map(|(_, n, _, _)| n.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             };
 
-            let binary_path = result.target_debug.join(target_name);
+            let bin_name = binary_name(target_name, target);
+            let binary_path = result.target_debug.join(&bin_name);
             shell::status("Running", &format!("`{}`", binary_path.display()));
-            let status = Command::new(&binary_path)
-                .args(args)
-                .status()
-                .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+            let status = run_binary(&binary_path, args, target, Some(manifest_dir))?;
             std::process::exit(status.code().unwrap_or(1));
         }
         SchneeCommand::Test {
@@ -2097,7 +2326,7 @@ fn main() -> Result<()> {
             let test_roots: Vec<_> = result
                 .root_drvs
                 .iter()
-                .filter(|(_, _, kind)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|(_, _, kind, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if test_roots.is_empty() {
@@ -2106,13 +2335,12 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, target_name, _) in &test_roots {
-                let binary_path = result.target_debug.join(target_name);
+            for (_, target_name, _, manifest_dir) in &test_roots {
+                let symlink_path = schnee_manifest_symlink(manifest_dir);
+                let bin_name = binary_name(target_name, target);
+                let binary_path = result.target_debug.join(&bin_name);
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
-                let status = Command::new(&binary_path)
-                    .args(args)
-                    .status()
-                    .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+                let status = run_binary(&binary_path, args, target, Some(&symlink_path))?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2152,7 +2380,7 @@ fn main() -> Result<()> {
             let bench_roots: Vec<_> = result
                 .root_drvs
                 .iter()
-                .filter(|(_, _, kind)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|(_, _, kind, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if bench_roots.is_empty() {
@@ -2161,18 +2389,17 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, target_name, _) in &bench_roots {
-                let binary_path = result.target_debug.join(target_name);
+            for (_, target_name, _, manifest_dir) in &bench_roots {
+                let symlink_path = schnee_manifest_symlink(manifest_dir);
+                let bin_name = binary_name(target_name, target);
+                let binary_path = result.target_debug.join(&bin_name);
                 shell::status(
                     "Running",
                     &format!("benchmarks in `{}`", binary_path.display()),
                 );
                 let mut bench_args = vec!["--bench".to_string()];
                 bench_args.extend(args.iter().cloned());
-                let status = Command::new(&binary_path)
-                    .args(&bench_args)
-                    .status()
-                    .with_context(|| format!("Failed to execute {}", binary_path.display()))?;
+                let status = run_binary(&binary_path, &bench_args, target, Some(&symlink_path))?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2229,11 +2456,12 @@ fn main() -> Result<()> {
 
             let src_store = add_project_source_to_store(project_dir)?;
             let mut closure_cache = HashMap::new();
-            let (_, plan_units, _) = plan_nix::run_plan_nix(
+            let (_, plan_units, _, _) = plan_nix::run_plan_nix(
                 Path::new(&src_store),
                 Path::new(&vendor_store),
                 verify_drv_paths,
                 &mut closure_cache,
+                None,
                 None,
                 None,
                 &profile_cfg,
@@ -2243,6 +2471,7 @@ fn main() -> Result<()> {
                 features,
                 no_default_features,
                 &[],
+                Some(project_dir),
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -2270,11 +2499,12 @@ fn main() -> Result<()> {
             let mut closure_cache = HashMap::new();
             let default_profile = plan_nix::ProfileConfig::dev();
             let default_target = plan_nix::TargetConfig::native();
-            let (root_drvs, _, _) = plan_nix::run_plan_nix(
+            let (root_drvs, _, _, _) = plan_nix::run_plan_nix(
                 src,
                 vendor_dir,
                 verify_drv_paths,
                 &mut closure_cache,
+                None,
                 None,
                 None,
                 &default_profile,
@@ -2284,6 +2514,7 @@ fn main() -> Result<()> {
                 &[],
                 false,
                 &[],
+                None,
             )?;
             // Output the root .drv paths
             for (drv_path, _) in &root_drvs {
@@ -2375,6 +2606,15 @@ version = "1.2.3"
         assert_eq!(
             sanitise_extra_source_name("../../bar/baz").unwrap(),
             "bar/baz"
+        );
+    }
+
+    #[test]
+    fn sanitise_handles_intermediate_dot_dot() {
+        // Only leading ../ components are stripped; intermediate ones are preserved
+        assert_eq!(
+            sanitise_extra_source_name("../foo/../bar").unwrap(),
+            "foo/../bar"
         );
     }
 

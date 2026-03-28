@@ -15,6 +15,7 @@
   version ? null,
   package ? null,
   hostPkgs ? null,
+  target ? null,
   rustToolchain ? null,
   nativeBuildInputs ? [],
   buildInputs ? [],
@@ -23,6 +24,9 @@
   env ? {},
   passthruEnv ? [],
   wrapBinaries ? false,
+  doCheck ? true,
+  preCheck ? "",
+  postCheck ? "",
   buildType ? "release",
   preBuild ? "",
   postBuild ? "",
@@ -37,6 +41,10 @@ let
 
   # -- cross-compilation --------------------------------------------------
   effectiveHostPkgs = if hostPkgs != null then hostPkgs else pkgs;
+  isWindows = target != null && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
+
+  # CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER etc.
+  cargoTargetEnvPrefix = lib.toUpper (builtins.replaceStrings ["-"] ["_"] target);
 
   # -- pname / version auto-detection ------------------------------------
   rootCargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
@@ -46,21 +54,32 @@ let
   # Members may contain globs (e.g. "crates/*", "*"), so we expand those first.
 
   # Expand a single member pattern into concrete directory paths.
-  # "crates/foo" (no glob) -> [ "crates/foo" ]
-  # "crates/*"             -> list subdirectories of <src>/crates/
-  # "*"                    -> list subdirectories of <src>/
+  # "crates/foo" (no glob)   -> [ "crates/foo" ]
+  # "crates/*"               -> list subdirectories of <src>/crates/
+  # "*"                      -> list subdirectories of <src>/
+  # "crates/*/sub"           -> list <src>/crates/X/sub for each X
+  #
+  # Only a single '*' segment is supported (matching Cargo's glob behaviour).
   expandMember = m:
     let
-      # Split on the first '*' to get the prefix directory and check if it's a glob.
       hasGlob = lib.hasInfix "*" m;
-      # For "crates/*" the parent is "crates", for "*" the parent is "".
-      parent = lib.removeSuffix "/*" m;
-      parentDir = if parent == "*" || parent == "" then src else src + "/${parent}";
+      # Split the pattern into segments around the glob.
+      parts = lib.splitString "/*" m;
+      # prefix: everything before the glob ("crates" for "crates/*", "" for "*")
+      prefix = builtins.head parts;
+      # suffix: everything after the glob ("/sub" for "crates/*/sub", "" for "crates/*")
+      suffix = lib.concatStrings (builtins.tail parts);
+      # Trim leading "/" from suffix if present
+      cleanSuffix = lib.removePrefix "/" suffix;
+      parentDir = if prefix == "*" || prefix == "" then src else src + "/${prefix}";
       entries = builtins.readDir parentDir;
       dirs = lib.filterAttrs (_: type: type == "directory") entries;
       expanded = builtins.filter (p: builtins.pathExists (src + "/${p}/Cargo.toml")) (
         map (name:
-          if parent == "*" || parent == "" then name else "${parent}/${name}"
+          let
+            base = if prefix == "*" || prefix == "" then name else "${prefix}/${name}";
+          in
+            if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
         ) (builtins.attrNames dirs)
       );
     in
@@ -121,8 +140,35 @@ let
     else throw "cargo-schnee buildPackage: one of cargoLock, cargoHash, or cargoDeps must be provided";
 
   # -- cargo flags --------------------------------------------------------
+  # Note: --target is NOT added here.  When `target` is set we override
+  # buildPhase entirely (see below) to avoid conflicting with the host
+  # --target that cargoBuildHook bakes in via @rustcTargetSpec@.
   cargoBuildFlags = cargoExtraArgs
     ++ lib.optionals (package != null) [ "-p" package ];
+
+  # -- custom build phase for explicit target ------------------------------
+  # cargoBuildHook always injects `--target <hostPlatform>`.  When the
+  # caller passes a different `target` (e.g. x86_64-pc-windows-msvc) we
+  # must bypass the hook and call cargo directly.
+  targetBuildFlags = lib.concatStringsSep " " (
+    [ "--target" target ]
+    ++ lib.optionals (buildType == "release") [ "--release" ]
+    ++ lib.optionals (buildType != "dev" && buildType != "release") [ "--profile" buildType ]
+    ++ lib.optionals (package != null) [ "-p" package ]
+    ++ cargoExtraArgs
+  );
+
+  buildPhaseForTarget = ''
+    runHook preBuild
+    cargo build ${targetBuildFlags}
+    runHook postBuild
+  '';
+
+  checkPhaseForTarget = ''
+    runHook preCheck
+    cargo test ${targetBuildFlags}
+    runHook postCheck
+  '';
 
   # -- extraSources (postUnpack) ------------------------------------------
   # For each { "../sibling" = ./source; } entry:
@@ -161,12 +207,50 @@ let
   );
 
   # -- install phase ------------------------------------------------------
-  profileDir = if buildType == "release" then "release" else buildType;
+  # Cargo maps the "dev" profile to the "debug" output directory.
+  profileDir =
+    if buildType == "release" then "release"
+    else if buildType == "dev" then "debug"
+    else buildType;
 
-  installPhase = ''
+  # Cross-compiled output lands in target/<triple>/<profile>/.
+  releaseDir =
+    if target != null
+    then "target/${target}/${profileDir}"
+    else "target/${profileDir}";
+
+  installPhaseWindows = ''
     runHook preInstall
 
-    releaseDir="target/${profileDir}"
+    releaseDir="${releaseDir}"
+    mkdir -p $out/bin
+
+    for f in "$releaseDir"/*.exe; do
+      [ -f "$f" ] || continue
+      install -m755 "$f" "$out/bin/"
+    done
+
+    # Install PDB debug symbol files if present
+    for f in "$releaseDir"/*.pdb; do
+      [ -f "$f" ] || continue
+      install -m644 "$f" "$out/bin/"
+    done
+
+    # Install DLLs if any
+    for f in "$releaseDir"/*.dll; do
+      [ -f "$f" ] || continue
+      install -m755 "$f" "$out/bin/"
+    done
+
+    rmdir --ignore-fail-on-non-empty $out/bin 2>/dev/null || true
+
+    runHook postInstall
+  '';
+
+  installPhaseNative = ''
+    runHook preInstall
+
+    releaseDir="${releaseDir}"
     mkdir -p $out/bin $out/lib
 
     for f in "$releaseDir"/*; do
@@ -189,6 +273,8 @@ let
     runHook postInstall
   '';
 
+  installPhase = if isWindows then installPhaseWindows else installPhaseNative;
+
   # -- wrapBinaries (postFixup) -------------------------------------------
   wrapBinariesScript = lib.optionalString wrapBinaries ''
     if [ -d "$out/bin" ]; then
@@ -198,6 +284,22 @@ let
           --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath buildInputs}"
       done
     fi
+  '';
+
+  # -- Windows test runner (Wine) -----------------------------------------
+  # When targeting Windows with doCheck, automatically configure Wine so
+  # that consumers don't need to wire up the runner, HOME, DLL overrides,
+  # and display vars manually.
+  wineEnvAttrs = lib.optionalAttrs (isWindows && doCheck) {
+    "CARGO_TARGET_${cargoTargetEnvPrefix}_RUNNER" = "wine";
+    WINEDLLOVERRIDES = "mscoree=d;mshtml=d";
+    DISPLAY = "";
+  };
+
+  winePreCheck = lib.optionalString (isWindows && doCheck) ''
+    export HOME="$TMPDIR/wine-home"
+    mkdir -p "$HOME"
+    unset WAYLAND_DISPLAY
   '';
 
   # -- passthruEnv --------------------------------------------------------
@@ -210,14 +312,18 @@ let
   # buildRustPackage, excluding the ones we consumed above.
   consumedKeys = [
     "pkgs" "src" "cargoLock" "cargoHash" "cargoDeps"
-    "pname" "version" "package" "hostPkgs" "rustToolchain"
+    "pname" "version" "package" "hostPkgs" "target" "rustToolchain"
     "nativeBuildInputs" "buildInputs" "cargoExtraArgs"
-    "extraSources" "env" "passthruEnv" "wrapBinaries"
+    "extraSources" "env" "passthruEnv" "wrapBinaries" "doCheck"
+    "preCheck" "postCheck"
     "buildType" "preBuild" "postBuild" "postInstall" "postFixup" "meta"
   ];
   extraAttrs = removeAttrs args consumedKeys;
 
 in
+  assert lib.assertMsg (!(wrapBinaries && isWindows))
+    "cargo-schnee buildPackage: wrapBinaries is not supported for Windows targets (dontFixup is required for PE binaries)";
+
   schneeRustPlatform.buildRustPackage (vendorArgs // extraAttrs // {
     pname = finalPname;
     version = finalVersion;
@@ -229,7 +335,8 @@ in
 
     nativeBuildInputs = [ pkgs.nix ]
       ++ nativeBuildInputs
-      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ];
+      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ]
+      ++ lib.optionals (isWindows && doCheck) [ pkgs.wineWow64Packages.stable ];
 
     inherit buildInputs;
 
@@ -237,11 +344,19 @@ in
     requiredSystemFeatures = [ "recursive-nix" ];
     NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
     auditable = false;
-    doCheck = false;
+    inherit doCheck postCheck;
+    preCheck = winePreCheck + preCheck;
 
     postUnpack = (args.postUnpack or "") + extraSourcesScript;
 
     postFixup = wrapBinariesScript + postFixup;
 
-    env = env // passthruEnvAttrs;
+    env = wineEnvAttrs // env // passthruEnvAttrs;
+  } // lib.optionalAttrs (target != null) {
+    # Bypass cargoBuildHook/cargoCheckHook which inject the host --target.
+    buildPhase = buildPhaseForTarget;
+    checkPhase = checkPhaseForTarget;
+  } // lib.optionalAttrs isWindows {
+    # patchelf/strip don't work on PE binaries
+    dontFixup = true;
   })

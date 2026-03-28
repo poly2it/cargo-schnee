@@ -88,6 +88,29 @@ impl TargetConfig {
     pub fn is_cross(&self) -> bool {
         self.host_triple != self.target_triple
     }
+
+    pub fn is_msvc(&self) -> bool {
+        self.target_triple.contains("msvc")
+    }
+
+    pub fn is_windows(&self) -> bool {
+        self.target_triple.contains("windows")
+    }
+
+    /// Map the target architecture to Microsoft's notation for Windows SDK paths.
+    /// Returns None for non-Windows targets.
+    pub fn ms_arch(&self) -> Option<&'static str> {
+        if !self.is_windows() {
+            return None;
+        }
+        let arch = self.target_triple.split('-').next().unwrap_or("");
+        Some(match arch {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            "i686" | "i586" => "x86",
+            _ => "x64",
+        })
+    }
 }
 
 /// Extract CARGO_CFG_* env vars from `rustc --print cfg` output for a target.
@@ -158,8 +181,13 @@ pub struct NixUnit {
     pub(crate) build_script_dep: Option<String>,
     /// Key of the build-script-compile derivation (for BuildScriptRun units)
     pub(crate) build_script_compile_key: Option<String>,
-    /// CARGO_MANIFEST_DIR for the package
+    /// CARGO_MANIFEST_DIR for the package (mapped to nix store path)
     pub(crate) manifest_dir: String,
+    /// Original (pre-mapping) manifest dir — the writable project path.
+    /// For TestCompile units, this is used as CARGO_MANIFEST_DIR so that
+    /// compile-time `env!("CARGO_MANIFEST_DIR")` captures a writable path.
+    #[serde(default)]
+    pub(crate) original_manifest_dir: String,
     /// Standard cargo env vars for build scripts
     pub(crate) cargo_envs: Vec<(String, String)>,
     /// Deterministic hash for -C extra-filename and -C metadata
@@ -362,6 +390,7 @@ pub fn run_plan_nix(
     closure_cache: &mut HashMap<String, Vec<String>>,
     cached_units: Option<(String, Vec<NixUnit>)>,
     cached_cfg_envs: Option<Vec<(String, String)>>,
+    cached_host_cfg_envs: Option<Vec<(String, String)>>,
     profile: &ProfileConfig,
     target: &TargetConfig,
     user_intent: UserIntent,
@@ -369,7 +398,13 @@ pub fn run_plan_nix(
     features: &[String],
     no_default_features: bool,
     passthru_envs: &[(String, String)],
-) -> Result<(Vec<(String, String)>, Vec<NixUnit>, Vec<(String, String)>)> {
+    project_dir: Option<&Path>,
+) -> Result<(
+    Vec<(String, String)>,
+    Vec<NixUnit>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
         anyhow::bail!("No Cargo.toml found at {}", manifest_path.display());
@@ -381,7 +416,9 @@ pub fn run_plan_nix(
 
     let src_str = src.to_string_lossy().to_string();
 
-    let (mut nix_units, cfg_envs) = if let Some((old_src_store, mut units)) = cached_units {
+    let (mut nix_units, cfg_envs, host_cfg_envs) = if let Some((old_src_store, mut units)) =
+        cached_units
+    {
         // Fix up source paths: replace old src_store prefix with current one
         if old_src_store != src_str {
             for unit in &mut units {
@@ -400,13 +437,14 @@ pub fn run_plan_nix(
             unit.drv_path = None;
         }
         let cfg = cached_cfg_envs.unwrap_or_default();
+        let host_cfg = cached_host_cfg_envs.unwrap_or_default();
         info!(
             "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
             units.len(),
             cfg.len(),
             old_src_store != src_str
         );
-        (units, cfg)
+        (units, cfg, host_cfg)
     } else {
         // Write cargo config for vendored sources (unique temp dirs for concurrent safety)
         let cargo_home_tmp = tempfile::Builder::new()
@@ -438,7 +476,13 @@ pub fn run_plan_nix(
             0,
             false,
             None,
-            false, // frozen: false to tolerate superset Cargo.lock (workspace subsets)
+            // frozen: false — when building a workspace subset (e.g. -p foo), the
+            // Cargo.lock may contain entries for sibling crates that aren't part of
+            // this resolve.  frozen=true would reject the lock as "out of date".
+            // This is safe because: (1) the Nix sandbox prevents network access so
+            // no new crates can be fetched, and (2) deps are pre-vendored so the
+            // resolve is fully offline regardless.
+            false,
             true,
             true,
             &Some(target_dir.to_string_lossy().to_string().into()),
@@ -483,6 +527,14 @@ pub fn run_plan_nix(
         let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir)?;
         let bcx_cfg_envs =
             extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
+        let bcx_host_cfg_envs = if target.is_cross() {
+            extract_cfg_envs(
+                bcx.target_data
+                    .cfg(cargo::core::compiler::CompileKind::Host),
+            )
+        } else {
+            bcx_cfg_envs.clone()
+        };
         drop(bcx);
         info!("Extracted {} units from unit graph", units.len());
 
@@ -491,8 +543,20 @@ pub fn run_plan_nix(
             let _ = std::env::set_current_dir(cwd);
         }
 
-        (units, bcx_cfg_envs)
+        (units, bcx_cfg_envs, bcx_host_cfg_envs)
     };
+
+    // Populate original_manifest_dir for TestCompile units so that compile-time
+    // env!("CARGO_MANIFEST_DIR") captures the writable project path instead of
+    // the read-only nix store path.
+    if let Some(proj) = project_dir {
+        let proj_str = proj.to_string_lossy();
+        for unit in &mut nix_units {
+            if let Some(suffix) = unit.manifest_dir.strip_prefix(src_str.as_str()) {
+                unit.original_manifest_dir = format!("{}{}", proj_str, suffix);
+            }
+        }
+    }
 
     // Resolve tool paths
     let rustc_path = which_rustc()?;
@@ -601,6 +665,38 @@ pub fn run_plan_nix(
         (host_cc_bin_dir.clone(), host_cc_store.clone())
     };
 
+    // For MSVC cross-compilation, resolve Windows SDK paths from XWIN_DIR
+    let (win_sdk_lib_dirs, win_sdk_store) = if target.is_msvc() {
+        let xwin_dir = std::env::var("XWIN_DIR").map_err(|_| {
+            anyhow::anyhow!(
+                "XWIN_DIR environment variable not set. \
+                 Point it to the pkgs.windows.sdk output \
+                 (e.g. XWIN_DIR=${{pkgs.windows.sdk}} in your devShell)."
+            )
+        })?;
+        let xwin_dir = PathBuf::from(&xwin_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&xwin_dir));
+        let ms_arch = target.ms_arch().unwrap_or("x64");
+        let lib_dirs = vec![
+            format!("{}/crt/lib/{}", xwin_dir.display(), ms_arch),
+            format!("{}/sdk/lib/um/{}", xwin_dir.display(), ms_arch),
+            format!("{}/sdk/lib/ucrt/{}", xwin_dir.display(), ms_arch),
+        ];
+        // Derive the Nix store root from the XWIN_DIR path
+        let xwin_str = xwin_dir.to_string_lossy();
+        let store = if let Some(after_prefix) = xwin_str.strip_prefix("/nix/store/")
+            && let Some(end) = after_prefix.find('/')
+        {
+            format!("/nix/store/{}", &after_prefix[..end])
+        } else {
+            xwin_str.to_string()
+        };
+        (lib_dirs, Some(store))
+    } else {
+        (Vec::new(), None)
+    };
+
     // Collect system build environment for -sys build scripts.
     let pkg_config_path_env = {
         let for_target = std::env::var("PKG_CONFIG_PATH_FOR_TARGET").unwrap_or_default();
@@ -623,6 +719,11 @@ pub fn run_plan_nix(
     closure_store_paths.push(host_cc_store.clone());
     if target.is_cross() && target_cc_store != host_cc_store {
         closure_store_paths.push(target_cc_store.clone());
+    }
+    if let Some(ref sdk_store) = win_sdk_store
+        && !closure_store_paths.contains(sdk_store)
+    {
+        closure_store_paths.push(sdk_store.clone());
     }
     // PKG_CONFIG_PATH entries
     let mut sys_store_roots: Vec<String> = Vec::new();
@@ -712,6 +813,10 @@ pub fn run_plan_nix(
         .get(&target_cc_store)
         .cloned()
         .unwrap_or_default();
+    let win_sdk_closure: Vec<String> = win_sdk_store
+        .as_ref()
+        .and_then(|s| closure_cache.get(s).cloned())
+        .unwrap_or_default();
 
     let mut sys_build_closure: Vec<String> = Vec::new();
     for root in &sys_store_roots {
@@ -782,11 +887,15 @@ pub fn run_plan_nix(
                 // Select host or target linker based on unit classification.
                 // system is always host — derivations run on the build machine,
                 // rustc's --target flag handles cross-compilation.
-                let (unit_cc_bin_dir, unit_cc_closure) = if nix_units[i].for_host {
-                    (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
-                } else {
-                    (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
-                };
+                // BuildScriptRun always executes on the host and needs the host
+                // cc (even though for_host is false — that flag describes what
+                // the output targets, not the execution environment).
+                let (unit_cc_bin_dir, unit_cc_closure) =
+                    if nix_units[i].for_host || nix_units[i].kind == UnitKind::BuildScriptRun {
+                        (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
+                    } else {
+                        (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
+                    };
                 let json = construct_derivation(
                     &nix_units,
                     i,
@@ -808,9 +917,12 @@ pub fn run_plan_nix(
                     profile,
                     target,
                     &cfg_envs,
+                    &host_cfg_envs,
                     &custom_sys_env,
                     passthru_envs,
                     &vendor_dir.to_string_lossy(),
+                    &win_sdk_lib_dirs,
+                    &win_sdk_closure,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",
@@ -950,8 +1062,13 @@ pub fn run_plan_nix(
             .last()
             .map(|u| u.crate_name.clone())
             .unwrap_or_default();
-        return Ok((vec![(last_drv, last_name)], nix_units, cfg_envs));
+        return Ok((
+            vec![(last_drv, last_name)],
+            nix_units,
+            cfg_envs,
+            host_cfg_envs,
+        ));
     }
 
-    Ok((root_drvs, nix_units, cfg_envs))
+    Ok((root_drvs, nix_units, cfg_envs, host_cfg_envs))
 }

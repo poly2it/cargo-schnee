@@ -11,21 +11,6 @@ struct CompilerMessage {
     rendered: Option<String>,
 }
 
-/// Try to parse a line as a rustc JSON diagnostic.
-/// Returns the `rendered` field if present, None for non-diagnostic JSON (artifacts) or non-JSON.
-fn try_parse_diagnostic(line: &str) -> Option<String> {
-    let msg: CompilerMessage = serde_json::from_str(line).ok()?;
-    let rendered = msg.rendered?;
-    // Skip summary messages that cargo normally suppresses
-    if rendered.contains("aborting due to")
-        || rendered.contains("warning emitted")
-        || rendered.contains("warnings emitted")
-    {
-        return None;
-    }
-    Some(rendered)
-}
-
 /// Remap Nix store source paths to local project paths in a string.
 fn remap_paths(text: &str, src_store_prefix: &str, project_dir_prefix: &str) -> String {
     text.replace(src_store_prefix, project_dir_prefix)
@@ -35,13 +20,32 @@ fn remap_paths(text: &str, src_store_prefix: &str, project_dir_prefix: &str) -> 
 ///
 /// Only rustc JSON diagnostics (with a `rendered` field) are remapped and rendered.
 /// All other lines (build script output, non-JSON nix messages, etc.) are silently dropped.
-pub fn emit_line(shell: &mut Shell, line: &str, src_store_prefix: &str, project_dir_prefix: &str) {
-    if let Some(rendered) = try_parse_diagnostic(line) {
-        let remapped = remap_paths(&rendered, src_store_prefix, project_dir_prefix);
-        // print_ansi_stderr handles ANSI → terminal color translation (or stripping if piped)
-        let _ = shell.print_ansi_stderr(remapped.as_bytes());
+/// Returns `true` if the line was a JSON diagnostic (rendered or suppressed summary).
+pub fn emit_line(
+    shell: &mut Shell,
+    line: &str,
+    src_store_prefix: &str,
+    project_dir_prefix: &str,
+) -> bool {
+    // Check if this is valid JSON with a rendered field at all
+    let Ok(msg) = serde_json::from_str::<CompilerMessage>(line) else {
+        return false;
+    };
+    let Some(rendered) = msg.rendered else {
+        // Valid JSON but no rendered field (artifact notification, etc.) — still a diagnostic line
+        return true;
+    };
+    // Skip summary messages that cargo normally suppresses
+    if rendered.contains("aborting due to")
+        || rendered.contains("warning emitted")
+        || rendered.contains("warnings emitted")
+    {
+        return true;
     }
-    // JSON lines without a `rendered` field (artifacts, etc.) are silently dropped
+    let remapped = remap_paths(&rendered, src_store_prefix, project_dir_prefix);
+    // print_ansi_stderr handles ANSI → terminal color translation (or stripping if piped)
+    let _ = shell.print_ansi_stderr(remapped.as_bytes());
+    true
 }
 
 /// Replay diagnostics from a file saved in a derivation output.
@@ -70,34 +74,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_valid_diagnostic() {
+    fn emit_returns_true_for_diagnostic() {
         let json = r#"{"rendered":"warning: unused variable\n","message":"unused variable","level":"warning","code":null,"spans":[],"children":[]}"#;
-        let rendered = try_parse_diagnostic(json);
-        assert_eq!(rendered, Some("warning: unused variable\n".to_string()));
+        let mut shell = Shell::new();
+        assert!(emit_line(
+            &mut shell,
+            json,
+            "/nix/store/src/",
+            "/home/user/"
+        ));
     }
 
     #[test]
-    fn parse_artifact_json() {
+    fn emit_returns_true_for_artifact_json() {
         let json = r#"{"artifact":"/nix/store/foo","emit":"link"}"#;
-        assert!(try_parse_diagnostic(json).is_none());
+        let mut shell = Shell::new();
+        assert!(emit_line(
+            &mut shell,
+            json,
+            "/nix/store/src/",
+            "/home/user/"
+        ));
     }
 
     #[test]
-    fn parse_non_json() {
-        assert!(try_parse_diagnostic("building '/nix/store/foo.drv'...").is_none());
-        assert!(try_parse_diagnostic("").is_none());
+    fn emit_returns_false_for_non_json() {
+        let mut shell = Shell::new();
+        assert!(!emit_line(
+            &mut shell,
+            "building '/nix/store/foo.drv'...",
+            "/nix/store/src/",
+            "/home/user/"
+        ));
+        assert!(!emit_line(&mut shell, "", "/nix/store/src/", "/home/user/"));
     }
 
     #[test]
-    fn skip_summary_messages() {
+    fn emit_returns_true_for_summary_messages() {
+        let mut shell = Shell::new();
+
         let json = r#"{"rendered":"aborting due to 3 previous errors\n"}"#;
-        assert!(try_parse_diagnostic(json).is_none());
+        assert!(emit_line(
+            &mut shell,
+            json,
+            "/nix/store/src/",
+            "/home/user/"
+        ));
 
         let json = r#"{"rendered":"warning: 2 warnings emitted\n"}"#;
-        assert!(try_parse_diagnostic(json).is_none());
+        assert!(emit_line(
+            &mut shell,
+            json,
+            "/nix/store/src/",
+            "/home/user/"
+        ));
 
         let json = r#"{"rendered":"warning: 1 warning emitted\n"}"#;
-        assert!(try_parse_diagnostic(json).is_none());
+        assert!(emit_line(
+            &mut shell,
+            json,
+            "/nix/store/src/",
+            "/home/user/"
+        ));
     }
 
     #[test]

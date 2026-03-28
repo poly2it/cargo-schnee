@@ -22,7 +22,21 @@ pub(super) fn extract_units_from_bcx(
     // Cargo can create multiple Unit entries for the same crate with different
     // dep_hash/profile values — they compile to the same output, so we merge them.
     let mut key_map: HashMap<Unit, String> = HashMap::new();
-    let mut all_units: Vec<Unit> = bcx.unit_graph.keys().cloned().collect();
+    let mut all_units: Vec<Unit> = bcx
+        .unit_graph
+        .keys()
+        .filter(|u| {
+            // Filter out modes that cargo-schnee cannot handle (they need
+            // rustdoc, not rustc).  Without this filter, Doctest units share
+            // the same compilation_identity as Build units, causing self-edges
+            // in the toposort when Doctest depends on Build.
+            !matches!(
+                u.mode,
+                CompileMode::Doctest | CompileMode::Doc | CompileMode::Docscrape
+            )
+        })
+        .cloned()
+        .collect();
     all_units.sort_by_key(unit_sort_key);
 
     // Group units by their "compilation identity" (what affects rustc output).
@@ -130,7 +144,7 @@ pub(super) fn extract_units_from_bcx(
             .get(&identity)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let mut dep_extern_map: HashMap<String, String> = HashMap::new();
+        let mut dep_extern_map: HashMap<String, (String, bool)> = HashMap::new();
         let mut build_script_dep: Option<String> = None;
         let mut build_script_compile_key: Option<String> = None;
         let mut links_dep_map: HashMap<String, String> = HashMap::new();
@@ -142,7 +156,11 @@ pub(super) fn extract_units_from_bcx(
                 .cloned()
                 .unwrap_or_default();
             for dep in &deps {
-                let dep_key = &key_map[&dep.unit];
+                // Skip deps on filtered-out modes (Doctest, Doc, Docscrape)
+                let dep_key = match key_map.get(&dep.unit) {
+                    Some(k) => k,
+                    None => continue,
+                };
                 if dep.unit.mode == CompileMode::RunCustomBuild {
                     if kind == UnitKind::BuildScriptRun {
                         if let Some(links_name) = dep.unit.pkg.manifest().links() {
@@ -170,14 +188,23 @@ pub(super) fn extract_units_from_bcx(
                     });
                 } else {
                     let extern_name = dep.extern_crate_name.to_string();
+                    // When a package has both lib and bin targets with the same
+                    // extern name, prefer the lib target — downstream --extern
+                    // needs the .rlib, not the binary.
+                    let dep_is_lib = dep.unit.target.is_lib();
                     dep_extern_map
                         .entry(extern_name)
-                        .and_modify(|existing| {
-                            if *dep_key < *existing {
-                                *existing = dep_key.clone();
+                        .and_modify(|(existing_key, existing_is_lib)| {
+                            if dep_is_lib && !*existing_is_lib {
+                                // Replace bin with lib unconditionally
+                                *existing_key = dep_key.clone();
+                                *existing_is_lib = true;
+                            } else if dep_is_lib == *existing_is_lib && *dep_key < *existing_key {
+                                // Same kind: pick lexicographically smallest
+                                *existing_key = dep_key.clone();
                             }
                         })
-                        .or_insert_with(|| dep_key.clone());
+                        .or_insert_with(|| (dep_key.clone(), dep_is_lib));
                 }
             }
         }
@@ -284,11 +311,14 @@ pub(super) fn extract_units_from_bcx(
                     dep_key,
                     key,
                 );
-                dep_extern_map.insert(extern_name, dep_key);
+                dep_extern_map.insert(extern_name, (dep_key, true));
             }
         }
 
-        let mut dep_extern: Vec<(String, String)> = dep_extern_map.into_iter().collect();
+        let mut dep_extern: Vec<(String, String)> = dep_extern_map
+            .into_iter()
+            .map(|(name, (key, _))| (name, key))
+            .collect();
         let mut links_dep_keys: Vec<(String, String)> = links_dep_map
             .into_iter()
             .map(|(links_name, dep_key)| (dep_key, links_name))
@@ -309,8 +339,9 @@ pub(super) fn extract_units_from_bcx(
         );
 
         // Manifest dir — map to store path
+        let original_manifest_dir = unit.pkg.root().to_string_lossy().to_string();
         let manifest_dir = map_to_store_path(
-            &unit.pkg.root().to_string_lossy(),
+            &original_manifest_dir,
             &src_str,
             &vendor_str,
             unit.pkg.root(),
@@ -349,6 +380,7 @@ pub(super) fn extract_units_from_bcx(
             build_script_dep,
             build_script_compile_key,
             manifest_dir,
+            original_manifest_dir,
             cargo_envs,
             extra_filename,
             needs_linker,
@@ -439,6 +471,9 @@ fn compilation_identity(unit: &Unit) -> String {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
         CompileMode::Check { .. } => "-check",
+        CompileMode::Doc => "-doc",
+        CompileMode::Doctest => "-doctest",
+        CompileMode::Docscrape => "-docscrape",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
@@ -490,6 +525,9 @@ fn make_unit_key(unit: &Unit) -> String {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
         CompileMode::Check { .. } => "-check",
+        CompileMode::Doc => "-doc",
+        CompileMode::Doctest => "-doctest",
+        CompileMode::Docscrape => "-docscrape",
         _ if unit.target.is_custom_build() => "-build-script",
         _ => "",
     };
@@ -731,7 +769,7 @@ pub(super) fn toposort(
 /// `(extern_name, dep_unit_key)` pairs it can provide.  Only entries whose
 /// `extern_name` is absent from `dep_extern` are returned.
 fn find_missing_feature_deps(
-    dep_extern: &HashMap<String, String>,
+    dep_extern: &HashMap<String, (String, bool)>,
     enabled_features: &[String],
     feature_dep_activations: &HashMap<String, Vec<(String, String)>>,
 ) -> Vec<(String, String)> {
@@ -762,6 +800,12 @@ fn find_missing_feature_deps(
 /// `cfg(any())`-gated deps injected by `find_missing_feature_deps`).  The
 /// toposort order may therefore place a dependency *after* its dependent,
 /// and a single pass would read the dependency's uninitialised level.
+///
+/// Complexity: O(n * d) per iteration where n = number of units and d = max
+/// edges per unit.  The loop converges in at most O(depth) iterations where
+/// depth is the longest dependency chain, giving O(n * d * depth) worst case.
+/// In practice crate graphs are wide rather than deep, so this converges in
+/// very few iterations (typically 1-3 beyond the initial pass).
 pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
@@ -1096,6 +1140,7 @@ mod tests {
             build_script_dep: None,
             build_script_compile_key: None,
             manifest_dir: format!("/nix/store/fake/{}", name),
+            original_manifest_dir: format!("/fake/project/{}", name),
             cargo_envs: vec![
                 ("CARGO_PKG_NAME".into(), name.into()),
                 ("CARGO_PKG_VERSION".into(), version.into()),
@@ -1373,8 +1418,8 @@ mod tests {
         // dep:serde, but cargo omits both from the unit graph because serde is
         // under [target.'cfg(any())'.dependencies].
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("equivalent".into(), "equivalent-key".into());
-        dep_extern.insert("hashbrown".into(), "hashbrown-key".into());
+        dep_extern.insert("equivalent".into(), ("equivalent-key".into(), true));
+        dep_extern.insert("hashbrown".into(), ("hashbrown-key".into(), true));
 
         let features = vec!["default".into(), "std".into(), "serde".into()];
 
@@ -1413,7 +1458,7 @@ mod tests {
         // If serde is already in dep_extern (normal case without cfg(any())),
         // no additions should be made.
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("serde".into(), "serde-key".into());
+        dep_extern.insert("serde".into(), ("serde-key".into(), true));
 
         let features = vec!["serde".into()];
         let mut activations = HashMap::new();
