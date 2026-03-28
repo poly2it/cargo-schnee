@@ -1,6 +1,6 @@
 use super::util::{collect_store_paths, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
-use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
+use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
 use anyhow::{Context, Result};
 use log::debug;
 use sha2::{Digest, Sha256};
@@ -422,12 +422,29 @@ fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
-    // For TestCompile units, use the original (writable) project path so that
-    // compile-time `env!("CARGO_MANIFEST_DIR")` captures a path the test
-    // binary can actually write to at runtime.
+    // For TestCompile units, use a deterministic /tmp symlink as
+    // CARGO_MANIFEST_DIR. At compile time the symlink points to the store
+    // path so proc macros (e.g. sqlx::migrate!) can read files. At test
+    // runtime the same path is re-symlinked to the writable project dir,
+    // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
+    // a readable+writable location.
+    let tmp_manifest_path;
     let manifest_dir_for_compile =
         if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
-            &unit.original_manifest_dir
+            let hash = {
+                let mut hasher = Sha256::new();
+                hasher.update(unit.original_manifest_dir.as_bytes());
+                hex_lower(&hasher.finalize()[..8])
+            };
+            tmp_manifest_path = format!("/tmp/_schnee_md_{}", hash);
+            let ln_path = format!("{}/ln", coreutils_bin_dir);
+            script.push_str(&format!(
+                "{} -sfn {} {} && ",
+                shell_quote(&ln_path),
+                shell_quote(&unit.manifest_dir),
+                shell_quote(&tmp_manifest_path),
+            ));
+            &tmp_manifest_path
         } else {
             &unit.manifest_dir
         };

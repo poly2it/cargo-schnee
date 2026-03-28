@@ -1545,6 +1545,28 @@ fn run_binary(
     Ok(status)
 }
 
+/// Create a deterministic `/tmp` symlink for CARGO_MANIFEST_DIR.
+///
+/// At compile time the derivation creates the same symlink pointing to the
+/// Nix store path so proc macros can read files. Here at runtime we
+/// re-create it pointing to the writable project directory, so both
+/// `env!("CARGO_MANIFEST_DIR")` (baked at compile time) and
+/// `std::env::var("CARGO_MANIFEST_DIR")` resolve to a readable+writable
+/// location.
+fn schnee_manifest_symlink(project_manifest_dir: &str) -> String {
+    let hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(project_manifest_dir.as_bytes());
+        nix_encoding::hex_lower(&hasher.finalize()[..8])
+    };
+    let tmp_path = format!("/tmp/_schnee_md_{}", hash);
+    // Atomically replace any stale symlink (may point to a store path from
+    // a previous build).
+    let _ = std::fs::remove_file(&tmp_path);
+    let _ = std::os::unix::fs::symlink(project_manifest_dir, &tmp_path);
+    tmp_path
+}
+
 struct BuildResult {
     /// Root derivation paths with target names, unit kinds, and manifest dirs
     root_drvs: Vec<(String, String, plan_nix::UnitKind, String)>,
@@ -2325,10 +2347,11 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for (_, target_name, _, manifest_dir) in &test_roots {
+                let symlink_path = schnee_manifest_symlink(manifest_dir);
                 let bin_name = binary_name(target_name, target);
                 let binary_path = result.target_debug.join(&bin_name);
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
-                let status = run_binary(&binary_path, args, target, Some(manifest_dir))?;
+                let status = run_binary(&binary_path, args, target, Some(&symlink_path))?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2378,6 +2401,7 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for (_, target_name, _, manifest_dir) in &bench_roots {
+                let symlink_path = schnee_manifest_symlink(manifest_dir);
                 let bin_name = binary_name(target_name, target);
                 let binary_path = result.target_debug.join(&bin_name);
                 shell::status(
@@ -2386,7 +2410,7 @@ fn main() -> Result<()> {
                 );
                 let mut bench_args = vec!["--bench".to_string()];
                 bench_args.extend(args.iter().cloned());
-                let status = run_binary(&binary_path, &bench_args, target, Some(manifest_dir))?;
+                let status = run_binary(&binary_path, &bench_args, target, Some(&symlink_path))?;
                 if !status.success() {
                     any_failed = true;
                 }
