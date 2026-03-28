@@ -1155,6 +1155,16 @@ fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
 // Build cache — skip vendoring + derivation registration on unchanged builds
 // ---------------------------------------------------------------------------
 
+/// A single unit-graph cache entry, keyed by
+/// `hash(Cargo.lock + Cargo.toml + profile + target + intent + packages + features)`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct UnitGraphCacheEntry {
+    src_store: String,
+    units: Vec<plan_nix::NixUnit>,
+    target_cfg_envs: Vec<(String, String)>,
+    host_cfg_envs: Vec<(String, String)>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SchneeCache {
     /// SHA-256 of Cargo.lock → vendor nix store path
@@ -1167,22 +1177,11 @@ struct SchneeCache {
     /// Invalidated per-entry: if a store path changes, its old entry is simply unused.
     #[serde(default)]
     tool_closures: HashMap<String, Vec<String>>,
-    /// Unit graph cache: hash(Cargo.lock + Cargo.toml) → cached NixUnit vec.
-    /// The unit graph depends only on manifest metadata and resolved deps, not source content.
+    /// Unit graph cache, keyed by a composite of Cargo.lock, workspace manifests,
+    /// profile, target, intent, packages, and features.  Multiple entries coexist
+    /// so that e.g. `--package X` does not evict the full-workspace entry.
     #[serde(default)]
-    unit_graph_hash: Option<String>,
-    #[serde(default)]
-    unit_graph_src_store: Option<String>,
-    #[serde(default)]
-    unit_graph: Option<Vec<plan_nix::NixUnit>>,
-    /// Cached CARGO_CFG_* env vars for the target (from rustc --print cfg).
-    /// Validity is tied to unit_graph_hash (same target triple + toolchain).
-    #[serde(default)]
-    target_cfg_envs: Option<Vec<(String, String)>>,
-    /// Cached CARGO_CFG_* env vars for the host (from rustc --print cfg for Host).
-    /// Used for build scripts of host-compiled crates during cross-compilation.
-    #[serde(default)]
-    host_cfg_envs: Option<Vec<(String, String)>>,
+    unit_graphs: HashMap<String, UnitGraphCacheEntry>,
 }
 
 struct CacheLock {
@@ -1698,27 +1697,13 @@ fn run_build_pipeline(
         features_str,
         no_default_features,
     );
-    let cached_units = if cache.unit_graph_hash.as_deref() == Some(&unit_graph_key) {
-        if let (Some(old_src), Some(units)) = (&cache.unit_graph_src_store, &cache.unit_graph) {
-            log::info!("Unit graph cache hit ({} units)", units.len());
-            Some((old_src.clone(), units.clone()))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let cached_cfg_envs = if cached_units.is_some() {
-        cache.target_cfg_envs.clone()
-    } else {
-        None
-    };
-    let cached_host_cfg_envs = if cached_units.is_some() {
-        cache.host_cfg_envs.clone()
-    } else {
-        None
-    };
+    let cached_entry = cache.unit_graphs.get(&unit_graph_key);
+    let cached_units = cached_entry.map(|e| {
+        log::info!("Unit graph cache hit ({} units)", e.units.len());
+        (e.src_store.clone(), e.units.clone())
+    });
+    let cached_cfg_envs = cached_entry.map(|e| e.target_cfg_envs.clone());
+    let cached_host_cfg_envs = cached_entry.map(|e| e.host_cfg_envs.clone());
 
     // Resolve passthrough env vars for build-script derivations.
     // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
@@ -1748,20 +1733,22 @@ fn run_build_pipeline(
     )?;
 
     // Update unit graph cache
-    cache.unit_graph_hash = Some(unit_graph_key);
-    cache.unit_graph_src_store = Some(src_store.clone());
-    cache.unit_graph = Some(
-        plan_units
-            .iter()
-            .map(|u| {
-                let mut c = u.clone();
-                c.clear_drv_path();
-                c
-            })
-            .collect(),
+    cache.unit_graphs.insert(
+        unit_graph_key,
+        UnitGraphCacheEntry {
+            src_store: src_store.clone(),
+            units: plan_units
+                .iter()
+                .map(|u| {
+                    let mut c = u.clone();
+                    c.clear_drv_path();
+                    c
+                })
+                .collect(),
+            target_cfg_envs: cfg_envs,
+            host_cfg_envs,
+        },
     );
-    cache.target_cfg_envs = Some(cfg_envs);
-    cache.host_cfg_envs = Some(host_cfg_envs);
 
     let plan_duration = plan_start.elapsed();
 
