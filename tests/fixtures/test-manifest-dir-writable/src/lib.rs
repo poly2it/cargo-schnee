@@ -1,9 +1,9 @@
 /// Verify CARGO_MANIFEST_DIR behaviour in cargo-schnee.
 ///
-/// Compile-time `env!("CARGO_MANIFEST_DIR")` points to the Nix store source,
-/// which is readable (so proc macros that resolve files at compile time work).
-/// Runtime `std::env::var("CARGO_MANIFEST_DIR")` points to the original
-/// project directory, which is writable.
+/// Both compile-time `env!("CARGO_MANIFEST_DIR")` and runtime
+/// `std::env::var("CARGO_MANIFEST_DIR")` should point to the original
+/// writable project directory, so tests that write generated files
+/// (e.g. TypeScript bindings) relative to CARGO_MANIFEST_DIR work.
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -19,6 +19,21 @@ mod tests {
         );
     }
 
+    /// Regression test: compile-time `env!("CARGO_MANIFEST_DIR")` must point
+    /// to a writable path so tests that generate files (e.g. yerpc TS bindings)
+    /// can write relative to it.
+    #[test]
+    fn write_to_manifest_dir_compile_time() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-output-compile-time");
+        std::fs::create_dir_all(&dir).expect("create_dir_all failed");
+        let out = dir.join("compile_time.txt");
+        std::fs::write(&out, "ok").expect("write failed");
+        assert!(out.exists());
+        // Clean up
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn write_to_manifest_dir_runtime() {
         let dir = PathBuf::from(
@@ -31,5 +46,17 @@ mod tests {
         assert!(out.exists());
         // Clean up
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Compile-time and runtime CARGO_MANIFEST_DIR should agree.
+    #[test]
+    fn compile_time_and_runtime_manifest_dir_agree() {
+        let compile_time = env!("CARGO_MANIFEST_DIR");
+        let runtime =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set at runtime");
+        assert_eq!(
+            compile_time, runtime,
+            "compile-time and runtime CARGO_MANIFEST_DIR should match"
+        );
     }
 }

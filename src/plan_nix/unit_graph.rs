@@ -339,8 +339,9 @@ pub(super) fn extract_units_from_bcx(
         );
 
         // Manifest dir — map to store path
+        let original_manifest_dir = unit.pkg.root().to_string_lossy().to_string();
         let manifest_dir = map_to_store_path(
-            &unit.pkg.root().to_string_lossy(),
+            &original_manifest_dir,
             &src_str,
             &vendor_str,
             unit.pkg.root(),
@@ -379,6 +380,7 @@ pub(super) fn extract_units_from_bcx(
             build_script_dep,
             build_script_compile_key,
             manifest_dir,
+            original_manifest_dir,
             cargo_envs,
             extra_filename,
             needs_linker,
@@ -1138,6 +1140,7 @@ mod tests {
             build_script_dep: None,
             build_script_compile_key: None,
             manifest_dir: format!("/nix/store/fake/{}", name),
+            original_manifest_dir: format!("/fake/project/{}", name),
             cargo_envs: vec![
                 ("CARGO_PKG_NAME".into(), name.into()),
                 ("CARGO_PKG_VERSION".into(), version.into()),

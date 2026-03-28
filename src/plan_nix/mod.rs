@@ -181,8 +181,13 @@ pub struct NixUnit {
     pub(crate) build_script_dep: Option<String>,
     /// Key of the build-script-compile derivation (for BuildScriptRun units)
     pub(crate) build_script_compile_key: Option<String>,
-    /// CARGO_MANIFEST_DIR for the package
+    /// CARGO_MANIFEST_DIR for the package (mapped to nix store path)
     pub(crate) manifest_dir: String,
+    /// Original (pre-mapping) manifest dir — the writable project path.
+    /// For TestCompile units, this is used as CARGO_MANIFEST_DIR so that
+    /// compile-time `env!("CARGO_MANIFEST_DIR")` captures a writable path.
+    #[serde(default)]
+    pub(crate) original_manifest_dir: String,
     /// Standard cargo env vars for build scripts
     pub(crate) cargo_envs: Vec<(String, String)>,
     /// Deterministic hash for -C extra-filename and -C metadata
@@ -393,7 +398,7 @@ pub fn run_plan_nix(
     features: &[String],
     no_default_features: bool,
     passthru_envs: &[(String, String)],
-    _project_dir: Option<&Path>,
+    project_dir: Option<&Path>,
 ) -> Result<(
     Vec<(String, String)>,
     Vec<NixUnit>,
@@ -540,6 +545,18 @@ pub fn run_plan_nix(
 
         (units, bcx_cfg_envs, bcx_host_cfg_envs)
     };
+
+    // Populate original_manifest_dir for TestCompile units so that compile-time
+    // env!("CARGO_MANIFEST_DIR") captures the writable project path instead of
+    // the read-only nix store path.
+    if let Some(proj) = project_dir {
+        let proj_str = proj.to_string_lossy();
+        for unit in &mut nix_units {
+            if let Some(suffix) = unit.manifest_dir.strip_prefix(src_str.as_str()) {
+                unit.original_manifest_dir = format!("{}{}", proj_str, suffix);
+            }
+        }
+    }
 
     // Resolve tool paths
     let rustc_path = which_rustc()?;

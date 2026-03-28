@@ -422,9 +422,18 @@ fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
+    // For TestCompile units, use the original (writable) project path so that
+    // compile-time `env!("CARGO_MANIFEST_DIR")` captures a path the test
+    // binary can actually write to at runtime.
+    let manifest_dir_for_compile =
+        if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
+            &unit.original_manifest_dir
+        } else {
+            &unit.manifest_dir
+        };
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
-        shell_quote(&unit.manifest_dir)
+        shell_quote(manifest_dir_for_compile)
     ));
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
