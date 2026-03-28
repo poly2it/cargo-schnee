@@ -8,7 +8,7 @@ Are you tired of slow and monolithic Rust derivations? Do you wish Nix would bui
 The following experimental features are required:
 
 ```
-experimental-features = nix-command flakes dynamic-derivations ca-derivations
+experimental-features = nix-command flakes dynamic-derivations ca-derivations recursive-nix
 ```
 
 ## How it works
@@ -379,7 +379,8 @@ cross builds. Permissions are adjusted from the Nix store's read-only
 The recommended way to use cargo-schnee is through a cargo wrapper that
 transparently redirects `cargo build`, `cargo check`, `cargo run`, `cargo test`,
 and `cargo bench` to their `cargo schnee` equivalents. The wrapper also forwards
-`-p`/`--package`, `--features`, `--bin`, and `--no-default-features`. The
+`-p`/`--package`, `--features`, `--bin`, `--no-default-features`,
+`--manifest-path`, `--target`, and `--profile`. The
 [simple example](examples/simple/) demonstrates this approach with a
 `devShell` and both packaging methods described below. For development shells, create the wrapper via
 `makeCargoWrapper`:
@@ -407,6 +408,10 @@ cargo build --profile bench
 
 # Or invoke cargo-schnee directly.
 cargo schnee build --manifest-path path/to/Cargo.toml
+cargo schnee check --manifest-path path/to/Cargo.toml
+cargo schnee run --manifest-path path/to/Cargo.toml -- --arg1 value
+cargo schnee test --manifest-path path/to/Cargo.toml -- --test-threads=1
+cargo schnee bench --manifest-path path/to/Cargo.toml
 
 # Pass -vv for Nix build logs.
 cargo schnee build -vv --manifest-path examples/simple/Cargo.toml
@@ -417,6 +422,9 @@ cargo build -p my-crate
 # Build with specific features.
 cargo build --features serde,json --no-default-features
 ```
+
+The `--vendor-dir` flag is available on all subcommands for providing a pre-vendored directory
+already in the Nix store.
 
 ### Cross-compilation
 
@@ -458,12 +466,76 @@ in {
 }
 ```
 
+### Windows cross-compilation
+
+The [cross-windows example](examples/cross-windows/) demonstrates
+cross-compiling to `x86_64-pc-windows-msvc`. MSVC targets require the Windows
+SDK, an LLVM-based linker such as `lld-link`, and a way to run the resulting
+binaries such as Wine. Your nixpkgs config must include
+`microsoftVisualStudioLicenseAccepted = true` to fetch the SDK.
+
+The `XWIN_DIR` environment variable must point to the Windows SDK store path,
+typically `pkgs.windows.sdk`. cargo-schnee reads it to locate the CRT and
+SDK libraries needed for linking. For build scripts that use the `cc` crate,
+`CARGO_SCHNEE_PASSTHRU_ENVS` forwards host-side toolchain variables like
+`CC` and `AR` into build-script derivations. For running cross-compiled
+binaries with `cargo schnee run`, `test`, or `bench`,
+`CARGO_TARGET_<TRIPLE>_RUNNER` specifies the runner.
+
+A development shell for Windows cross-compilation:
+
+```nix
+let
+  pkgs = import nixpkgs {
+    inherit system;
+    overlays = [ (import rust-overlay) ];
+    config = {
+      allowUnfree = true;
+      microsoftVisualStudioLicenseAccepted = true;
+    };
+  };
+
+  rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+    targets = [ "x86_64-pc-windows-msvc" ];
+  };
+
+  schneeToolchain = cargo-schnee.lib.makeCargoWrapper {
+    inherit pkgs rustToolchain;
+    cargo = lib.getExe' rustToolchain "cargo";
+    overrides = cargo-schnee.lib.cargoOverrides { inherit pkgs; };
+  };
+in {
+  devShells.default = pkgs.mkShell {
+    buildInputs = [
+      schneeToolchain
+      pkgs.llvmPackages.bintools-unwrapped
+      pkgs.llvmPackages.clang-unwrapped
+      pkgs.wineWow64Packages.stable
+      pkgs.nix
+    ];
+
+    XWIN_DIR = "${pkgs.windows.sdk}";
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link";
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER = "wine";
+
+    CARGO_SCHNEE_PASSTHRU_ENVS = "CC_x86_64_pc_windows_msvc AR_x86_64_pc_windows_msvc";
+    CC_x86_64_pc_windows_msvc = "clang-cl";
+    AR_x86_64_pc_windows_msvc = "llvm-lib";
+  };
+}
+```
+
+See [`examples/cross-windows/`](examples/cross-windows/) for the full
+`devShell` and `buildRustPackage` setup, and
+[`examples/build-package-cross-windows/`](examples/build-package-cross-windows/)
+for the `lib.buildPackage` equivalent.
+
 ### Custom `-sys` crate environment variables
 
 cargo-schnee has a built-in table that tells common `-sys` crates to use
 `pkg-config`, such as `LIBGIT2_NO_VENDOR=1` and `OPENSSL_NO_VENDOR=1`. For `-sys`
-crates not in the table, add a `[workspace.metadata.schnee.sys-env]` section to
-your `Cargo.toml`:
+crates not in the table, add a `[workspace.metadata.schnee.sys-env]` or
+`[package.metadata.schnee.sys-env]` section to your `Cargo.toml`:
 
 ```toml
 [workspace.metadata.schnee.sys-env]
@@ -529,11 +601,22 @@ cargo-schnee.lib.buildPackage {
 }
 ```
 
+Instead of `cargoLock`, you can pass `cargoHash` as a fixed-output hash for
+the vendored dependencies, or `cargoDeps` as a pre-fetched dependency store
+path.
+
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
-`wrapBinaries`, `buildType`, `preBuild`, `postBuild`, `postInstall`,
+`wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`, `postInstall`,
 `postFixup`, and `meta`. Unrecognised attributes are passed through to
-`buildRustPackage`. See [`examples/build-package/`](examples/build-package/)
+`buildRustPackage`.
+
+For Windows targets, `buildPackage` automatically sets `dontFixup = true`
+because patchelf and strip do not work on PE binaries. When `doCheck` is
+enabled for a Windows target, Wine is configured as the test runner
+automatically.
+
+See [`examples/build-package/`](examples/build-package/)
 for a workspace example,
 [`examples/build-package-cross/`](examples/build-package-cross/) for
 cross-compilation, and
@@ -624,4 +707,17 @@ cargo schnee plan --manifest-path examples/simple/Cargo.toml
 # Write a per-derivation timing report to a file.
 cargo schnee build --write-profile-to profile.txt \
     --manifest-path examples/simple/Cargo.toml
+
+# Verify in-process .drv path computation against nix derivation add.
+cargo schnee build --verify-drv-paths \
+    --manifest-path examples/simple/Cargo.toml
 ```
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `XWIN_DIR` | Path to the Windows SDK store path, typically `pkgs.windows.sdk`. Required for MSVC targets. |
+| `CARGO_SCHNEE_PASSTHRU_ENVS` | Space-separated list of environment variable names to forward into build-script derivations. |
+| `CARGO_TARGET_<TRIPLE>_LINKER` | Cross-linker for the given target triple. Used in derivation builder scripts. |
+| `CARGO_TARGET_<TRIPLE>_RUNNER` | Runner for cross-compiled binaries, such as `wine`. Required by `run`, `test`, and `bench` on cross targets. |
