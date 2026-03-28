@@ -1536,8 +1536,10 @@ fn run_binary(
     };
     // Set CARGO_MANIFEST_DIR so that runtime lookups via std::env::var()
     // resolve to the writable project directory instead of the nix store.
+    // Also set the working directory to match vanilla cargo behavior.
     if let Some(dir) = manifest_dir {
         cmd.env("CARGO_MANIFEST_DIR", dir);
+        cmd.current_dir(dir);
     }
     let status = cmd
         .status()
