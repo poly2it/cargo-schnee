@@ -1,6 +1,3 @@
 [workspace]
 resolver = "3"
 members = ["my-app", "my-dep"]
-
-[workspace.metadata.schnee]
-passthruEnv = ["MY_CUSTOM_FLAG"]

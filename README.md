@@ -664,6 +664,61 @@ Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `postFixup`, and `meta`. Unrecognised attributes are passed through to
 `buildRustPackage`.
 
+#### `env`
+
+`env` is an attribute set of environment variables injected into the
+`buildRustPackage` derivation. These variables are available during all build
+phases but do not propagate into individual per-crate build-script
+derivations created by cargo-schnee.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  env = {
+    XWIN_DIR = "${pkgs.windows.sdk}";
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = "lld-link";
+  };
+}
+```
+
+#### `passthruEnv`
+
+`passthruEnv` is a list of environment variable names whose values are
+forwarded from the outer derivation environment into every build-script
+derivation in the dependency graph, including transitive vendored
+dependencies. Build scripts run in isolated Nix derivations that do not
+inherit the parent derivation's environment, so this is the mechanism for
+making host-side variables like `LIBCLANG_PATH` available to them.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  passthruEnv = [ "LIBCLANG_PATH" "BINDGEN_EXTRA_CLANG_ARGS" ];
+  env = {
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+  };
+}
+```
+
+Variables listed in `passthruEnv` must also have values set via `env` so
+that they are present in the derivation environment where cargo-schnee runs.
+If a name is listed but the corresponding variable is not set, cargo-schnee
+emits a warning and skips it.
+
+In devshell workflows, set `CARGO_SCHNEE_PASSTHRU_ENVS` as a space-separated
+list of variable names to forward.
+
+```nix
+devShells.default = pkgs.mkShell {
+  CARGO_SCHNEE_PASSTHRU_ENVS = "LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS";
+  LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+  BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+};
+```
+
 For Windows targets, `buildPackage` automatically sets `dontFixup = true`
 because patchelf and strip do not work on PE binaries. When `doCheck` is
 enabled for a Windows target, Wine is configured as the test runner

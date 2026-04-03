@@ -652,9 +652,8 @@ fn fixture_extra_includes() {
     );
 }
 
-/// passthruEnv from Cargo.toml metadata: env var names declared in
-/// `[workspace.metadata.schnee] passthruEnv` are forwarded to ALL build script
-/// derivations, including transitive dependencies.
+/// CARGO_SCHNEE_PASSTHRU_ENVS forwards env vars into ALL build script
+/// derivations, including transitive vendored dependencies.
 #[test]
 #[ignore]
 fn fixture_passthru_env_manifest() {
@@ -668,6 +667,7 @@ fn fixture_passthru_env_manifest() {
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
+        .env("CARGO_SCHNEE_PASSTHRU_ENVS", "MY_CUSTOM_FLAG")
         .env("MY_CUSTOM_FLAG", "hello-from-env")
         .output()
         .expect("Failed to execute cargo-schnee");
