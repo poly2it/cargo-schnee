@@ -173,11 +173,12 @@
           local sys="$1" scenario="$2" drv="$3"
           local profile="/results/profile-''${sys}-''${scenario}.log"
 
-          local start end rc duration
+          local start end rc duration build_stderr
+          build_stderr=$(mktemp)
           start=$(date +%s%N)
           set +e
           nixprof record -o "$profile" \
-            nix-store --realise "$drv" >>/results/build.log 2>&1
+            nix-store --realise "$drv" >>/results/build.log 2>"$build_stderr"
           rc=$?
           set -e
           end=$(date +%s%N)
@@ -193,6 +194,15 @@
               echo "    (nixprof reported success but output $first_out is not valid)" >>/results/build.log
             fi
           fi
+
+          if [ $rc -ne 0 ]; then
+            echo "    === build stderr for $sys/$scenario ===" >>/results/build.log
+            cat "$build_stderr" >>/results/build.log
+            echo "    === nix log $drv ===" >>/results/build.log
+            nix log "$drv" >>/results/build.log 2>&1 || \
+              nix-store -l "$drv" >>/results/build.log 2>&1 || true
+          fi
+          rm -f "$build_stderr"
 
           if [ $rc -eq 0 ]; then
             add_result "$sys" "$scenario" "OK" "$duration"
