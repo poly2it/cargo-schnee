@@ -669,8 +669,10 @@ fn build_run_script(
         script.push_str("_bs_workdir=$TMPDIR/workdir && ");
         script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
         // For workspace root crates (manifest_dir == src_store), _parent/
-        // was included in the copy; move it one level up.
-        if has_parent {
+        // was included in the copy above; move it one level up.
+        // Only applies when the crate is actually local — vendored deps
+        // (whose manifest_dir is in the vendor store) never contain _parent/.
+        if has_parent && unit.manifest_dir == src_store {
             script.push_str(concat!(
                 "cp -r --no-preserve=mode $_bs_workdir/_parent/. $TMPDIR/ && ",
                 "rm -rf $_bs_workdir/_parent && ",
