@@ -652,6 +652,49 @@ fn fixture_extra_includes() {
     );
 }
 
+/// passthruEnv from Cargo.toml metadata: env var names declared in
+/// `[workspace.metadata.schnee] passthruEnv` are forwarded to ALL build script
+/// derivations, including transitive dependencies.
+#[test]
+#[ignore]
+fn fixture_passthru_env_manifest() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/passthru-env-manifest");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .env("MY_CUSTOM_FLAG", "hello-from-env")
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "cargo-schnee build failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    let binary = fixture_dir.join("target/debug/my-app");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(run_output.status.success());
+    let run_stdout = String::from_utf8_lossy(&run_output.stdout);
+    assert!(
+        run_stdout.contains("flag=hello-from-env"),
+        "Unexpected output: {}",
+        run_stdout
+    );
+}
+
 /// Extra includes with _parent: a workspace whose extra-includes glob matches
 /// files outside the project directory. A build script in a member crate reads
 /// those files via relative paths from CARGO_MANIFEST_DIR. The files are mapped

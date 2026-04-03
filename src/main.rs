@@ -1134,6 +1134,40 @@ fn read_extra_includes(manifest_path: &Path) -> Vec<String> {
     }
 }
 
+/// Read passthruEnv names from `[workspace.metadata.schnee]` or
+/// `[package.metadata.schnee]` in the given Cargo.toml.
+/// Returns env var names (not values) that should be forwarded to build scripts.
+fn read_passthru_env_names(manifest_path: &Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(manifest_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = doc
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("passthruEnv"))
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            doc.get("package")
+                .and_then(|p| p.get("metadata"))
+                .and_then(|m| m.get("schnee"))
+                .and_then(|s| s.get("passthruEnv"))
+                .and_then(|v| v.as_array())
+        });
+    match arr {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Recursively copy a directory, skipping entries whose names match the exclude list.
 /// Symlinks are skipped to avoid accidentally copying large nix store closures.
 fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
@@ -1718,12 +1752,24 @@ fn run_build_pipeline(
     let cached_host_cfg_envs = cached_entry.map(|e| e.host_cfg_envs.clone());
 
     // Resolve passthrough env vars for build-script derivations.
-    // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
-    // whose values should be forwarded into per-crate build-script derivations.
-    let passthru_envs: Vec<(String, String)> = std::env::var("CARGO_SCHNEE_PASSTHRU_ENVS")
+    // Names come from two sources (merged, deduplicated):
+    // 1. CARGO_SCHNEE_PASSTHRU_ENVS env var (space-separated list of names)
+    // 2. [workspace.metadata.schnee] passthruEnv in Cargo.toml (array of names)
+    // Each name is looked up in the current environment; missing vars are skipped.
+    let mut passthru_names: Vec<String> = std::env::var("CARGO_SCHNEE_PASSTHRU_ENVS")
         .unwrap_or_default()
         .split_whitespace()
-        .filter_map(|name| std::env::var(name).ok().map(|val| (name.to_string(), val)))
+        .map(String::from)
+        .collect();
+    let manifest_names = read_passthru_env_names(&project_dir.join("Cargo.toml"));
+    for name in manifest_names {
+        if !passthru_names.contains(&name) {
+            passthru_names.push(name);
+        }
+    }
+    let passthru_envs: Vec<(String, String)> = passthru_names
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
         .collect();
 
     let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
