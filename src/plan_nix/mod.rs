@@ -400,7 +400,7 @@ pub fn run_plan_nix(
     passthru_envs: &[(String, String)],
     project_dir: Option<&Path>,
 ) -> Result<(
-    Vec<(String, String)>,
+    Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
     Vec<(String, String)>,
     Vec<(String, String)>,
@@ -1047,10 +1047,14 @@ pub fn run_plan_nix(
     );
 
     // Collect root derivation paths (all units marked is_root)
-    let root_drvs: Vec<(String, String)> = nix_units
+    let root_drvs: Vec<(String, String, UnitKind)> = nix_units
         .iter()
         .filter(|u| u.is_root)
-        .filter_map(|u| u.drv_path.clone().map(|p| (p, u.target_name.clone())))
+        .filter_map(|u| {
+            u.drv_path
+                .clone()
+                .map(|p| (p, u.target_name.clone(), u.kind.clone()))
+        })
         .collect();
     if root_drvs.is_empty() {
         // Fallback: use last unit (backward compat for single-package projects)
@@ -1063,7 +1067,7 @@ pub fn run_plan_nix(
             .map(|u| u.crate_name.clone())
             .unwrap_or_default();
         return Ok((
-            vec![(last_drv, last_name)],
+            vec![(last_drv, last_name, UnitKind::Compile)],
             nix_units,
             cfg_envs,
             host_cfg_envs,
