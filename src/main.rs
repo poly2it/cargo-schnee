@@ -1726,7 +1726,6 @@ fn run_build_pipeline(
         .unwrap_or_default()
         .split_whitespace()
         .map(String::from)
-        .into_iter()
         .filter_map(|name| match std::env::var(&name) {
             Ok(val) => Some((name, val)),
             Err(_) => {
@@ -2035,30 +2034,28 @@ fn run_build_pipeline(
         // behavior where test binaries live in deps/ and never overwrite the
         // main binary in target/<profile>/.
         let is_test_root = matches!(kind, plan_nix::UnitKind::TestCompile);
-        if !is_test_root {
-            if let Some(ref bin_path) = bin_file {
-                // For Windows targets, use the correct extension (.exe or .dll)
-                let bin_ext = bin_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let clean_name = if is_windows_target && !bin_ext.is_empty() {
-                    format!("{}.{}", target_name, bin_ext)
-                } else {
-                    target_name.to_string()
-                };
-                let clean_dest = target_debug.join(&clean_name);
-                if clean_dest != *bin_path {
-                    if clean_dest.exists()
-                        && let Err(e) = std::fs::remove_file(&clean_dest)
-                    {
-                        log::debug!(
-                            "Failed to remove old binary {}: {}",
-                            clean_dest.display(),
-                            e
-                        );
-                    }
-                    std::fs::hard_link(bin_path, &clean_dest)
-                        .or_else(|_| std::fs::copy(bin_path, &clean_dest).map(|_| ()))
-                        .with_context(|| format!("Failed to create {}", clean_dest.display()))?;
+        if !is_test_root && let Some(ref bin_path) = bin_file {
+            // For Windows targets, use the correct extension (.exe or .dll)
+            let bin_ext = bin_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let clean_name = if is_windows_target && !bin_ext.is_empty() {
+                format!("{}.{}", target_name, bin_ext)
+            } else {
+                target_name.to_string()
+            };
+            let clean_dest = target_debug.join(&clean_name);
+            if clean_dest != *bin_path {
+                if clean_dest.exists()
+                    && let Err(e) = std::fs::remove_file(&clean_dest)
+                {
+                    log::debug!(
+                        "Failed to remove old binary {}: {}",
+                        clean_dest.display(),
+                        e
+                    );
                 }
+                std::fs::hard_link(bin_path, &clean_dest)
+                    .or_else(|_| std::fs::copy(bin_path, &clean_dest).map(|_| ()))
+                    .with_context(|| format!("Failed to create {}", clean_dest.display()))?;
             }
         }
         root_bin_paths.push(bin_file);

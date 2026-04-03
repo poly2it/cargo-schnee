@@ -651,8 +651,7 @@ fn build_run_script(
         .strip_prefix(src_store)
         .map(|s| s.trim_start_matches('/'))
         .filter(|s| !s.is_empty());
-    if has_parent && crate_rel.is_some() {
-        let crate_rel = crate_rel.unwrap();
+    if let Some(crate_rel) = crate_rel.filter(|_| has_parent) {
         // Nest the crate copy so relative `..` paths land inside $TMPDIR.
         script.push_str(&format!(
             "_bs_workdir=$TMPDIR/workdir/{cr} && mkdir -p $_bs_workdir && \
