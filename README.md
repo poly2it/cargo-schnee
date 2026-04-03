@@ -11,6 +11,59 @@ The following experimental features are required:
 experimental-features = nix-command flakes dynamic-derivations ca-derivations recursive-nix
 ```
 
+<!-- BEGIN BENCHMARK -->
+## Comparative benchmark
+
+### Just
+
+Build of [Just](https://github.com/casey/just) version 1.40.0. The incremental change is an appended newline to `lib.rs` and `src/main.rs`.
+
+#### Clean build
+
+| Build system | Time | vs. cargo build |
+|---|---|---|
+| cargo build | 35.7s | baseline |
+| cargo-schnee | 49.5s | 1.4x |
+| buildRustPackage | 49.1s | 1.4x |
+| **crane** | **47.9s** | **1.3x** |
+| cargo2nix | 94.9s | 2.7x |
+| cargo2nix (w/pregeneration) | 93.8s | 2.6x |
+
+#### Incremental build
+
+| Build system | Time | vs. cargo build | vs. clean |
+|---|---|---|---|
+| cargo build | 24.5s | baseline | 0.7x |
+| **cargo-schnee** | **18.7s** | **0.8x** | **0.4x** |
+| buildRustPackage | 54.7s | 2.2x | 1.1x |
+| crane | 44.1s | 1.8x | 0.9x |
+| cargo2nix | 34.5s | 1.4x | 0.4x |
+
+### Build system descriptions
+
+| System | Strategy | Incremental behavior |
+|---|---|---|
+| cargo build | Invokes the cargo crate to compute a build graph directly. | Invokes the cargo crate to compute which artefacts are dirty. Uses timestamps internally. |
+| cargo-schnee | Invokes the cargo crate to compute a build graph directly. | Uses composite keys for build configuration updates and compilation identities for translation units. Uses content-addressed derivations everywhere. Uses Nix's dirty detection for source files. Enables granularity down to translation unit level. |
+| buildRustPackage | Invokes cargo to perform a full build. | Does not have an incremental strategy, rebuilds on any source change. |
+| crane | Builds are split into two phases. The first derivation builds the dependencies, which can be shared in a workspace. The second derivation builds a discrete artefact. | The dependency phase is cached when Cargo.lock is unchanged; the source phase rebuilds entirely. |
+| cargo2nix | Generates Nix expressions from Cargo.lock using cargo crate for dependency resolution, then builds using Nix derivations. | Rebuilds only dirty crates from the pregenerated Nix expression. Enables granularity down to crate level. |
+
+<details>
+<summary>Methodology</summary>
+
+- All benchmarks run in a NixOS QEMU VM with 16 GiB of RAM, 4 cores, and 30 GiB of disk. A Fresh VM disk image is created per run.
+- The benchmarks are designed to not count potential overhead of building prerequisites of the build system itself. As such, toolchains, sources and `.drv` files are pre-populated via 9p host store sharing.
+- Disk caches are dropped via `echo 3 > /proc/sys/vm/drop_caches` before every timed operation.
+- The VM has no network access. All source tarballs and tools are pre-populated.
+- For `cargo build`, the target directory is deleted before the clean build but preserved between clean and incremental to test native incrementality.
+- For Nix-based systems, `nix-store --realise <drv>` is timed. The incremental build benefits from cached outputs of the clean build, since no garbage collection runs between the clean and incremental builds within the same system.
+- cargo2nix requires running `cargo2nix generate` to produce a `Cargo.nix` file before builds can start. The "cargo2nix" row in the clean build table includes this generation cost; "cargo2nix (w/pregeneration)" shows the build-only time. The incremental table omits generation since it only runs once per `Cargo.lock` change.
+- crane's default `cargo check` pre-pass in `buildDepsOnly` is disabled via `cargoCheckCommand = "true"`. This pre-pass adds overhead on clean builds by running two cargo passes, and only benefits subsequent pipeline steps like clippy or nextest, not the build itself. Disabling it makes crane faster, not slower. Since crane's optimisation strategy revolves caching the build dependencies, realistic usage of crane would rarely invoke the first phase or its check pre-pass.
+
+</details>
+<!-- END BENCHMARK -->
+
 ## How it works
 
 ### Pipeline overview

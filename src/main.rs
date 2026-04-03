@@ -1920,6 +1920,9 @@ fn run_build_pipeline(
                  Or set NIX_CONFIG=\"extra-experimental-features = ca-derivations\"."
             );
         }
+        for line in &nix_error_lines {
+            eprintln!("{}", line);
+        }
         if !failed_drvs.is_empty() {
             eprintln!("For derivation logs, run:");
             for drv in &failed_drvs {
