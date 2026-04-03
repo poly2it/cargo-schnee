@@ -1,3 +1,4 @@
+use crate::nix_encoding::NIX_BASE32;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,10 +9,16 @@ pub(crate) fn collect_store_paths(s: &str, paths: &mut HashSet<String>) {
         let start = search_from + idx;
         let after_prefix = &s[start + "/nix/store/".len()..];
         if after_prefix.len() >= 32 && after_prefix.as_bytes().get(32) == Some(&b'-') {
-            let rest = &after_prefix[33..];
-            let name_end = rest.find(['/', ' ', '"', '\'', ')']).unwrap_or(rest.len());
-            let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
-            paths.insert(root.to_string());
+            // Validate that the 32-char hash uses only valid Nix base32 chars.
+            // Placeholder paths (e.g. clang wrapper's eeee...eeee-gcc) use
+            // characters outside the alphabet and must be skipped.
+            let hash_part = &after_prefix[..32];
+            if hash_part.bytes().all(|b| NIX_BASE32.contains(&b)) {
+                let rest = &after_prefix[33..];
+                let name_end = rest.find(['/', ' ', '"', '\'', ')']).unwrap_or(rest.len());
+                let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
+                paths.insert(root.to_string());
+            }
         }
         search_from = start + 1;
     }
@@ -231,6 +238,27 @@ mod tests {
         );
         collect_store_paths(&input, &mut paths);
         assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn collect_store_paths_skips_invalid_base32() {
+        let mut paths = HashSet::new();
+        // 'e' is not in the Nix base32 alphabet — this matches clang wrapper placeholders
+        collect_store_paths(
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-15.2.0",
+            &mut paths,
+        );
+        assert!(paths.is_empty(), "placeholder path should be rejected");
+    }
+
+    #[test]
+    fn collect_store_paths_mixed_valid_and_placeholder() {
+        let mut paths = HashSet::new();
+        let input = "-I/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-15.2.0/include \
+                      -L/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc/lib";
+        collect_store_paths(input, &mut paths);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc"));
     }
 
     #[test]
