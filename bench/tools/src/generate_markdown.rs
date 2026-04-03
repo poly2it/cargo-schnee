@@ -167,7 +167,11 @@ Build of [Just](https://github.com/casey/just) version 1.40.0. The incremental c
                     out,
                     "{}",
                     row(
-                        &[label, &fmt_duration(duration), &fmt_ratio(duration, cargo_clean)],
+                        &[
+                            label,
+                            &fmt_duration(duration),
+                            &fmt_ratio(duration, cargo_clean)
+                        ],
                         is_best,
                     )
                 )
@@ -179,7 +183,11 @@ Build of [Just](https://github.com/casey/just) version 1.40.0. The incremental c
                 out,
                 "{}",
                 row(
-                    &[label, &fmt_duration(duration), &fmt_ratio(duration, cargo_clean)],
+                    &[
+                        label,
+                        &fmt_duration(duration),
+                        &fmt_ratio(duration, cargo_clean)
+                    ],
                     is_best,
                 )
             )

@@ -2350,9 +2350,9 @@ fn main() -> Result<()> {
             let mut any_failed = false;
             for (_, _target_name, _, manifest_dir, bin_path) in &test_roots {
                 let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("test root has no binary output")
-                })?;
+                let binary_path = bin_path
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("test root has no binary output"))?;
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
                 let status = run_binary(binary_path, args, target, Some(&symlink_path))?;
                 if !status.success() {
@@ -2405,9 +2405,9 @@ fn main() -> Result<()> {
             let mut any_failed = false;
             for (_, _target_name, _, manifest_dir, bin_path) in &bench_roots {
                 let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("bench root has no binary output")
-                })?;
+                let binary_path = bin_path
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("bench root has no binary output"))?;
                 shell::status(
                     "Running",
                     &format!("benchmarks in `{}`", binary_path.display()),

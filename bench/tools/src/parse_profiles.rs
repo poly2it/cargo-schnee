@@ -133,7 +133,11 @@ pub fn run(dir: &str) {
         let mut cum = 0.0;
         for b in &builds[..show] {
             cum += b.time();
-            let pct = if total > 0.0 { cum / total * 100.0 } else { 0.0 };
+            let pct = if total > 0.0 {
+                cum / total * 100.0
+            } else {
+                0.0
+            };
             println!("  {:>7.1}s  {:>5.1}%  {}", b.time(), pct, b.name);
         }
         if builds.len() > show {
