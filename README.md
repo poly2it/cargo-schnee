@@ -22,22 +22,22 @@ Build of [Just](https://github.com/casey/just) version 1.40.0. The incremental c
 
 | Build system | Time | vs. cargo build |
 |---|---|---|
-| cargo build | 35.7s | baseline |
-| cargo-schnee | 49.5s | 1.4x |
-| buildRustPackage | 49.1s | 1.4x |
-| **crane** | **47.9s** | **1.3x** |
-| cargo2nix | 94.9s | 2.7x |
-| cargo2nix (w/pregeneration) | 93.8s | 2.6x |
+| cargo build | 37.8s | baseline |
+| cargo-schnee | 58.1s | 1.5x |
+| buildRustPackage | 47.5s | 1.3x |
+| **crane** | **44.5s** | **1.2x** |
+| cargo2nix | 100.8s | 2.7x |
+| cargo2nix (w/pregeneration) | 99.9s | 2.6x |
 
 #### Incremental build
 
 | Build system | Time | vs. cargo build | vs. clean |
 |---|---|---|---|
-| cargo build | 24.5s | baseline | 0.7x |
-| **cargo-schnee** | **18.7s** | **0.8x** | **0.4x** |
-| buildRustPackage | 54.7s | 2.2x | 1.1x |
-| crane | 44.1s | 1.8x | 0.9x |
-| cargo2nix | 34.5s | 1.4x | 0.4x |
+| cargo build | 33.0s | baseline | 0.9x |
+| **cargo-schnee** | **18.1s** | **0.5x** | **0.3x** |
+| buildRustPackage | 48.1s | 1.5x | 1.0x |
+| crane | 45.4s | 1.4x | 1.0x |
+| cargo2nix | 31.5s | 1.0x | 0.3x |
 
 ### Build system descriptions
 
