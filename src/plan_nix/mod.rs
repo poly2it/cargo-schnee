@@ -923,6 +923,7 @@ pub fn run_plan_nix(
                     &vendor_dir.to_string_lossy(),
                     &win_sdk_lib_dirs,
                     &win_sdk_closure,
+                    &src_str,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

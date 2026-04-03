@@ -50,6 +50,7 @@ pub(super) fn construct_derivation(
     vendor_store: &str,
     win_sdk_lib_dirs: &[String],
     win_sdk_closure: &[String],
+    src_store: &str,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let script = match unit.kind {
@@ -70,6 +71,7 @@ pub(super) fn construct_derivation(
             host_cfg_envs,
             custom_sys_env,
             passthru_envs,
+            src_store,
         )?,
         _ => {
             let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -492,6 +494,7 @@ fn build_run_script(
     host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
+    src_store: &str,
 ) -> Result<String> {
     // The build script compile derivation provides the binary
     let bs_compile_key = unit
@@ -631,8 +634,43 @@ fn build_run_script(
     // Remember the original (Nix store) manifest dir so we can rewrite
     // workdir paths back to it in the build script output.
     script.push_str("_orig_manifest_dir=$CARGO_MANIFEST_DIR && ");
-    script.push_str("_bs_workdir=$TMPDIR/workdir && ");
-    script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
+
+    // For local crates, copy the full source root (not just the crate dir)
+    // so that build scripts can access sibling crates and extra-includes
+    // files mapped via _parent/. The _parent/ directory is moved one level
+    // above the source root copy so that `..` traversal from the source root
+    // resolves to files originally outside the project directory.
+    let crate_rel = unit
+        .manifest_dir
+        .strip_prefix(src_store)
+        .map(|s| s.trim_start_matches('/'))
+        .filter(|s| !s.is_empty());
+    if let Some(crate_rel) = crate_rel {
+        script.push_str(&format!(
+            "_bs_src_root=$TMPDIR/workdir && cp -r --no-preserve=mode {}/. $_bs_src_root && ",
+            shell_quote(src_store),
+        ));
+        // Move _parent/ content one level above the source root copy so that
+        // relative `..` paths from the source root resolve correctly.
+        script.push_str(concat!(
+            "if [ -d $_bs_src_root/_parent ]; then ",
+            "cp -r --no-preserve=mode $_bs_src_root/_parent/. $TMPDIR/ && ",
+            "rm -rf $_bs_src_root/_parent; fi && ",
+        ));
+        script.push_str(&format!("_bs_workdir=$_bs_src_root/{} && ", crate_rel,));
+    } else {
+        script.push_str("_bs_workdir=$TMPDIR/workdir && ");
+        script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
+        // Handle _parent/ for workspace root crates (manifest_dir == src_store)
+        if unit.manifest_dir == src_store {
+            script.push_str(concat!(
+                "if [ -d $_bs_workdir/_parent ]; then ",
+                "cp -r --no-preserve=mode $_bs_workdir/_parent/. $TMPDIR/ && ",
+                "rm -rf $_bs_workdir/_parent; fi && ",
+            ));
+        }
+    }
+
     // Update CARGO_MANIFEST_DIR to the writable copy so build scripts that
     // read assets via std::env::var("CARGO_MANIFEST_DIR") get a writable path.
     script.push_str("export CARGO_MANIFEST_DIR=$_bs_workdir && ");

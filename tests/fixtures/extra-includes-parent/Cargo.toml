@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["my-crate"]
+
+[workspace.metadata.schnee]
+extra-includes = ["../extra-includes-parent-data/**"]

@@ -652,6 +652,36 @@ fn fixture_extra_includes() {
     );
 }
 
+/// Extra includes with _parent: a workspace whose extra-includes glob matches
+/// files outside the project directory. A build script in a member crate reads
+/// those files via relative paths from CARGO_MANIFEST_DIR. The files are mapped
+/// to _parent/ in the source store and must be accessible from the build script
+/// workdir.
+#[test]
+#[ignore]
+fn fixture_extra_includes_parent() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extra-includes-parent");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let binary = fixture_dir.join("target/debug/my-crate");
+    assert!(binary.exists(), "Binary not found at {}", binary.display());
+
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from parent data"),
+        "Unexpected output: {}",
+        stdout
+    );
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the

@@ -914,15 +914,27 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                         if !entry.is_file() {
                             continue;
                         }
-                        if let Ok(rel) = entry.strip_prefix(project_dir) {
+                        // Canonicalize the entry so that glob results containing
+                        // ".." are resolved before the strip_prefix check.
+                        // Without this, strip_prefix succeeds for paths like
+                        // "<project_dir>/../sibling/file" and classifies them
+                        // as inside the project (with a "../..." relative path
+                        // that escapes the store tree when joined with dest).
+                        let canon_entry = match entry.canonicalize() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let canon_proj = match project_dir.canonicalize() {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        if let Ok(rel) = canon_entry.strip_prefix(&canon_proj) {
                             // Inside project_dir — add to allowed files
                             if let Some(ref mut files) = allowed_files {
                                 files.insert(rel.to_path_buf());
                             }
                             count += 1;
-                        } else if let (Ok(canon_entry), Ok(canon_proj)) =
-                            (entry.canonicalize(), project_dir.canonicalize())
-                        {
+                        } else {
                             // Outside project_dir — compute _parent-based relative path
                             // Walk up from project_dir to find common ancestor, replacing
                             // each '..' with '_parent'.
