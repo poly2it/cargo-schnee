@@ -347,7 +347,15 @@ in
     inherit doCheck postCheck;
     preCheck = winePreCheck + preCheck;
 
-    postUnpack = (args.postUnpack or "") + extraSourcesScript;
+    # Skip nixpkgs' cargoSetupPostUnpackHook (cp -Lr + chmod -R of the vendor
+    # dir).  cargo-schnee reads $cargoDeps directly via --vendor-dir.
+    dontCargoSetupPostUnpack = true;
+
+    # Set cargoDepsCopy so cargoSetupPostPatchHook's Cargo.lock validation
+    # still works against the original (read-only) vendor path.
+    postUnpack = ''
+      export cargoDepsCopy="$cargoDeps"
+    '' + (args.postUnpack or "") + extraSourcesScript;
 
     postFixup = wrapBinariesScript + postFixup;
 

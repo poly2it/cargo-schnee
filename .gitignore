@@ -7,3 +7,8 @@
 .direnv
 profile*.txt
 result*
+*.qcow2
+bench/tools/target/
+bench/BENCHMARK.md
+bench/profiles/
+bench/results.json
