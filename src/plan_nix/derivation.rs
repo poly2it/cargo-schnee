@@ -635,38 +635,45 @@ fn build_run_script(
     // workdir paths back to it in the build script output.
     script.push_str("_orig_manifest_dir=$CARGO_MANIFEST_DIR && ");
 
-    // For local crates, copy the full source root (not just the crate dir)
-    // so that build scripts can access sibling crates and extra-includes
-    // files mapped via _parent/. The _parent/ directory is moved one level
-    // above the source root copy so that `..` traversal from the source root
-    // resolves to files originally outside the project directory.
+    // When extra-includes reference files outside the project directory,
+    // they are mapped under _parent/ in the source store. For build scripts
+    // to access these files via their original relative paths (e.g.
+    // ../../sibling/file from CARGO_MANIFEST_DIR), we place _parent/ content
+    // at the right position above the workdir so `..` traversal resolves.
+    //
+    // For a nested crate (manifest_dir = src_store + "/my-crate"), we nest
+    // the workdir at $TMPDIR/workdir/my-crate so that `../../X` resolves to
+    // $TMPDIR/X, then copy _parent/ content straight into $TMPDIR/.
+    // This copies only the crate dir + _parent files, not the full source root.
+    let has_parent = PathBuf::from(src_store).join("_parent").is_dir();
     let crate_rel = unit
         .manifest_dir
         .strip_prefix(src_store)
         .map(|s| s.trim_start_matches('/'))
         .filter(|s| !s.is_empty());
-    if let Some(crate_rel) = crate_rel {
+    if has_parent && crate_rel.is_some() {
+        let crate_rel = crate_rel.unwrap();
+        // Nest the crate copy so relative `..` paths land inside $TMPDIR.
         script.push_str(&format!(
-            "_bs_src_root=$TMPDIR/workdir && cp -r --no-preserve=mode {}/. $_bs_src_root && ",
+            "_bs_workdir=$TMPDIR/workdir/{cr} && mkdir -p $_bs_workdir && \
+             cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ",
+            cr = crate_rel,
+        ));
+        // Place _parent/ content at $TMPDIR/ so that traversing above the
+        // source root (e.g. ../../sibling/file) finds the right files.
+        script.push_str(&format!(
+            "cp -r --no-preserve=mode {}/_parent/. $TMPDIR/ && ",
             shell_quote(src_store),
         ));
-        // Move _parent/ content one level above the source root copy so that
-        // relative `..` paths from the source root resolve correctly.
-        script.push_str(concat!(
-            "if [ -d $_bs_src_root/_parent ]; then ",
-            "cp -r --no-preserve=mode $_bs_src_root/_parent/. $TMPDIR/ && ",
-            "rm -rf $_bs_src_root/_parent; fi && ",
-        ));
-        script.push_str(&format!("_bs_workdir=$_bs_src_root/{} && ", crate_rel,));
     } else {
         script.push_str("_bs_workdir=$TMPDIR/workdir && ");
         script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
-        // Handle _parent/ for workspace root crates (manifest_dir == src_store)
-        if unit.manifest_dir == src_store {
+        // For workspace root crates (manifest_dir == src_store), _parent/
+        // was included in the copy; move it one level up.
+        if has_parent {
             script.push_str(concat!(
-                "if [ -d $_bs_workdir/_parent ]; then ",
                 "cp -r --no-preserve=mode $_bs_workdir/_parent/. $TMPDIR/ && ",
-                "rm -rf $_bs_workdir/_parent; fi && ",
+                "rm -rf $_bs_workdir/_parent && ",
             ));
         }
     }

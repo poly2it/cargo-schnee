@@ -898,6 +898,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
     let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
     let mut extra_outside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, store_rel_path)
     if !extra_patterns.is_empty() {
+        let canon_proj = project_dir.canonicalize().ok();
         let mut count = 0usize;
         for pattern in &extra_patterns {
             // glob crate: `dir/**` only matches the dir itself (zero components).
@@ -924,11 +925,10 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                             Ok(c) => c,
                             Err(_) => continue,
                         };
-                        let canon_proj = match project_dir.canonicalize() {
-                            Ok(c) => c,
-                            Err(_) => continue,
+                        let Some(ref canon_proj) = canon_proj else {
+                            continue;
                         };
-                        if let Ok(rel) = canon_entry.strip_prefix(&canon_proj) {
+                        if let Ok(rel) = canon_entry.strip_prefix(canon_proj) {
                             // Inside project_dir — add to allowed files
                             if let Some(ref mut files) = allowed_files {
                                 files.insert(rel.to_path_buf());
