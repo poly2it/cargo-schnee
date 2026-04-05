@@ -404,6 +404,7 @@ pub fn run_plan_nix(
     target: &TargetConfig,
     user_intent: UserIntent,
     packages: &[String],
+    exclude: &[String],
     features: &[String],
     no_default_features: bool,
     passthru_envs: &[(String, String)],
@@ -514,12 +515,12 @@ pub fn run_plan_nix(
                     cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
                 )];
         }
-        // Package selection: -p/--package narrows the build to specific crates
+        // Package selection: -p/--package narrows the build to specific crates,
+        // --exclude removes crates from the default workspace set.
         if !packages.is_empty() {
             options.spec = ops::Packages::Packages(packages.to_vec());
-        } else if ws.is_virtual() {
-            // For virtual workspaces (no [package] in root), build all members
-            options.spec = ops::Packages::All(Vec::new());
+        } else if ws.is_virtual() || !exclude.is_empty() {
+            options.spec = ops::Packages::All(exclude.to_vec());
         }
 
         // Feature flags

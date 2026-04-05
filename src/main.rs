@@ -78,6 +78,9 @@ enum SchneeCommand {
         /// Package(s) to check (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -107,6 +110,9 @@ enum SchneeCommand {
         /// Package(s) to build (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -137,6 +143,9 @@ enum SchneeCommand {
         /// Package(s) to build (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -167,6 +176,9 @@ enum SchneeCommand {
         /// Package(s) to build (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -197,6 +209,9 @@ enum SchneeCommand {
         /// Package(s) to build (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -229,6 +244,9 @@ enum SchneeCommand {
         /// Package(s) to document (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -264,6 +282,9 @@ enum SchneeCommand {
         /// Package(s) to build (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -1658,6 +1679,7 @@ fn run_build_pipeline(
     profile_opt: &Option<String>,
     target: &Option<String>,
     packages: &[String],
+    exclude: &[String],
     features: &[String],
     no_default_features: bool,
     user_intent: UserIntent,
@@ -1762,15 +1784,17 @@ fn run_build_pipeline(
         _ => "build",
     };
     let packages_str = packages.join(",");
+    let exclude_str = exclude.join(",");
     let features_str = features.join(",");
     let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         lockfile_hash,
         manifest_hash,
         profile.name,
         target_config.target_triple,
         intent_str,
         packages_str,
+        exclude_str,
         features_str,
         no_default_features,
     );
@@ -1816,6 +1840,7 @@ fn run_build_pipeline(
         &target_config,
         user_intent,
         packages,
+        exclude,
         features,
         no_default_features,
         &passthru_envs,
@@ -2306,6 +2331,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
         } => {
@@ -2316,6 +2342,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Check { test: false },
@@ -2333,6 +2360,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
         } => {
@@ -2343,6 +2371,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Build,
@@ -2361,6 +2390,7 @@ fn main() -> Result<()> {
             ref target,
             ref bin,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
             ref args,
@@ -2372,6 +2402,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Build,
@@ -2430,6 +2461,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
             ref args,
@@ -2441,6 +2473,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Test,
@@ -2486,6 +2519,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
             ref args,
@@ -2497,6 +2531,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Bench,
@@ -2547,6 +2582,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
         } => {
@@ -2600,6 +2636,7 @@ fn main() -> Result<()> {
                 &target_config,
                 UserIntent::Build,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 &[],
@@ -2621,6 +2658,7 @@ fn main() -> Result<()> {
             ref profile,
             ref target,
             ref package,
+            ref exclude,
             ref features,
             no_default_features,
             no_deps,
@@ -2633,6 +2671,7 @@ fn main() -> Result<()> {
                 profile,
                 target,
                 package,
+                exclude,
                 features,
                 no_default_features,
                 UserIntent::Doc {
@@ -2715,6 +2754,7 @@ fn main() -> Result<()> {
                 &default_profile,
                 &default_target,
                 UserIntent::Build,
+                &[],
                 &[],
                 &[],
                 false,
