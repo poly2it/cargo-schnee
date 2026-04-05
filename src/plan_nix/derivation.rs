@@ -770,42 +770,47 @@ fn build_run_script(
     // workdir paths back to it in the build script output.
     script.push_str("_orig_manifest_dir=$CARGO_MANIFEST_DIR && ");
 
-    // When extra-includes reference files outside the project directory,
-    // they are mapped under _parent/ in the source store. For build scripts
-    // to access these files via their original relative paths (e.g.
-    // ../../sibling/file from CARGO_MANIFEST_DIR), we place _parent/ content
-    // at the right position above the workdir so `..` traversal resolves.
+    // Build scripts access files relative to CARGO_MANIFEST_DIR. For nested
+    // crates (manifest_dir = src_store + "/my-crate"), the workdir must
+    // mirror the workspace layout so that relative paths to sibling
+    // directories like "../spec/" resolve correctly. We copy the full
+    // workspace source tree into $TMPDIR/workdir/ and set the workdir to
+    // the crate's subdirectory within it.
     //
-    // For a nested crate (manifest_dir = src_store + "/my-crate"), we nest
-    // the workdir at $TMPDIR/workdir/my-crate so that `../../X` resolves to
-    // $TMPDIR/X, then copy _parent/ content straight into $TMPDIR/.
-    // This copies only the crate dir + _parent files, not the full source root.
+    // When extra-includes reference files outside the project directory,
+    // they are mapped under _parent/ in the source store. _parent/ content
+    // is moved to $TMPDIR/ so that paths traversing above the workspace
+    // root still resolve.
     let has_parent = PathBuf::from(src_store).join("_parent").is_dir();
     let crate_rel = unit
         .manifest_dir
         .strip_prefix(src_store)
         .map(|s| s.trim_start_matches('/'))
         .filter(|s| !s.is_empty());
-    if let Some(crate_rel) = crate_rel.filter(|_| has_parent) {
-        // Nest the crate copy so relative `..` paths land inside $TMPDIR.
+    if let Some(crate_rel) = crate_rel {
+        // Nested crate: copy the full workspace source so sibling paths
+        // like "../spec/" resolve from the crate's workdir.
         script.push_str(&format!(
-            "_bs_workdir=$TMPDIR/workdir/{cr} && mkdir -p $_bs_workdir && \
-             cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ",
+            "_bs_workdir=$TMPDIR/workdir/{cr} && \
+             cp -r --no-preserve=mode {src}/. $TMPDIR/workdir/ && ",
             cr = crate_rel,
+            src = shell_quote(src_store),
         ));
-        // Place _parent/ content at $TMPDIR/ so that traversing above the
-        // source root (e.g. ../../sibling/file) finds the right files.
-        script.push_str(&format!(
-            "cp -r --no-preserve=mode {}/_parent/. $TMPDIR/ && ",
-            shell_quote(src_store),
-        ));
+        if has_parent {
+            // Move _parent/ content one level above the workspace root
+            // so that paths traversing above it still resolve.
+            script.push_str(concat!(
+                "cp -r --no-preserve=mode $TMPDIR/workdir/_parent/. $TMPDIR/ && ",
+                "rm -rf $TMPDIR/workdir/_parent && ",
+            ));
+        }
     } else {
         script.push_str("_bs_workdir=$TMPDIR/workdir && ");
         script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
         // For workspace root crates (manifest_dir == src_store), _parent/
         // was included in the copy above; move it one level up.
-        // Only applies when the crate is actually local — vendored deps
-        // (whose manifest_dir is in the vendor store) never contain _parent/.
+        // Only applies when the crate is actually local; vendored deps
+        // whose manifest_dir is in the vendor store never contain _parent/.
         if has_parent && unit.manifest_dir == src_store {
             script.push_str(concat!(
                 "cp -r --no-preserve=mode $_bs_workdir/_parent/. $TMPDIR/ && ",
