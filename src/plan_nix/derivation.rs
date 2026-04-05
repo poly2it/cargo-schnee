@@ -30,6 +30,7 @@ pub(super) fn construct_derivation(
     dep_drv_map: &HashMap<String, String>,
     bash_path: &str,
     rustc_path: &str,
+    rustdoc_path: &str,
     proc_macro_rlib: &str,
     resolved_sysroot: &str,
     mkdir_path: &str,
@@ -51,8 +52,10 @@ pub(super) fn construct_derivation(
     win_sdk_lib_dirs: &[String],
     win_sdk_closure: &[String],
     src_store: &str,
+    document_private_items: bool,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
+    let coreutils_bin_dir = format!("{}/bin", coreutils_store);
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -73,23 +76,30 @@ pub(super) fn construct_derivation(
             passthru_envs,
             src_store,
         )?,
-        _ => {
-            let coreutils_bin_dir = format!("{}/bin", coreutils_store);
-            build_compile_script(
-                unit,
-                units,
-                key_to_idx,
-                dep_drv_map,
-                rustc_path,
-                proc_macro_rlib,
-                resolved_sysroot,
-                &coreutils_bin_dir,
-                cc_bin_dir,
-                profile,
-                target,
-                win_sdk_lib_dirs,
-            )?
-        }
+        UnitKind::Doc => build_doc_script(
+            unit,
+            units,
+            key_to_idx,
+            dep_drv_map,
+            rustdoc_path,
+            resolved_sysroot,
+            &coreutils_bin_dir,
+            document_private_items,
+        )?,
+        _ => build_compile_script(
+            unit,
+            units,
+            key_to_idx,
+            dep_drv_map,
+            rustc_path,
+            proc_macro_rlib,
+            resolved_sysroot,
+            &coreutils_bin_dir,
+            cc_bin_dir,
+            profile,
+            target,
+            win_sdk_lib_dirs,
+        )?,
     };
 
     // env
@@ -475,6 +485,131 @@ fn build_compile_script(
     Ok(script)
 }
 
+/// Build the shell script for a rustdoc documentation derivation.
+#[allow(clippy::too_many_arguments)]
+fn build_doc_script(
+    unit: &NixUnit,
+    units: &[NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+    dep_drv_map: &HashMap<String, String>,
+    rustdoc_path: &str,
+    resolved_sysroot: &str,
+    coreutils_bin_dir: &str,
+    document_private_items: bool,
+) -> Result<String> {
+    let mut parts = vec![
+        // Source file
+        shell_quote(&unit.source_file),
+        // --sysroot
+        "--sysroot".into(),
+        resolved_sysroot.to_string(),
+        // --crate-name
+        "--crate-name".into(),
+        unit.crate_name.clone(),
+        // --edition
+        "--edition".into(),
+        unit.edition.clone(),
+    ];
+
+    // --crate-type
+    for ct in &unit.crate_types {
+        parts.push("--crate-type".into());
+        parts.push(ct.clone());
+    }
+
+    // --output: rustdoc writes HTML to this directory
+    parts.push("--output".into());
+    parts.push("$out/doc".into());
+
+    // --cfg feature="X"
+    for feat in &unit.features {
+        parts.push("--cfg".into());
+        parts.push(shell_quote(&format!("feature=\"{}\"", feat)));
+    }
+
+    // --cap-lints allow for dependency crates
+    if !unit.is_local {
+        parts.push("--cap-lints".into());
+        parts.push("allow".into());
+    }
+
+    // JSON diagnostics
+    parts.push("--error-format=json".into());
+    parts.push("--json=diagnostic-rendered-ansi".into());
+
+    // --document-private-items if requested
+    if document_private_items && unit.is_local {
+        parts.push("--document-private-items".into());
+    }
+
+    // -C metadata (rustdoc uses this for cross-crate link stability)
+    parts.push("-C".into());
+    parts.push(format!("metadata={}", &unit.extra_filename[1..]));
+
+    // --extern deps — point to .rmeta/.rlib from dependency compile outputs
+    for (extern_name, dep_key) in &unit.dep_extern {
+        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
+            let dep_unit = &units[key_to_idx[dep_key]];
+            let placeholder = downstream_placeholder(dep_drv, "out")?;
+            let filename = dep_unit.output_lib_filename();
+            parts.push("--extern".into());
+            parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
+        }
+    }
+
+    // -L dependency= for transitive deps
+    for dep_key in &unit.all_dep_keys {
+        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
+            let placeholder = downstream_placeholder(dep_drv, "out")?;
+            parts.push("-L".into());
+            parts.push(format!("dependency={}", placeholder));
+        }
+    }
+
+    // Build the script
+    let mut script = String::new();
+
+    // Initialize EXTRA_ARGS for build script directives
+    script.push_str(r#"EXTRA_ARGS="" && "#);
+
+    // Parse build script output if we depend on one
+    if let Some(ref bs_key) = unit.build_script_dep
+        && let Some(bs_drv) = dep_drv_map.get(bs_key)
+    {
+        let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
+        script.push_str(&format!(
+            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; export "${{kv%%=*}}=${{kv#*=}}" ;; esac; done < {ph}/output; fi && "#,
+            ph = bs_placeholder,
+        ));
+    }
+
+    // Set cargo env vars
+    for (k, v) in &unit.cargo_envs {
+        script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
+    }
+    script.push_str(&format!(
+        "export CARGO_MANIFEST_DIR={} && ",
+        shell_quote(&unit.manifest_dir)
+    ));
+
+    let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
+    let cat_path = format!("{}/cat", coreutils_bin_dir);
+    script.push_str(&format!(
+        "{} -p $out/doc && {} {}",
+        shell_quote(&mkdir_path),
+        shell_quote(rustdoc_path),
+        parts.join(" "),
+    ));
+
+    // Append $EXTRA_ARGS and capture diagnostics
+    script.push_str(&format!(
+        " $EXTRA_ARGS 2>$out/diagnostics; __rs=$?; {} $out/diagnostics >&2; exit $__rs",
+        shell_quote(&cat_path),
+    ));
+
+    Ok(script)
+}
+
 /// Build the shell script for running a build script.
 #[allow(clippy::too_many_arguments)]
 fn build_run_script(
@@ -849,5 +984,201 @@ mod tests {
     #[test]
     fn downstream_placeholder_short_path() {
         assert!(downstream_placeholder("/nix/store/short", "out").is_err());
+    }
+
+    // -- build_doc_script tests --------------------------------------------------
+
+    fn make_doc_unit(
+        name: &str,
+        features: &[&str],
+        deps: &[(&str, &str)],
+        is_local: bool,
+    ) -> NixUnit {
+        NixUnit {
+            key: format!("{}-doc", name),
+            drv_name: format!("{}-0.1.0-{}-doc", name, name),
+            kind: UnitKind::Doc,
+            source_file: format!("/nix/store/fake-src/{}/src/lib.rs", name),
+            crate_name: name.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".into(),
+            features: features.iter().map(|f| f.to_string()).collect(),
+            dep_extern: deps
+                .iter()
+                .map(|(ext, key)| (ext.to_string(), key.to_string()))
+                .collect(),
+            all_dep_keys: Vec::new(),
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("/nix/store/fake-src/{}", name),
+            original_manifest_dir: String::new(),
+            cargo_envs: vec![("CARGO_PKG_NAME".into(), name.into())],
+            extra_filename: "-abc123".into(),
+            needs_linker: false,
+            is_local,
+            links: None,
+            links_dep_keys: Vec::new(),
+            is_root: true,
+            target_name: name.to_string(),
+            for_host: false,
+            drv_path: None,
+        }
+    }
+
+    #[test]
+    fn build_doc_script_basic_structure() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+        )
+        .unwrap();
+
+        // Must invoke rustdoc, not rustc
+        assert!(script.contains("/nix/store/rustdoc-bin/bin/rustdoc"));
+        assert!(!script.contains("rustc"));
+        // Must include --output $out/doc
+        assert!(script.contains("--output $out/doc"));
+        // Must include --crate-name
+        assert!(script.contains("--crate-name my_lib"));
+        // Must include --edition
+        assert!(script.contains("--edition 2021"));
+        // Must include --crate-type
+        assert!(script.contains("--crate-type lib"));
+        // Must include --sysroot
+        assert!(script.contains("--sysroot /nix/store/rust-sysroot"));
+        // Must create $out/doc directory
+        assert!(script.contains("mkdir"));
+        assert!(script.contains("$out/doc"));
+        // Must NOT have --emit (rustdoc doesn't use it)
+        assert!(!script.contains("--emit"));
+        // Must NOT have optimization flags
+        assert!(!script.contains("opt-level"));
+        // Must capture diagnostics
+        assert!(script.contains("diagnostics"));
+        // Must NOT have --document-private-items
+        assert!(!script.contains("--document-private-items"));
+    }
+
+    #[test]
+    fn build_doc_script_private_items() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            true,
+        )
+        .unwrap();
+
+        assert!(script.contains("--document-private-items"));
+    }
+
+    #[test]
+    fn build_doc_script_private_items_skipped_for_deps() {
+        let unit = make_doc_unit("serde", &[], &[], false);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("serde-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            true,
+        )
+        .unwrap();
+
+        // --document-private-items should only apply to local crates
+        assert!(!script.contains("--document-private-items"));
+    }
+
+    #[test]
+    fn build_doc_script_with_features() {
+        let unit = make_doc_unit("my-lib", &["serde", "async"], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+        )
+        .unwrap();
+
+        assert!(script.contains(r#"--cfg 'feature="serde"'"#));
+        assert!(script.contains(r#"--cfg 'feature="async"'"#));
+    }
+
+    #[test]
+    fn build_doc_script_cap_lints_for_deps() {
+        let unit = make_doc_unit("serde", &[], &[], false);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("serde-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+        )
+        .unwrap();
+
+        assert!(script.contains("--cap-lints allow"));
+    }
+
+    #[test]
+    fn build_doc_script_no_cap_lints_for_local() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+        )
+        .unwrap();
+
+        assert!(!script.contains("--cap-lints"));
     }
 }

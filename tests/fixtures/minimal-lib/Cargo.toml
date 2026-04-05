@@ -1,0 +1,6 @@
+[workspace]
+
+[package]
+name = "minimal-lib"
+version = "0.1.0"
+edition = "2021"

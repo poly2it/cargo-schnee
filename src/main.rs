@@ -209,8 +209,39 @@ enum SchneeCommand {
     },
     /// Run clippy lints on the project (not yet implemented)
     Clippy,
-    /// Build documentation (not yet implemented)
-    Doc,
+    /// Build documentation via rustdoc
+    Doc {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Build artifacts in release mode, with optimizations
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to document (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+        /// Do not document dependencies
+        #[arg(long)]
+        no_deps: bool,
+        /// Document private items
+        #[arg(long)]
+        document_private_items: bool,
+    },
     /// Automatically apply lint suggestions (not yet implemented)
     Fix,
     /// Dump the Nix derivation graph as a Mermaid flowchart
@@ -255,6 +286,37 @@ enum SchneeCommand {
         #[arg(long)]
         vendor_dir: PathBuf,
     },
+}
+
+/// Recursively copy the contents of `src_dir` into `dst_dir`, overwriting
+/// existing files. Creates subdirectories as needed. Destination files are
+/// made writable (nix store sources are read-only).
+fn copy_dir_recursive(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest = dst_dir.join(entry.file_name());
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            // Remove read-only destination (e.g. from a previous nix store copy)
+            if dest.exists() {
+                let _ = std::fs::remove_file(&dest);
+            }
+            std::fs::copy(entry.path(), &dest)?;
+            // Ensure the copy is writable so future overwrites succeed
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(&dest)?;
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o644);
+                std::fs::set_permissions(&dest, perms)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_manifest(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
@@ -1438,6 +1500,7 @@ fn write_profile(
                     shell::DrvKind::BuildScriptCompile => " (build script)",
                     shell::DrvKind::TestCompile => " (test)",
                     shell::DrvKind::Check => " (check)",
+                    shell::DrvKind::Doc => " (doc)",
                     shell::DrvKind::Compile => "",
                 };
                 let label = if version.is_empty() {
@@ -1602,6 +1665,7 @@ fn run_build_pipeline(
     verbose: u8,
     write_profile_to: &Option<PathBuf>,
     interrupted: &Arc<AtomicBool>,
+    document_private_items: bool,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1694,6 +1758,7 @@ fn run_build_pipeline(
         UserIntent::Check { .. } => "check",
         UserIntent::Test => "test",
         UserIntent::Bench => "bench",
+        UserIntent::Doc { .. } => "doc",
         _ => "build",
     };
     let packages_str = packages.join(",");
@@ -1755,6 +1820,7 @@ fn run_build_pipeline(
         no_default_features,
         &passthru_envs,
         Some(project_dir),
+        document_private_items,
     )?;
 
     // Update unit graph cache
@@ -1856,6 +1922,23 @@ fn run_build_pipeline(
                         };
                         progress.clear();
                         shell::status("Checking", &msg);
+                    }
+                }
+                shell::DrvKind::Doc => {
+                    let display_key = format!("{}-{}-doc", pkg, version);
+                    if seen_pkgs.insert(display_key) {
+                        let is_project = project_pkg_name.as_deref() == Some(&pkg);
+                        let msg = if !version.is_empty() {
+                            if is_project {
+                                format!("{} v{} ({})", pkg, version, project_dir.display())
+                            } else {
+                                format!("{} v{}", pkg, version)
+                            }
+                        } else {
+                            pkg.clone()
+                        };
+                        progress.clear();
+                        shell::status("Documenting", &msg);
                     }
                 }
                 shell::DrvKind::BuildScriptRun if verbose > 0 => {
@@ -1993,6 +2076,12 @@ fn run_build_pipeline(
                 root_drvs.len()
             )
         })?;
+
+        // Doc derivation outputs are handled separately (merged into target/doc/)
+        if matches!(kind, plan_nix::UnitKind::Doc) {
+            root_bin_paths.push(None);
+            continue;
+        }
 
         let mut bin_file = None;
         let is_windows_target = target_config.is_windows();
@@ -2234,6 +2323,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
             )?;
         }
         SchneeCommand::Build {
@@ -2260,6 +2350,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
             )?;
         }
         SchneeCommand::Run {
@@ -2288,6 +2379,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
             )?;
 
             // Find the binary to run
@@ -2356,6 +2448,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
             )?;
 
             // Find test binaries (TestCompile roots)
@@ -2411,6 +2504,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
             )?;
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
@@ -2510,6 +2604,7 @@ fn main() -> Result<()> {
                 no_default_features,
                 &[],
                 Some(project_dir),
+                false,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -2519,8 +2614,80 @@ fn main() -> Result<()> {
                 "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
             );
         }
-        SchneeCommand::Doc => {
-            anyhow::bail!("cargo schnee doc is not yet implemented (needs rustdoc integration)");
+        SchneeCommand::Doc {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref features,
+            no_default_features,
+            no_deps,
+            document_private_items,
+        } => {
+            let result = run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                features,
+                no_default_features,
+                UserIntent::Doc {
+                    deps: !no_deps,
+                    json: false,
+                },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &interrupted,
+                document_private_items,
+            )?;
+
+            // Merge doc outputs into target/doc/
+            let target_doc = result.target_debug.parent().unwrap().join("doc");
+            std::fs::create_dir_all(&target_doc)?;
+
+            let doc_roots: Vec<_> = result
+                .root_drvs
+                .iter()
+                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::Doc))
+                .collect();
+
+            for (_, target_name, _, _, _) in &doc_roots {
+                shell::status("Documenting", target_name);
+            }
+
+            // Each doc derivation output has $out/doc/<crate_name>/ and
+            // $out/doc/static.files/. Merge them into target/doc/.
+            let out_paths: Vec<String> = {
+                let mut cmd = Command::new("nix-store");
+                cmd.arg("--realise");
+                for (drv_path, _, kind, _, _) in &result.root_drvs {
+                    if matches!(kind, plan_nix::UnitKind::Doc) {
+                        cmd.arg(drv_path);
+                    }
+                }
+                let output = cmd
+                    .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+                    .output()
+                    .context("Failed to resolve doc derivation outputs")?;
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            };
+
+            for out_path in &out_paths {
+                let doc_dir = Path::new(out_path).join("doc");
+                if !doc_dir.exists() {
+                    continue;
+                }
+                copy_dir_recursive(&doc_dir, &target_doc)?;
+            }
         }
         SchneeCommand::Fix => {
             anyhow::bail!("cargo schnee fix is not yet implemented (needs rustfix integration)");
@@ -2553,6 +2720,7 @@ fn main() -> Result<()> {
                 false,
                 &[],
                 None,
+                false,
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {
@@ -2796,5 +2964,53 @@ version = "1.2.3"
             "workspace.exclude should contain 'my-lib': {:?}",
             exclude_strs
         );
+    }
+
+    // -- copy_dir_recursive tests -----------------------------------------------
+
+    #[test]
+    fn copy_dir_recursive_flat_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "aaa").unwrap();
+        std::fs::write(src.path().join("b.txt"), "bbb").unwrap();
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "aaa");
+        assert_eq!(std::fs::read_to_string(dst.path().join("b.txt")).unwrap(), "bbb");
+    }
+
+    #[test]
+    fn copy_dir_recursive_nested_dirs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("sub/deep")).unwrap();
+        std::fs::write(src.path().join("sub/deep/file.txt"), "nested").unwrap();
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("sub/deep/file.txt")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_overwrites_existing() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("file.txt"), "old").unwrap();
+        std::fs::write(src.path().join("file.txt"), "new").unwrap();
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("file.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_empty_dir() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+        // No error, destination remains valid
+        assert!(dst.path().exists());
     }
 }

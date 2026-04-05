@@ -11,6 +11,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 /// Guards to serialize tests that share a fixture directory.
 /// Without this, parallel test runs race on clean_target / build / read.
 static MINIMAL_BIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static MINIMAL_LIB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lock(m: &'static LazyLock<Mutex<()>>) -> MutexGuard<'static, ()> {
@@ -1124,4 +1125,56 @@ fn fixture_lib_bin_integration_test() {
 
     clean_target(&fixture_dir);
     run_schnee_test(&manifest);
+}
+
+// ---------------------------------------------------------------------------
+// Doc tests
+// ---------------------------------------------------------------------------
+
+/// Basic doc generation: `cargo schnee doc` on a minimal library.
+/// Verifies that target/doc/<crate_name>/index.html is produced.
+#[test]
+#[ignore]
+fn fixture_minimal_lib_doc() {
+    let _guard = lock(&MINIMAL_LIB_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd("doc", &manifest, &["--no-deps"]);
+
+    let doc_index = fixture_dir.join("target/doc/minimal_lib/index.html");
+    assert!(
+        doc_index.exists(),
+        "Doc index not found at {}",
+        doc_index.display()
+    );
+}
+
+/// Doc generation with --document-private-items flag.
+#[test]
+#[ignore]
+fn fixture_minimal_lib_doc_private_items() {
+    let _guard = lock(&MINIMAL_LIB_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd("doc", &manifest, &["--no-deps", "--document-private-items"]);
+
+    let doc_index = fixture_dir.join("target/doc/minimal_lib/index.html");
+    assert!(
+        doc_index.exists(),
+        "Doc index not found at {}",
+        doc_index.display()
+    );
+
+    // With private items, the private fn `helper` should appear in the docs
+    let doc_content = std::fs::read_to_string(&doc_index).unwrap();
+    assert!(
+        doc_content.contains("helper"),
+        "Private fn 'helper' should appear in docs with --document-private-items"
+    );
 }

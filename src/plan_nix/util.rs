@@ -28,6 +28,10 @@ pub(super) fn which_rustc() -> Result<PathBuf> {
     which_command("rustc")
 }
 
+pub(super) fn which_rustdoc() -> Result<PathBuf> {
+    which_command("rustdoc")
+}
+
 pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
