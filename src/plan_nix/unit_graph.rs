@@ -38,10 +38,6 @@ pub(super) fn extract_units_from_bcx(
             if u.mode == CompileMode::Doc && !is_doc_intent {
                 return false;
             }
-            // When documenting, drop Check units (doc doesn't need metadata-only)
-            if is_doc_intent && matches!(u.mode, CompileMode::Check { .. }) {
-                return false;
-            }
             true
         })
         .cloned()
