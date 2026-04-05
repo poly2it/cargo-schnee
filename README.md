@@ -160,11 +160,12 @@ identity string. This key is used to reference dependencies between units and
 to look up derivation store paths during construction. It is stable across
 builds with the same `Cargo.lock` and `Cargo.toml`.
 
-Units exist in four kinds:
+Units exist in five kinds:
 
 | Kind | Meaning |
 |------|---------|
 | `Compile` | Regular `rustc` invocation (lib, bin, proc-macro, cdylib, dylib) |
+| `Doc` | Documentation generation via `rustdoc` |
 | `TestCompile` | Compilation with `--test` flag (test/bench harness) |
 | `BuildScriptCompile` | Compile a `build.rs` into a binary |
 | `BuildScriptRun` | Execute the compiled `build.rs`, capturing its `cargo:` stdout |
@@ -431,9 +432,10 @@ cross builds. Permissions are adjusted from the Nix store's read-only
 
 The recommended way to use cargo-schnee is through a cargo wrapper that
 transparently redirects `cargo build`, `cargo check`, `cargo run`, `cargo test`,
-and `cargo bench` to their `cargo schnee` equivalents. The wrapper also forwards
-`-p`/`--package`, `--features`, `--bin`, `--no-default-features`,
-`--manifest-path`, `--target`, and `--profile`. The
+`cargo bench`, and `cargo doc` to their `cargo schnee` equivalents. The wrapper
+also forwards `-p`/`--package`, `--features`, `--bin`, `--no-default-features`,
+`--manifest-path`, `--target`, and `--profile`. For `cargo doc`, the wrapper
+additionally forwards `--no-deps` and `--document-private-items`. The
 [simple example](examples/simple/) demonstrates this approach with a
 `devShell` and both packaging methods described below. For development shells, create the wrapper via
 `makeCargoWrapper`:
@@ -456,12 +458,14 @@ in {
 # With the wrapper, regular cargo commands use cargo-schnee automatically.
 cargo build
 cargo check
+cargo doc
 cargo build --release
 cargo build --profile bench
 
 # Or invoke cargo-schnee directly.
 cargo schnee build --manifest-path path/to/Cargo.toml
 cargo schnee check --manifest-path path/to/Cargo.toml
+cargo schnee doc --manifest-path path/to/Cargo.toml --no-deps
 cargo schnee run --manifest-path path/to/Cargo.toml -- --arg1 value
 cargo schnee test --manifest-path path/to/Cargo.toml -- --test-threads=1
 cargo schnee bench --manifest-path path/to/Cargo.toml
@@ -474,6 +478,9 @@ cargo build -p my-crate
 
 # Build with specific features.
 cargo build --features serde,json --no-default-features
+
+# Generate docs for workspace crates only, including private items.
+cargo doc --no-deps --document-private-items
 ```
 
 The `--vendor-dir` flag is available on all subcommands for providing a pre-vendored directory
@@ -730,6 +737,48 @@ for a workspace example,
 cross-compilation, and
 [`examples/build-package-cross-windows/`](examples/build-package-cross-windows/)
 for Windows cross-compilation.
+
+### Documentation with `lib.buildDoc`
+
+`lib.buildDoc` generates rustdoc HTML documentation via cargo-schnee. It
+shares the same source setup as `buildPackage`, including vendoring, toolchain
+wrapping, `extraSources`, and `passthruEnv`, but runs `cargo doc` instead of
+`cargo build` and installs the HTML output to `$out/share/doc`.
+
+```nix
+cargo-schnee.lib.buildDoc {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+}
+```
+
+Doc-specific options:
+
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `noDeps` | `true` | Only document workspace crates, not dependencies. |
+| `documentPrivateItems` | `false` | Include private items in generated documentation. |
+
+For workspaces with build scripts that reference files outside the project
+tree via `extra-includes`, pass the same `extraSources` as the build
+derivation so that build scripts can resolve those paths.
+
+```nix
+cargo-schnee.lib.buildDoc {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  extraSources = {
+    "../spec" = ../spec;
+  };
+}
+```
+
+All other `buildPackage` attributes are supported: `package`, `rustToolchain`,
+`nativeBuildInputs`, `buildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`,
+`preBuild`, `postBuild`, `postInstall`, and `meta`.
+
+See [`examples/build-package/nix/packages/doc.nix`](examples/build-package/nix/packages/doc.nix)
+for a workspace example.
 
 ### Packaging with `buildRustPackage`
 
