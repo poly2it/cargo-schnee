@@ -767,6 +767,30 @@ pub fn run_plan_nix(
         closure_store_paths.push(store.clone());
     }
 
+    // passthruEnv values may reference store paths (e.g. LIBCLANG_PATH).
+    // Their closures must be available in build-script-run sandboxes.
+    let mut passthru_store_roots: Vec<String> = Vec::new();
+    for (_name, value) in passthru_envs {
+        for segment in value.split(':') {
+            if let Some(after_prefix) = segment.strip_prefix("/nix/store/")
+                && let Some(end) = after_prefix.find('/')
+            {
+                let store_root = format!("/nix/store/{}", &after_prefix[..end]);
+                if !passthru_store_roots.contains(&store_root) {
+                    passthru_store_roots.push(store_root.clone());
+                    closure_store_paths.push(store_root);
+                }
+            } else if segment.starts_with("/nix/store/") {
+                // Value is the store path itself, without a trailing subpath.
+                let store_root = segment.to_string();
+                if !passthru_store_roots.contains(&store_root) {
+                    passthru_store_roots.push(store_root.clone());
+                    closure_store_paths.push(store_root);
+                }
+            }
+        }
+    }
+
     // Deduplicate
     closure_store_paths.sort();
     closure_store_paths.dedup();
@@ -850,6 +874,20 @@ pub fn run_plan_nix(
         for p in closure {
             if !sys_build_closure.contains(p) {
                 sys_build_closure.push(p.clone());
+            }
+        }
+    }
+
+    // Build closure for passthruEnv store paths so that libraries like
+    // libclang and their transitive dependencies are available in build
+    // script sandboxes.
+    let mut passthru_closure: Vec<String> = Vec::new();
+    for root in &passthru_store_roots {
+        if let Some(closure) = closure_cache.get(root) {
+            for p in closure {
+                if !passthru_closure.contains(p) {
+                    passthru_closure.push(p.clone());
+                }
             }
         }
     }
@@ -942,6 +980,7 @@ pub fn run_plan_nix(
                     &win_sdk_closure,
                     &src_str,
                     document_private_items,
+                    &passthru_closure,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

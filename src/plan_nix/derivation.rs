@@ -53,6 +53,7 @@ pub(super) fn construct_derivation(
     win_sdk_closure: &[String],
     src_store: &str,
     document_private_items: bool,
+    passthru_closure: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -204,6 +205,13 @@ pub(super) fn construct_derivation(
     // paths pointing into the vendor store (e.g. pre-built .lib files).
     if (unit.kind == UnitKind::BuildScriptRun || unit.needs_linker) && !vendor_store.is_empty() {
         input_srcs.insert(vendor_store.to_string());
+    }
+    // passthruEnv values may reference store paths whose closures must be
+    // available in build-script-run sandboxes (e.g. LIBCLANG_PATH).
+    if unit.kind == UnitKind::BuildScriptRun {
+        for path in passthru_closure {
+            input_srcs.insert(path.clone());
+        }
     }
 
     collect_store_paths(&script, &mut input_srcs);
