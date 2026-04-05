@@ -150,13 +150,13 @@
         in {
           check = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee check";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           build = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee build";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" "--bin" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" "--bin" ];
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
             postRun = ''
@@ -181,25 +181,25 @@
           };
           run = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee run";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" "--bin" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" "--bin" ];
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           test = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee test";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           bench = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee bench";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
           doc = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee doc";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
             boolArgs = [ "--no-default-features" "--no-deps" "--document-private-items" ];
             setup = schneeSetup;
           };
