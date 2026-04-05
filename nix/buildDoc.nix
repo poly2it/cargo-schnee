@@ -1,8 +1,8 @@
 # lib.buildDoc — build rustdoc documentation via cargo-schnee.
 #
-# Shares the same source setup as buildPackage (vendoring, extraSources,
-# toolchain wrapping) but runs `cargo doc` instead of `cargo build` and
-# installs the generated HTML into $out/share/doc.
+# Shares the same source setup as buildPackage, including vendoring,
+# extraSources, and toolchain wrapping, but runs `cargo doc` instead of
+# `cargo build` and installs the generated HTML into $out/share/doc.
 { self }:
 
 {
