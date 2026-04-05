@@ -519,8 +519,10 @@ pub fn run_plan_nix(
         // --exclude removes crates from the default workspace set.
         if !packages.is_empty() {
             options.spec = ops::Packages::Packages(packages.to_vec());
-        } else if ws.is_virtual() || !exclude.is_empty() {
-            options.spec = ops::Packages::All(exclude.to_vec());
+        } else if !exclude.is_empty() {
+            options.spec = ops::Packages::OptOut(exclude.to_vec());
+        } else if ws.is_virtual() {
+            options.spec = ops::Packages::All(Vec::new());
         }
 
         // Feature flags
