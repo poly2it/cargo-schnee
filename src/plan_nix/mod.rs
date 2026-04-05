@@ -18,6 +18,7 @@ use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_command, which_command_no_deref, which_rustc,
+    which_rustdoc,
 };
 
 use anyhow::{Context, Result};
@@ -152,6 +153,8 @@ pub enum UnitKind {
     Compile,
     /// Metadata-only check (--emit=metadata, no codegen)
     Check,
+    /// Documentation generation via rustdoc
+    Doc,
     /// Compilation with --test (test/bench harness)
     TestCompile,
     /// Compilation of a build script binary
@@ -231,6 +234,11 @@ impl NixUnit {
         if self.kind == UnitKind::Check {
             return format!("lib{}{}.rmeta", self.crate_name, self.extra_filename);
         }
+        // Doc mode outputs HTML directories, not linkable artifacts.
+        // This shouldn't be called for Doc units, but return a sentinel.
+        if self.kind == UnitKind::Doc {
+            return format!("doc/{}", self.crate_name);
+        }
         if self.crate_types.iter().any(|ct| ct == "bin")
             || self.kind == UnitKind::BuildScriptCompile
         {
@@ -270,6 +278,7 @@ pub fn local_compile_drv_paths(units: &[NixUnit]) -> Vec<&str> {
                     u.kind,
                     UnitKind::Compile
                         | UnitKind::Check
+                        | UnitKind::Doc
                         | UnitKind::TestCompile
                         | UnitKind::BuildScriptCompile
                 )
@@ -399,6 +408,7 @@ pub fn run_plan_nix(
     no_default_features: bool,
     passthru_envs: &[(String, String)],
     project_dir: Option<&Path>,
+    document_private_items: bool,
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -524,7 +534,7 @@ pub fn run_plan_nix(
         // Extract unit graph and target cfg — NO compilation happens here
         let interner = UnitInterner::new();
         let bcx = ops::create_bcx(&ws, &options, &interner, None)?;
-        let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir)?;
+        let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir, user_intent)?;
         let bcx_cfg_envs =
             extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
         let bcx_host_cfg_envs = if target.is_cross() {
@@ -561,6 +571,12 @@ pub fn run_plan_nix(
     // Resolve tool paths
     let rustc_path = which_rustc()?;
     let rustc_str = rustc_path.to_string_lossy().to_string();
+    let rustdoc_str = if user_intent.is_doc() {
+        let rustdoc_path = which_rustdoc()?;
+        rustdoc_path.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
 
     // Query rustc for its sysroot — this works with wrapper scripts (nixpkgs'
     // rustc-wrapper) where the binary's store path differs from the sysroot.
@@ -903,6 +919,7 @@ pub fn run_plan_nix(
                     &dep_drv_map,
                     &bash_path,
                     &rustc_str,
+                    &rustdoc_str,
                     &proc_macro_rlib,
                     &rustc_store,
                     &mkdir_path,
@@ -924,6 +941,7 @@ pub fn run_plan_nix(
                     &win_sdk_lib_dirs,
                     &win_sdk_closure,
                     &src_str,
+                    document_private_items,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

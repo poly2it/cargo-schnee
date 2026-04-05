@@ -19,6 +19,7 @@ pub fn status(label: &str, message: &str) {
 pub enum DrvKind {
     Compile,
     Check,
+    Doc,
     TestCompile,
     BuildScriptCompile,
     BuildScriptRun,
@@ -48,6 +49,8 @@ pub fn parse_drv_display(drv_path: &str) -> (String, String, DrvKind) {
         (n, DrvKind::TestCompile)
     } else if let Some(n) = name.strip_suffix("-check") {
         (n, DrvKind::Check)
+    } else if let Some(n) = name.strip_suffix("-doc") {
+        (n, DrvKind::Doc)
     } else {
         (name, DrvKind::Compile)
     };
@@ -126,6 +129,36 @@ mod tests {
         assert_eq!(pkg, "my-crate-target");
         assert!(ver.is_empty());
         assert_eq!(kind, DrvKind::Compile);
+    }
+
+    #[test]
+    fn parse_drv_display_doc() {
+        let (pkg, ver, kind) = parse_drv_display(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-my-lib-0.1.0-my-lib-doc.drv",
+        );
+        assert_eq!(pkg, "my-lib");
+        assert_eq!(ver, "0.1.0");
+        assert_eq!(kind, DrvKind::Doc);
+    }
+
+    #[test]
+    fn parse_drv_display_check() {
+        let (pkg, ver, kind) = parse_drv_display(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-serde-1.0.210-serde-check.drv",
+        );
+        assert_eq!(pkg, "serde");
+        assert_eq!(ver, "1.0.210");
+        assert_eq!(kind, DrvKind::Check);
+    }
+
+    #[test]
+    fn parse_drv_display_test() {
+        let (pkg, ver, kind) = parse_drv_display(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-my-lib-0.1.0-my-lib-test.drv",
+        );
+        assert_eq!(pkg, "my-lib");
+        assert_eq!(ver, "0.1.0");
+        assert_eq!(kind, DrvKind::TestCompile);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use super::{NixUnit, UnitKind};
 use anyhow::Result;
 use cargo::core::FeatureValue;
 use cargo::core::compiler::{CompileKind, CompileMode, Unit};
+use cargo::util::command_prelude::UserIntent;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -14,6 +15,7 @@ pub(super) fn extract_units_from_bcx(
     roots: &[Unit],
     src: &Path,
     vendor_dir: &Path,
+    user_intent: UserIntent,
 ) -> Result<Vec<NixUnit>> {
     let src_str = src.to_string_lossy();
     let vendor_str = vendor_dir.to_string_lossy();
@@ -22,18 +24,25 @@ pub(super) fn extract_units_from_bcx(
     // Cargo can create multiple Unit entries for the same crate with different
     // dep_hash/profile values — they compile to the same output, so we merge them.
     let mut key_map: HashMap<Unit, String> = HashMap::new();
+    let is_doc_intent = user_intent.is_doc();
     let mut all_units: Vec<Unit> = bcx
         .unit_graph
         .keys()
         .filter(|u| {
-            // Filter out modes that cargo-schnee cannot handle (they need
-            // rustdoc, not rustc).  Without this filter, Doctest units share
-            // the same compilation_identity as Build units, causing self-edges
-            // in the toposort when Doctest depends on Build.
-            !matches!(
-                u.mode,
-                CompileMode::Doctest | CompileMode::Doc | CompileMode::Docscrape
-            )
+            // Filter out modes that cargo-schnee cannot handle.
+            // Doctest and Docscrape are always filtered (not needed).
+            // Doc units are kept only when the user intent is Doc.
+            if matches!(u.mode, CompileMode::Doctest | CompileMode::Docscrape) {
+                return false;
+            }
+            if u.mode == CompileMode::Doc && !is_doc_intent {
+                return false;
+            }
+            // When documenting, drop Check units (doc doesn't need metadata-only)
+            if is_doc_intent && matches!(u.mode, CompileMode::Check { .. }) {
+                return false;
+            }
+            true
         })
         .cloned()
         .collect();
@@ -97,6 +106,8 @@ pub(super) fn extract_units_from_bcx(
             UnitKind::BuildScriptRun
         } else if unit.target.is_custom_build() {
             UnitKind::BuildScriptCompile
+        } else if unit.mode == CompileMode::Doc {
+            UnitKind::Doc
         } else if unit.mode == CompileMode::Test {
             UnitKind::TestCompile
         } else if matches!(unit.mode, CompileMode::Check { .. }) {
@@ -351,6 +362,7 @@ pub(super) fn extract_units_from_bcx(
         let cargo_envs = compute_cargo_envs(unit);
 
         let needs_linker = kind != UnitKind::Check
+            && kind != UnitKind::Doc
             && (kind == UnitKind::TestCompile
                 || crate_types.iter().any(|ct| {
                     ct == "proc-macro" || ct == "bin" || ct == "cdylib" || ct == "dylib"
@@ -460,6 +472,7 @@ pub(super) fn mode_suffix_for_drv_name(kind: &UnitKind) -> &'static str {
         UnitKind::BuildScriptRun => "-run-build-script",
         UnitKind::TestCompile => "-test",
         UnitKind::Check => "-check",
+        UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
     }
 }
@@ -867,6 +880,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         UnitKind::BuildScriptCompile => "-build-script",
         UnitKind::TestCompile => "-test",
         UnitKind::Check => "-check",
+        UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
     };
     let kind_suffix = if u.for_host { "-host" } else { "" };
@@ -963,6 +977,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             UnitKind::BuildScriptCompile => "-build-script",
             UnitKind::TestCompile => "-test",
             UnitKind::Check => "-check",
+            UnitKind::Doc => "-doc",
             UnitKind::Compile => "",
         };
         let kind_suffix = if u.for_host { "-host" } else { "" };
@@ -1689,5 +1704,40 @@ mod tests {
             "unified key should NOT convert underscores to hyphens: {}",
             serde_core_unit.key,
         );
+    }
+
+    // -- Doc kind tests ---------------------------------------------------------
+
+    #[test]
+    fn group_key_differs_for_doc_vs_compile() {
+        let a = make_unit("foo", "1.0.0", &[], &[]);
+        let mut b = make_unit("foo", "1.0.0", &[], &[]);
+        b.kind = UnitKind::Doc;
+        assert_ne!(
+            feature_agnostic_group_key(&a),
+            feature_agnostic_group_key(&b)
+        );
+    }
+
+    #[test]
+    fn mode_suffix_doc() {
+        assert_eq!(mode_suffix_for_drv_name(&UnitKind::Doc), "-doc");
+    }
+
+    #[test]
+    fn doc_unit_does_not_need_linker() {
+        let mut u = make_unit("foo", "1.0.0", &[], &[]);
+        u.kind = UnitKind::Doc;
+        u.crate_types = vec!["bin".to_string()];
+        // Even bin crate-type Doc units should not need a linker
+        assert!(!u.needs_linker);
+    }
+
+    #[test]
+    fn doc_output_lib_filename() {
+        let mut u = make_unit("my-lib", "1.0.0", &[], &[]);
+        u.kind = UnitKind::Doc;
+        let filename = u.output_lib_filename();
+        assert_eq!(filename, "doc/my_lib");
     }
 }
