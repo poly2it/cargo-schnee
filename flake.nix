@@ -196,6 +196,12 @@
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
+          doc = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee doc";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--features" ];
+            boolArgs = [ "--no-default-features" "--no-deps" "--document-private-items" ];
+            setup = schneeSetup;
+          };
         };
 
       formatter = forAllSystems (system: (mkSystem system).formatter);
