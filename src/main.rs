@@ -908,6 +908,15 @@ fn update_workspace_exclude(root_toml: &Path, mappings: &HashMap<PathBuf, String
             .entry("exclude")
             .or_insert(toml::Value::Array(Vec::new()));
         if let Some(arr) = exclude.as_array_mut() {
+            // Always exclude .parent — cargo-schnee maps parent workspace
+            // files under .parent/ in the store and Cargo's member globs
+            // (e.g. members = ["*"]) match dotfiles.
+            let parent_val = toml::Value::String(".parent".to_string());
+            if !arr.contains(&parent_val) {
+                arr.push(parent_val);
+                changed = true;
+            }
+
             // Collect unique top-level directory names from sanitised paths.
             // e.g. "my-lib/sub" → "my-lib"
             let mut seen = std::collections::HashSet::new();
@@ -1020,8 +1029,8 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                         } else {
                             // Outside project_dir — compute .parent-based relative path
                             // Walk up from project_dir to find common ancestor, replacing
-                            // each '..' with '.parent'.  The dot-prefix prevents Cargo's
-                            // member globs (e.g. members = ["*"]) from matching it.
+                            // each '..' with '.parent'.  update_workspace_exclude adds
+                            // .parent to [workspace].exclude to prevent glob conflicts.
                             let proj_comps: Vec<_> = canon_proj.components().collect();
                             let entry_comps: Vec<_> = canon_entry.components().collect();
                             let common = proj_comps
@@ -2949,6 +2958,11 @@ version = "1.2.3"
             "should NOT use full sanitised path: {:?}",
             exclude_strs
         );
+        assert!(
+            exclude_strs.contains(&".parent"),
+            "should always exclude .parent: {:?}",
+            exclude_strs
+        );
     }
 
     #[test]
@@ -3003,6 +3017,11 @@ version = "1.2.3"
         assert!(
             exclude_strs.contains(&"my-lib"),
             "workspace.exclude should contain 'my-lib': {:?}",
+            exclude_strs
+        );
+        assert!(
+            exclude_strs.contains(&".parent"),
+            "workspace.exclude should contain '.parent': {:?}",
             exclude_strs
         );
     }
