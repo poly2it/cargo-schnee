@@ -786,10 +786,11 @@ fn build_run_script(
     // the crate's subdirectory within it.
     //
     // When extra-includes reference files outside the project directory,
-    // they are mapped under _parent/ in the source store. _parent/ content
+    // they are mapped under .parent/ in the source store. .parent/ content
     // is moved to $TMPDIR/ so that paths traversing above the workspace
-    // root still resolve.
-    let has_parent = PathBuf::from(src_store).join("_parent").is_dir();
+    // root still resolve.  The dot-prefix prevents Cargo's member globs
+    // (e.g. members = ["*"]) from treating it as a workspace member.
+    let has_parent = PathBuf::from(src_store).join(".parent").is_dir();
     let crate_rel = unit
         .manifest_dir
         .strip_prefix(src_store)
@@ -805,24 +806,24 @@ fn build_run_script(
             src = shell_quote(src_store),
         ));
         if has_parent {
-            // Move _parent/ content one level above the workspace root
+            // Move .parent/ content one level above the workspace root
             // so that paths traversing above it still resolve.
             script.push_str(concat!(
-                "cp -r --no-preserve=mode $TMPDIR/workdir/_parent/. $TMPDIR/ && ",
-                "rm -rf $TMPDIR/workdir/_parent && ",
+                "cp -r --no-preserve=mode $TMPDIR/workdir/.parent/. $TMPDIR/ && ",
+                "rm -rf $TMPDIR/workdir/.parent && ",
             ));
         }
     } else {
         script.push_str("_bs_workdir=$TMPDIR/workdir && ");
         script.push_str("cp -r --no-preserve=mode $CARGO_MANIFEST_DIR/. $_bs_workdir && ");
-        // For workspace root crates (manifest_dir == src_store), _parent/
+        // For workspace root crates (manifest_dir == src_store), .parent/
         // was included in the copy above; move it one level up.
         // Only applies when the crate is actually local; vendored deps
-        // whose manifest_dir is in the vendor store never contain _parent/.
+        // whose manifest_dir is in the vendor store never contain .parent/.
         if has_parent && unit.manifest_dir == src_store {
             script.push_str(concat!(
-                "cp -r --no-preserve=mode $_bs_workdir/_parent/. $TMPDIR/ && ",
-                "rm -rf $_bs_workdir/_parent && ",
+                "cp -r --no-preserve=mode $_bs_workdir/.parent/. $TMPDIR/ && ",
+                "rm -rf $_bs_workdir/.parent && ",
             ));
         }
     }

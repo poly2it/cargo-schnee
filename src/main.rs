@@ -1018,9 +1018,10 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                             }
                             count += 1;
                         } else {
-                            // Outside project_dir — compute _parent-based relative path
+                            // Outside project_dir — compute .parent-based relative path
                             // Walk up from project_dir to find common ancestor, replacing
-                            // each '..' with '_parent'.
+                            // each '..' with '.parent'.  The dot-prefix prevents Cargo's
+                            // member globs (e.g. members = ["*"]) from matching it.
                             let proj_comps: Vec<_> = canon_proj.components().collect();
                             let entry_comps: Vec<_> = canon_entry.components().collect();
                             let common = proj_comps
@@ -1030,7 +1031,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                                 .count();
                             let mut store_rel = PathBuf::new();
                             for _ in common..proj_comps.len() {
-                                store_rel.push("_parent");
+                                store_rel.push(".parent");
                             }
                             for comp in &entry_comps[common..] {
                                 store_rel.push(comp);
