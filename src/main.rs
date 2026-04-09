@@ -3016,8 +3016,14 @@ version = "1.2.3"
         std::fs::write(src.path().join("a.txt"), "aaa").unwrap();
         std::fs::write(src.path().join("b.txt"), "bbb").unwrap();
         copy_dir_recursive(src.path(), dst.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "aaa");
-        assert_eq!(std::fs::read_to_string(dst.path().join("b.txt")).unwrap(), "bbb");
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("a.txt")).unwrap(),
+            "aaa"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("b.txt")).unwrap(),
+            "bbb"
+        );
     }
 
     #[test]

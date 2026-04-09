@@ -1137,8 +1137,7 @@ fn fixture_lib_bin_integration_test() {
 #[ignore]
 fn fixture_minimal_lib_doc() {
     let _guard = lock(&MINIMAL_LIB_LOCK);
-    let fixture_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
     let manifest = fixture_dir.join("Cargo.toml");
 
     clean_target(&fixture_dir);
@@ -1157,8 +1156,7 @@ fn fixture_minimal_lib_doc() {
 #[ignore]
 fn fixture_minimal_lib_doc_private_items() {
     let _guard = lock(&MINIMAL_LIB_LOCK);
-    let fixture_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal-lib");
     let manifest = fixture_dir.join("Cargo.toml");
 
     clean_target(&fixture_dir);
