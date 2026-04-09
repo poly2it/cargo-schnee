@@ -624,7 +624,7 @@ extra-includes = ["src/generated/**/*.rs", "proto/out/*.rs"]
 
 Files matching these patterns are added to the source tree even if they appear
 in `.gitignore`. Files outside the project directory are supported and are
-stored with a `_parent` prefix in the Nix store tree.
+stored with a `.parent` prefix in the Nix store tree.
 
 ### Packaging with `lib.buildPackage`
 

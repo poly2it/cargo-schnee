@@ -696,10 +696,10 @@ fn fixture_passthru_env_manifest() {
     );
 }
 
-/// Extra includes with _parent: a workspace whose extra-includes glob matches
+/// Extra includes with .parent: a workspace whose extra-includes glob matches
 /// files outside the project directory. A build script in a member crate reads
 /// those files via relative paths from CARGO_MANIFEST_DIR. The files are mapped
-/// to _parent/ in the source store and must be accessible from the build script
+/// to .parent/ in the source store and must be accessible from the build script
 /// workdir.
 #[test]
 #[ignore]
