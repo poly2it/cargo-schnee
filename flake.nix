@@ -196,7 +196,7 @@
           clippy = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
             forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            boolArgs = [ "--no-default-features" "--no-deps" ];
             setup = schneeSetup;
           };
           bench = {

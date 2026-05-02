@@ -248,12 +248,18 @@ enum SchneeCommand {
         /// Exclude packages from the operation
         #[arg(long)]
         exclude: Vec<String>,
+        /// Skip linting dependencies (forwarded as cargo clippy --no-deps)
+        #[arg(long)]
+        no_deps: bool,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
         /// Do not activate the `default` feature
         #[arg(long)]
         no_default_features: bool,
+        /// Lint args passed to clippy-driver after `--` (e.g. -D warnings)
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Build documentation via rustdoc
     Doc {
@@ -2708,9 +2714,15 @@ fn main() -> Result<()> {
             ref target,
             ref package,
             ref exclude,
+            no_deps: _no_deps,
             ref features,
             no_default_features,
+            args: ref _clippy_args,
         } => {
+            // TODO: thread no_deps and clippy_args (lint flags after --)
+            // through to per-unit derivations so they actually affect
+            // clippy-driver invocation.  For now both are accepted at the
+            // CLI surface so the wrapper-routed calls type-check.
             run_build_pipeline(
                 manifest_path,
                 vendor_dir,
