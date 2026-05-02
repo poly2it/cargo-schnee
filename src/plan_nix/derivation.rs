@@ -54,9 +54,29 @@ pub(super) fn construct_derivation(
     src_store: &str,
     document_private_items: bool,
     passthru_closure: &[String],
+    // When `Some`, swap rustc for clippy-driver on local (workspace) compile
+    // units.  Dep units keep using rustc so their per-unit derivations stay
+    // byte-identical to a regular check / build run.
+    clippy_path: Option<&str>,
+    // clippy-driver's nix store closure.  Only added to inputSrcs of units
+    // that actually use clippy_path so dep units are unaffected.
+    clippy_closure: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+
+    // Decide whether this unit should be linted.  Doc and BuildScriptRun
+    // are excluded — Doc runs rustdoc, BuildScriptRun executes a binary.
+    // Only local (workspace) units swap; deps keep their cached rustc drvs.
+    let use_clippy = clippy_path.is_some()
+        && unit.is_local
+        && !matches!(unit.kind, UnitKind::Doc | UnitKind::BuildScriptRun);
+    let effective_rustc = if use_clippy {
+        clippy_path.unwrap()
+    } else {
+        rustc_path
+    };
+
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -92,7 +112,7 @@ pub(super) fn construct_derivation(
             units,
             key_to_idx,
             dep_drv_map,
-            rustc_path,
+            effective_rustc,
             proc_macro_rlib,
             resolved_sysroot,
             &coreutils_bin_dir,
@@ -177,6 +197,13 @@ pub(super) fn construct_derivation(
     // Rustc closure includes rust-std (needed for sysroot libs like libproc_macro)
     for path in rustc_closure {
         input_srcs.insert(path.clone());
+    }
+    // clippy-driver's closure is added only to local units that actually run
+    // clippy.  Adding it unconditionally would invalidate dep unit caches.
+    if use_clippy {
+        for path in clippy_closure {
+            input_srcs.insert(path.clone());
+        }
     }
     input_srcs.insert(coreutils_store.to_string());
 

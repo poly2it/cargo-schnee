@@ -32,6 +32,10 @@ pub(super) fn which_rustdoc() -> Result<PathBuf> {
     which_command("rustdoc")
 }
 
+pub(super) fn which_clippy_driver() -> Result<PathBuf> {
+    which_command("clippy-driver")
+}
+
 pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {

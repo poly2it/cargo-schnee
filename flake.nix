@@ -193,6 +193,12 @@
             boolArgs = [ "--no-default-features" ];
             setup = schneeSetup;
           };
+          clippy = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
+            boolArgs = [ "--no-default-features" ];
+            setup = schneeSetup;
+          };
           bench = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee bench";
             forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];

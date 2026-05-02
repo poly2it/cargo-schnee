@@ -17,8 +17,8 @@ use daemon::NixDaemonConn;
 use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
-    find_cross_linker, find_sysroot_rlib, which_command, which_command_no_deref, which_rustc,
-    which_rustdoc,
+    find_cross_linker, find_sysroot_rlib, which_clippy_driver, which_command,
+    which_command_no_deref, which_rustc, which_rustdoc,
 };
 
 use anyhow::{Context, Result};
@@ -392,6 +392,7 @@ fn check_system_libraries(
 /// If `Some((old_src_store, units))`, path prefixes are fixed up and units are used directly.
 /// Returns `(root_drv_path, units_for_caching)`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_plan_nix(
     src: &Path,
     vendor_dir: &Path,
@@ -410,6 +411,10 @@ pub fn run_plan_nix(
     passthru_envs: &[(String, String)],
     project_dir: Option<&Path>,
     document_private_items: bool,
+    // Run clippy-driver instead of rustc on local (workspace) compile units.
+    // Dependency units are unchanged so per-unit derivations stay shared with
+    // regular check / build runs.
+    clippy: bool,
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -580,6 +585,15 @@ pub fn run_plan_nix(
     } else {
         String::new()
     };
+    // For clippy mode, resolve clippy-driver.  It is invoked as a rustc
+    // replacement for local (workspace) units; dep units keep using rustc
+    // so their per-unit derivations stay byte-identical to regular builds.
+    let clippy_str = if clippy {
+        let path = which_clippy_driver()?;
+        path.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
 
     // Query rustc for its sysroot — this works with wrapper scripts (nixpkgs'
     // rustc-wrapper) where the binary's store path differs from the sysroot.
@@ -736,6 +750,24 @@ pub fn run_plan_nix(
     let mut closure_store_paths: Vec<String> = Vec::new();
     closure_store_paths.push(rustc_store.clone());
     closure_store_paths.push(host_cc_store.clone());
+    // Capture clippy-driver's store closure when in clippy mode.  In typical
+    // rust-overlay setups it lives inside the same toolchain symlink farm as
+    // rustc and the closure is a no-op, but if clippy ships separately we
+    // need its libs available in the per-unit sandbox.
+    let clippy_store: Option<String> = if !clippy_str.is_empty() {
+        let canon = std::fs::canonicalize(&clippy_str).unwrap_or_else(|_| PathBuf::from(&clippy_str));
+        canon
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    if let Some(ref store) = clippy_store
+        && !closure_store_paths.contains(store)
+    {
+        closure_store_paths.push(store.clone());
+    }
     if target.is_cross() && target_cc_store != host_cc_store {
         closure_store_paths.push(target_cc_store.clone());
     }
@@ -848,6 +880,10 @@ pub fn run_plan_nix(
 
     // Build closure vectors from cache
     let rustc_closure = closure_cache.get(&rustc_store).cloned().unwrap_or_default();
+    let clippy_closure: Vec<String> = clippy_store
+        .as_ref()
+        .and_then(|s| closure_cache.get(s).cloned())
+        .unwrap_or_default();
     let host_cc_closure = closure_cache
         .get(&host_cc_store)
         .cloned()
@@ -984,6 +1020,12 @@ pub fn run_plan_nix(
                     &src_str,
                     document_private_items,
                     &passthru_closure,
+                    if clippy_str.is_empty() {
+                        None
+                    } else {
+                        Some(&clippy_str)
+                    },
+                    &clippy_closure,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

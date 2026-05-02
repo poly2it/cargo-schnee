@@ -3,14 +3,11 @@
 # Runs `cargo clippy` for a single package (by default) inside a sandboxed
 # derivation.  Skips the cargo build step; clippy runs in checkPhase.
 #
-# Currently `cargo clippy` falls through the wrapper to real cargo because
-# `clippy` is not in `cargoOverrides`; clippy-driver runs as the rustc
-# wrapper directly inside this derivation's sandbox.  Vendored deps are
-# wired via a manually-written .cargo/config.toml since cargo-schnee
-# disables nixpkgs's cargoSetupPostUnpackHook.  Once cargo-schnee grows
-# native `schnee clippy` support (see src/main.rs SchneeCommand::Clippy)
-# and the override is registered, the manual config.toml step becomes a
-# harmless no-op and per-unit derivation caching kicks in for free.
+# `cargo clippy` is intercepted by the cargoOverrides wrapper and routed to
+# `cargo schnee clippy`, which mirrors the regular check pipeline but swaps
+# rustc for clippy-driver on local (workspace) compile units.  Dependency
+# units stay rustc-compiled so their per-unit derivations are byte-shared
+# with the corresponding buildPackage / testPackage runs.
 { self }:
 
 {
@@ -45,21 +42,12 @@ self.lib.buildPackage (forwardArgs // {
   dontBuild = true;
   wrapBinaries = false;
 
-  # Override cargoCheckHook's default `cargo test` invocation.  Wire
-  # vendored deps via .cargo/config.toml since the wrapper does not inject
-  # --vendor-dir for clippy yet.
+  # Override cargoCheckHook's default `cargo test` invocation.  The wrapper
+  # routes `cargo clippy` through `cargo schnee clippy` which injects
+  # --vendor-dir from $cargoDeps automatically — no manual config.toml.
   checkPhase = ''
     runHook preCheck
-
-    mkdir -p .cargo
-    cat > .cargo/config.toml <<EOF
-    [source.crates-io]
-    replace-with = "vendored-sources"
-    [source.vendored-sources]
-    directory = "$cargoDeps"
-    EOF
-
-    cargo --offline clippy ${cargoArgs} -- ${postDashes}
+    cargo clippy ${cargoArgs} -- ${postDashes}
     runHook postCheck
   '';
 

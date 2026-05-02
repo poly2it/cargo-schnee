@@ -222,8 +222,39 @@ enum SchneeCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Run clippy lints on the project (not yet implemented)
-    Clippy,
+    /// Run clippy lints on the project via dynamic derivations (nix build).
+    /// Local (workspace) compile units run clippy-driver instead of rustc;
+    /// dependency units are compiled with plain rustc and stay shared with
+    /// regular check / build derivations.
+    Clippy {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Run in release mode
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to lint (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Build documentation via rustdoc
     Doc {
         /// Path to Cargo.toml
@@ -1682,6 +1713,7 @@ struct BuildResult {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_build_pipeline(
     manifest_path_opt: &Option<PathBuf>,
     vendor_dir: &Option<PathBuf>,
@@ -1698,6 +1730,9 @@ fn run_build_pipeline(
     write_profile_to: &Option<PathBuf>,
     interrupted: &Arc<AtomicBool>,
     document_private_items: bool,
+    // Run clippy-driver instead of rustc on local (workspace) compile units.
+    // The cargo plan is unchanged; only per-unit derivations differ.
+    clippy: bool,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1783,7 +1818,9 @@ fn run_build_pipeline(
     let plan_start = Instant::now();
     shell::status("Planning", "build...");
 
-    // Check unit graph cache
+    // Check unit graph cache.  Note: clippy mode reuses the regular check
+    // unit graph because the cargo plan is identical — only the rustc binary
+    // swapped out per-unit at construction time.
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
     let intent_str = match user_intent {
         UserIntent::Build => "build",
@@ -1856,6 +1893,7 @@ fn run_build_pipeline(
         &passthru_envs,
         Some(project_dir),
         document_private_items,
+        clippy,
     )?;
 
     // Update unit graph cache
@@ -2361,6 +2399,7 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
             )?;
         }
         SchneeCommand::Build {
@@ -2389,6 +2428,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
                 false,
             )?;
         }
@@ -2420,6 +2460,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
                 false,
             )?;
 
@@ -2492,6 +2533,7 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
             )?;
 
             // Find test binaries (TestCompile roots)
@@ -2549,6 +2591,7 @@ fn main() -> Result<()> {
                 verbose,
                 &write_profile_to,
                 &interrupted,
+                false,
                 false,
             )?;
 
@@ -2652,14 +2695,40 @@ fn main() -> Result<()> {
                 &[],
                 Some(project_dir),
                 false,
+                false,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
         }
-        SchneeCommand::Clippy => {
-            anyhow::bail!(
-                "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
-            );
+        SchneeCommand::Clippy {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref exclude,
+            ref features,
+            no_default_features,
+        } => {
+            run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                exclude,
+                features,
+                no_default_features,
+                UserIntent::Check { test: false },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &interrupted,
+                false,
+                true,
+            )?;
         }
         SchneeCommand::Doc {
             ref manifest_path,
@@ -2693,6 +2762,7 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 document_private_items,
+                false,
             )?;
 
             // Merge doc outputs into target/doc/
@@ -2770,6 +2840,7 @@ fn main() -> Result<()> {
                 false,
                 &[],
                 None,
+                false,
                 false,
             )?;
             // Output the root .drv paths
