@@ -30,7 +30,18 @@ let
   effectiveScope = if testScope != null then testScope else defaultScope;
   cargoTestFlags = effectiveScope ++ cargoTestExtraArgs;
 
-  forwardArgs = removeAttrs args [ "testScope" "cargoTestExtraArgs" ];
+  forwardArgs = removeAttrs args [ "testScope" "cargoTestExtraArgs" "preBuild" "preCheck" ];
+
+  # With dontBuild = true the entire buildPhase is skipped — including its
+  # preBuild hook.  Splice the caller's preBuild into preCheck so source-
+  # tree mutations (codegen injection, etc.) still happen before cargo test
+  # runs; the working directory is identical at both points.
+  callerPreBuild = args.preBuild or "";
+  callerPreCheck = args.preCheck or "";
+  effectivePreCheck =
+    if callerPreBuild == ""
+    then callerPreCheck
+    else callerPreBuild + "\n" + callerPreCheck;
 in
 self.lib.buildPackage (forwardArgs // {
   inherit package;
@@ -38,6 +49,7 @@ self.lib.buildPackage (forwardArgs // {
   dontBuild = true;
   wrapBinaries = false;
   inherit cargoTestFlags;
+  preCheck = effectivePreCheck;
 
   installPhase = ''
     runHook preInstall

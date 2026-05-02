@@ -34,7 +34,21 @@ let
   cargoArgs = lib.escapeShellArgs (effectiveScope ++ clippyExtraArgs);
   postDashes = lib.escapeShellArgs lintArgs;
 
-  forwardArgs = removeAttrs args [ "clippyScope" "clippyExtraArgs" "lintArgs" ];
+  forwardArgs = removeAttrs args [
+    "clippyScope" "clippyExtraArgs" "lintArgs"
+    "preBuild" "preCheck"
+  ];
+
+  # With dontBuild = true the entire buildPhase is skipped — including its
+  # preBuild hook.  Splice the caller's preBuild into preCheck so source-
+  # tree mutations (codegen injection, etc.) still happen before cargo
+  # clippy runs; the working directory is identical at both points.
+  callerPreBuild = args.preBuild or "";
+  callerPreCheck = args.preCheck or "";
+  effectivePreCheck =
+    if callerPreBuild == ""
+    then callerPreCheck
+    else callerPreBuild + "\n" + callerPreCheck;
 in
 self.lib.buildPackage (forwardArgs // {
   inherit package;
@@ -50,6 +64,7 @@ self.lib.buildPackage (forwardArgs // {
     cargo clippy ${cargoArgs} -- ${postDashes}
     runHook postCheck
   '';
+  preCheck = effectivePreCheck;
 
   installPhase = ''
     runHook preInstall
