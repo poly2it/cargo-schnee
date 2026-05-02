@@ -755,7 +755,8 @@ pub fn run_plan_nix(
     // rustc and the closure is a no-op, but if clippy ships separately we
     // need its libs available in the per-unit sandbox.
     let clippy_store: Option<String> = if !clippy_str.is_empty() {
-        let canon = std::fs::canonicalize(&clippy_str).unwrap_or_else(|_| PathBuf::from(&clippy_str));
+        let canon =
+            std::fs::canonicalize(&clippy_str).unwrap_or_else(|_| PathBuf::from(&clippy_str));
         canon
             .parent()
             .and_then(|p| p.parent())
