@@ -65,6 +65,13 @@ pub(super) fn construct_derivation(
     // Only applied to units that actually run clippy so dep-unit derivation
     // hashes stay stable when the caller toggles deny-warnings on or off.
     clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules to inject into every compile unit's rustc
+    // command line.  Each pair is `(src_relative, replacement)` where
+    // `src_relative` is interpreted relative to `src_store` — empty string
+    // remaps the project-src root itself.  Sorted shortest-first inside
+    // `build_compile_script` so rustc's "last matching wins" rule resolves
+    // longer (more specific) entries on top of shorter ones.
+    path_prefix_remaps: &[(String, String)],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -125,6 +132,8 @@ pub(super) fn construct_derivation(
             target,
             win_sdk_lib_dirs,
             if use_clippy { clippy_lint_args } else { &[] },
+            path_prefix_remaps,
+            src_store,
         )?,
     };
 
@@ -282,6 +291,11 @@ fn build_compile_script(
     // arg.  Used to forward post-`--` clippy lint flags such as
     // `--deny warnings`; empty for normal compile units.
     extra_rustc_args: &[String],
+    // `--remap-path-prefix` rules.  See `construct_derivation` doc.
+    path_prefix_remaps: &[(String, String)],
+    // Project-src store path; remaps with `src_relative = ""` rewrite this
+    // root, longer entries rewrite subdirectories.
+    src_store: &str,
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -426,6 +440,25 @@ fn build_compile_script(
             parts.push("-L".into());
             parts.push(format!("dependency={}", placeholder));
         }
+    }
+
+    // `--remap-path-prefix`: rewrite source paths in diagnostics, debug
+    // info, and macro expansions.  Each `(src_relative, replacement)` is
+    // interpreted relative to `src_store` so callers don't have to know the
+    // per-build content-addressed hash; empty `src_relative` rewrites the
+    // project-src root itself.  rustc resolves multiple remaps with
+    // "last matching wins" — sort shortest-first so longer (more specific)
+    // entries override shorter ones for paths that match both.
+    let mut sorted_remaps: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
+    sorted_remaps.sort_by_key(|(src_relative, _)| src_relative.len());
+    for (src_relative, replacement) in sorted_remaps {
+        let from = if src_relative.is_empty() {
+            src_store.to_string()
+        } else {
+            format!("{}/{}", src_store, src_relative)
+        };
+        parts.push("--remap-path-prefix".into());
+        parts.push(shell_quote(&format!("{}={}", from, replacement)));
     }
 
     // Caller-supplied flags forwarded to clippy-driver (or rustc).  For

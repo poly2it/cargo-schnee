@@ -1885,6 +1885,19 @@ fn run_build_pipeline(
         })
         .collect();
 
+    // `--remap-path-prefix` rules to apply to every compile unit.
+    // CARGO_SCHNEE_PATH_PREFIX_REMAPS is JSON-encoded — a list of two-element
+    // arrays `[[src_relative, replacement], ...]` — so the consumer's Nix
+    // attrset can express remaps relative to the project-src layout without
+    // knowing the per-build store hash.
+    let path_prefix_remaps: Vec<(String, String)> =
+        match std::env::var("CARGO_SCHNEE_PATH_PREFIX_REMAPS") {
+            Ok(s) if !s.is_empty() => serde_json::from_str(&s).with_context(|| {
+                format!("parse CARGO_SCHNEE_PATH_PREFIX_REMAPS as JSON: {}", s)
+            })?,
+            _ => Vec::new(),
+        };
+
     let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
@@ -1905,6 +1918,7 @@ fn run_build_pipeline(
         document_private_items,
         clippy,
         clippy_lint_args,
+        &path_prefix_remaps,
     )?;
 
     // Update unit graph cache
@@ -2713,6 +2727,7 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                &[],
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -2881,6 +2896,7 @@ fn main() -> Result<()> {
                 None,
                 false,
                 false,
+                &[],
                 &[],
             )?;
             // Output the root .drv paths

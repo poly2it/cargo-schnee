@@ -418,6 +418,11 @@ pub fn run_plan_nix(
     // Empty when `clippy` is false or when the caller did not pass any
     // post-`--` driver flags.
     clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules forwarded to every compile unit.  Each
+    // `(src_relative, replacement)` is resolved against `src_store` inside
+    // `build_compile_script`, so callers express remaps in terms of the
+    // project-src layout without knowing the content-addressed hash.
+    path_prefix_remaps: &[(String, String)],
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -1031,6 +1036,7 @@ pub fn run_plan_nix(
                     },
                     &clippy_closure,
                     clippy_lint_args,
+                    path_prefix_remaps,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",
