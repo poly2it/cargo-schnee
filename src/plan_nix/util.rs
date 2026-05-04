@@ -15,7 +15,11 @@ pub(crate) fn collect_store_paths(s: &str, paths: &mut HashSet<String>) {
             let hash_part = &after_prefix[..32];
             if hash_part.bytes().all(|b| NIX_BASE32.contains(&b)) {
                 let rest = &after_prefix[33..];
-                let name_end = rest.find(['/', ' ', '"', '\'', ')']).unwrap_or(rest.len());
+                // `=` terminates the name so `--remap-path-prefix
+                // <store-path>=<replacement>` doesn't accidentally extend the
+                // captured path past the literal store entry.  `=` is not a
+                // valid character in Nix store names so this is loss-free.
+                let name_end = rest.find(['/', ' ', '"', '\'', ')', '=']).unwrap_or(rest.len());
                 let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
                 paths.insert(root.to_string());
             }
@@ -295,6 +299,24 @@ mod tests {
             &mut paths,
         );
         assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-start"));
+    }
+
+    #[test]
+    fn collect_store_paths_terminates_at_equals() {
+        // `--remap-path-prefix <path>=<replacement>` lands a literal
+        // `<store-path>=<replacement>` token in the script.  The replacement
+        // must not be appended to the captured store path.
+        let mut paths = HashSet::new();
+        collect_store_paths(
+            "--remap-path-prefix /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src=crates",
+            &mut paths,
+        );
+        assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src"));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("=crates"))
+        );
     }
 
     #[test]
