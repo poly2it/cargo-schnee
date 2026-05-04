@@ -2736,6 +2736,18 @@ fn main() -> Result<()> {
             no_default_features,
             ref args,
         } => {
+            // clap's `last = true` keeps a literal `--` token in
+            // the captured `args` when the cargo wrapper passes
+            // something like `clippy ... -- --deny warnings`.  The
+            // `--` itself isn't a clippy-driver flag — feeding it
+            // through ends "everything is a flag" mode and rustc
+            // treats subsequent `--deny` as a positional source
+            // file.  Strip it before plumbing.
+            let lint_args: Vec<String> = args
+                .iter()
+                .filter(|a| a.as_str() != "--")
+                .cloned()
+                .collect();
             run_build_pipeline(
                 manifest_path,
                 vendor_dir,
@@ -2753,7 +2765,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 true,
-                args,
+                &lint_args,
             )?;
         }
         SchneeCommand::Doc {
