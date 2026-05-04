@@ -392,7 +392,6 @@ fn check_system_libraries(
 /// If `Some((old_src_store, units))`, path prefixes are fixed up and units are used directly.
 /// Returns `(root_drv_path, units_for_caching)`.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn run_plan_nix(
     src: &Path,
     vendor_dir: &Path,
@@ -415,6 +414,10 @@ pub fn run_plan_nix(
     // Dependency units are unchanged so per-unit derivations stay shared with
     // regular check / build runs.
     clippy: bool,
+    // Lint args forwarded to clippy-driver on every local clippy unit.
+    // Empty when `clippy` is false or when the caller did not pass any
+    // post-`--` driver flags.
+    clippy_lint_args: &[String],
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -1027,6 +1030,7 @@ pub fn run_plan_nix(
                         Some(&clippy_str)
                     },
                     &clippy_closure,
+                    clippy_lint_args,
                 )?;
                 log::debug!(
                     "Adding derivation for {}: {}",

@@ -1719,7 +1719,6 @@ struct BuildResult {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_build_pipeline(
     manifest_path_opt: &Option<PathBuf>,
     vendor_dir: &Option<PathBuf>,
@@ -1739,6 +1738,11 @@ fn run_build_pipeline(
     // Run clippy-driver instead of rustc on local (workspace) compile units.
     // The cargo plan is unchanged; only per-unit derivations differ.
     clippy: bool,
+    // Extra arguments forwarded to clippy-driver after the rustc command
+    // line on every local clippy unit, e.g. `["--deny", "warnings"]`.
+    // Empty for non-clippy commands and ignored for dependency units so
+    // their per-unit derivations stay byte-shared with regular runs.
+    clippy_lint_args: &[String],
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1900,6 +1904,7 @@ fn run_build_pipeline(
         Some(project_dir),
         document_private_items,
         clippy,
+        clippy_lint_args,
     )?;
 
     // Update unit graph cache
@@ -2406,6 +2411,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 false,
+                &[],
             )?;
         }
         SchneeCommand::Build {
@@ -2436,6 +2442,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 false,
+                &[],
             )?;
         }
         SchneeCommand::Run {
@@ -2468,6 +2475,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 false,
+                &[],
             )?;
 
             // Find the binary to run
@@ -2540,6 +2548,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 false,
+                &[],
             )?;
 
             // Find test binaries (TestCompile roots)
@@ -2599,6 +2608,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 false,
+                &[],
             )?;
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
@@ -2702,6 +2712,7 @@ fn main() -> Result<()> {
                 Some(project_dir),
                 false,
                 false,
+                &[],
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -2714,15 +2725,17 @@ fn main() -> Result<()> {
             ref target,
             ref package,
             ref exclude,
+            // schnee never runs clippy on dependency units — local units
+            // swap rustc for clippy-driver while deps stay rustc-checked
+            // so their per-unit derivations remain byte-shared with the
+            // regular check / build pipeline.  `--no-deps` is therefore
+            // implicitly always-on; we accept the flag for cargo-clippy
+            // CLI compatibility but it is a no-op.
             no_deps: _no_deps,
             ref features,
             no_default_features,
-            args: ref _clippy_args,
+            ref args,
         } => {
-            // TODO: thread no_deps and clippy_args (lint flags after --)
-            // through to per-unit derivations so they actually affect
-            // clippy-driver invocation.  For now both are accepted at the
-            // CLI surface so the wrapper-routed calls type-check.
             run_build_pipeline(
                 manifest_path,
                 vendor_dir,
@@ -2740,6 +2753,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 false,
                 true,
+                args,
             )?;
         }
         SchneeCommand::Doc {
@@ -2775,6 +2789,7 @@ fn main() -> Result<()> {
                 &interrupted,
                 document_private_items,
                 false,
+                &[],
             )?;
 
             // Merge doc outputs into target/doc/
@@ -2854,6 +2869,7 @@ fn main() -> Result<()> {
                 None,
                 false,
                 false,
+                &[],
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {

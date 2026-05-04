@@ -61,6 +61,10 @@ pub(super) fn construct_derivation(
     // clippy-driver's nix store closure.  Only added to inputSrcs of units
     // that actually use clippy_path so dep units are unaffected.
     clippy_closure: &[String],
+    // Lint args forwarded to clippy-driver after the rustc command line.
+    // Only applied to units that actually run clippy so dep-unit derivation
+    // hashes stay stable when the caller toggles deny-warnings on or off.
+    clippy_lint_args: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
@@ -120,6 +124,7 @@ pub(super) fn construct_derivation(
             profile,
             target,
             win_sdk_lib_dirs,
+            if use_clippy { clippy_lint_args } else { &[] },
         )?,
     };
 
@@ -273,6 +278,10 @@ fn build_compile_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
+    // Extra rustc / clippy-driver flags appended after every other
+    // arg.  Used to forward post-`--` clippy lint flags such as
+    // `--deny warnings`; empty for normal compile units.
+    extra_rustc_args: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -417,6 +426,15 @@ fn build_compile_script(
             parts.push("-L".into());
             parts.push(format!("dependency={}", placeholder));
         }
+    }
+
+    // Caller-supplied flags forwarded to clippy-driver (or rustc).  For
+    // clippy units this is e.g. `["--deny", "warnings"]` from
+    // `cargo schnee clippy -- --deny warnings`; empty for regular
+    // compile units.  Appended last so the deny level applies on top of
+    // any allow level set by earlier flags.
+    for arg in extra_rustc_args {
+        parts.push(shell_quote(arg));
     }
 
     // Build the script
