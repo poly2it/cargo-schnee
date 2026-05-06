@@ -94,6 +94,14 @@
   # registered paths when it opens its SQLite connection.
   fileSystems."/results".neededForBoot = true;
   boot.postBootCommands = lib.mkAfter ''
+    # The 9p mount inherits the host directory's owner and a restrictive
+    # mode by default, so non-root users (e.g. `nixbld` running build
+    # derivations with sandbox=false) cannot write under /results.
+    # Make it world-writable with the sticky bit so cargo-schnee, which
+    # runs as the build user when invoked from inside `buildPackage`,
+    # can drop its `CARGO_SCHNEE_TRACE` file there.
+    chmod 1777 /results
+
     echo "=== store-reg: checking /results/store-reg.txt ==="
     if [ -f /results/store-reg.txt ]; then
       LINES=$(wc -l < /results/store-reg.txt)
