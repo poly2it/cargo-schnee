@@ -975,8 +975,12 @@ pub(super) fn nix_store_closure(store_path: &str) -> Result<Vec<String>> {
 }
 
 pub(super) fn nix_derivation_add(json: &serde_json::Value) -> Result<String> {
-    let json_str = serde_json::to_string(json)?;
-    debug!("nix derivation add input: {}", json_str);
+    use super::derivation_format::{NixDerivation, StoreDir, TargetNix};
+    let target = TargetNix::detect()?;
+    let store = StoreDir::detect();
+    let derivation = NixDerivation::from_ir(json, target, &store)?;
+    let json_str = serde_json::to_string(&derivation)?;
+    debug!("nix derivation add input ({:?}): {}", target, json_str);
     let mut child = Command::new("nix")
         .args([
             "derivation",

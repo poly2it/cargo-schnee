@@ -9,6 +9,7 @@
 mod aterm;
 mod daemon;
 mod derivation;
+mod derivation_format;
 mod unit_graph;
 pub(crate) mod util;
 
