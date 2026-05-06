@@ -139,6 +139,7 @@
       lib.buildDoc = import ./nix/buildDoc.nix { inherit self; };
       lib.testPackage = import ./nix/testPackage.nix { inherit self; };
       lib.clippyPackage = import ./nix/clippyPackage.nix { inherit self; };
+      lib.unitGraph = import ./nix/unitGraph.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
 
       lib.cargoOverrides = { pkgs }:

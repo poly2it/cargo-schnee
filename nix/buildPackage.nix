@@ -324,6 +324,33 @@ let
     CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
   };
 
+  # -- unit-graph cache hand-off -----------------------------------------
+  # cargo-schnee's planner accepts a pre-computed unit graph via
+  # `CARGO_SCHNEE_UNIT_GRAPH=<path>` (file or directory containing
+  # `graph.json`) — see `self.lib.unitGraph` and the `compute-graph`
+  # subcommand. On match, the planner skips the ~7 s cargo-as-library
+  # bootstrap. On mismatch (different cargo-resolution inputs from the
+  # ones the graph was generated for), cargo-schnee logs a warning and
+  # falls back to a fresh bootstrap, so a stale graph is silently
+  # ignored rather than served.
+  #
+  # `buildPackage` does not call `lib.unitGraph` automatically because
+  # the resolver-input declaration belongs to the caller — features and
+  # package selection that today live inside `cargoExtraArgs` would have
+  # to be lifted out. Opt in by passing the realised path through
+  # `env.CARGO_SCHNEE_UNIT_GRAPH`:
+  #
+  #   buildPackage {
+  #     inherit pkgs src cargoDeps rustToolchain;
+  #     env = {
+  #       CARGO_SCHNEE_UNIT_GRAPH = "${self.lib.unitGraph {
+  #         inherit pkgs src cargoDeps rustToolchain;
+  #         buildType = "release";
+  #         features = [ "default" ];
+  #       }}";
+  #     };
+  #   }
+
   # -- pathPrefixRemaps ---------------------------------------------------
   # Compose the `--remap-path-prefix` rules from `sourceRootPrefix` plus
   # per-extraSource identity remaps (each entry lands at
