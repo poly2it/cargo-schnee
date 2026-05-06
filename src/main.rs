@@ -222,8 +222,45 @@ enum SchneeCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Run clippy lints on the project (not yet implemented)
-    Clippy,
+    /// Run clippy lints on the project via dynamic derivations (nix build).
+    /// Local (workspace) compile units run clippy-driver instead of rustc;
+    /// dependency units are compiled with plain rustc and stay shared with
+    /// regular check / build derivations.
+    Clippy {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Run in release mode
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to lint (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Skip linting dependencies (forwarded as cargo clippy --no-deps)
+        #[arg(long)]
+        no_deps: bool,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+        /// Lint args passed to clippy-driver after `--` (e.g. -D warnings)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Build documentation via rustdoc
     Doc {
         /// Path to Cargo.toml
@@ -1698,6 +1735,14 @@ fn run_build_pipeline(
     write_profile_to: &Option<PathBuf>,
     interrupted: &Arc<AtomicBool>,
     document_private_items: bool,
+    // Run clippy-driver instead of rustc on local (workspace) compile units.
+    // The cargo plan is unchanged; only per-unit derivations differ.
+    clippy: bool,
+    // Extra arguments forwarded to clippy-driver after the rustc command
+    // line on every local clippy unit, e.g. `["--deny", "warnings"]`.
+    // Empty for non-clippy commands and ignored for dependency units so
+    // their per-unit derivations stay byte-shared with regular runs.
+    clippy_lint_args: &[String],
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1783,7 +1828,9 @@ fn run_build_pipeline(
     let plan_start = Instant::now();
     shell::status("Planning", "build...");
 
-    // Check unit graph cache
+    // Check unit graph cache.  Note: clippy mode reuses the regular check
+    // unit graph because the cargo plan is identical — only the rustc binary
+    // swapped out per-unit at construction time.
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
     let intent_str = match user_intent {
         UserIntent::Build => "build",
@@ -1838,6 +1885,19 @@ fn run_build_pipeline(
         })
         .collect();
 
+    // `--remap-path-prefix` rules to apply to every compile unit.
+    // CARGO_SCHNEE_PATH_PREFIX_REMAPS is JSON-encoded — a list of two-element
+    // arrays `[[src_relative, replacement], ...]` — so the consumer's Nix
+    // attrset can express remaps relative to the project-src layout without
+    // knowing the per-build store hash.
+    let path_prefix_remaps: Vec<(String, String)> =
+        match std::env::var("CARGO_SCHNEE_PATH_PREFIX_REMAPS") {
+            Ok(s) if !s.is_empty() => serde_json::from_str(&s).with_context(|| {
+                format!("parse CARGO_SCHNEE_PATH_PREFIX_REMAPS as JSON: {}", s)
+            })?,
+            _ => Vec::new(),
+        };
+
     let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
@@ -1856,6 +1916,9 @@ fn run_build_pipeline(
         &passthru_envs,
         Some(project_dir),
         document_private_items,
+        clippy,
+        clippy_lint_args,
+        &path_prefix_remaps,
     )?;
 
     // Update unit graph cache
@@ -2361,6 +2424,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
+                &[],
             )?;
         }
         SchneeCommand::Build {
@@ -2390,6 +2455,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
+                &[],
             )?;
         }
         SchneeCommand::Run {
@@ -2421,6 +2488,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
+                &[],
             )?;
 
             // Find the binary to run
@@ -2492,6 +2561,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
+                &[],
             )?;
 
             // Find test binaries (TestCompile roots)
@@ -2550,6 +2621,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 false,
+                false,
+                &[],
             )?;
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
@@ -2652,14 +2725,63 @@ fn main() -> Result<()> {
                 &[],
                 Some(project_dir),
                 false,
+                false,
+                &[],
+                &[],
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
         }
-        SchneeCommand::Clippy => {
-            anyhow::bail!(
-                "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
-            );
+        SchneeCommand::Clippy {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref exclude,
+            // schnee never runs clippy on dependency units — local units
+            // swap rustc for clippy-driver while deps stay rustc-checked
+            // so their per-unit derivations remain byte-shared with the
+            // regular check / build pipeline.  `--no-deps` is therefore
+            // implicitly always-on; we accept the flag for cargo-clippy
+            // CLI compatibility but it is a no-op.
+            no_deps: _no_deps,
+            ref features,
+            no_default_features,
+            ref args,
+        } => {
+            // clap's `last = true` keeps a literal `--` token in
+            // the captured `args` when the cargo wrapper passes
+            // something like `clippy ... -- --deny warnings`.  The
+            // `--` itself isn't a clippy-driver flag — feeding it
+            // through ends "everything is a flag" mode and rustc
+            // treats subsequent `--deny` as a positional source
+            // file.  Strip it before plumbing.
+            let lint_args: Vec<String> = args
+                .iter()
+                .filter(|a| a.as_str() != "--")
+                .cloned()
+                .collect();
+            run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                exclude,
+                features,
+                no_default_features,
+                UserIntent::Check { test: false },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &interrupted,
+                false,
+                true,
+                &lint_args,
+            )?;
         }
         SchneeCommand::Doc {
             ref manifest_path,
@@ -2693,6 +2815,8 @@ fn main() -> Result<()> {
                 &write_profile_to,
                 &interrupted,
                 document_private_items,
+                false,
+                &[],
             )?;
 
             // Merge doc outputs into target/doc/
@@ -2771,6 +2895,9 @@ fn main() -> Result<()> {
                 &[],
                 None,
                 false,
+                false,
+                &[],
+                &[],
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {

@@ -137,6 +137,8 @@
     {
       lib.buildPackage = import ./nix/buildPackage.nix { inherit self; };
       lib.buildDoc = import ./nix/buildDoc.nix { inherit self; };
+      lib.testPackage = import ./nix/testPackage.nix { inherit self; };
+      lib.clippyPackage = import ./nix/clippyPackage.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
 
       lib.cargoOverrides = { pkgs }:
@@ -189,6 +191,12 @@
             command = "${cargoSchnee}/bin/cargo-schnee schnee test";
             forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
             boolArgs = [ "--no-default-features" ];
+            setup = schneeSetup;
+          };
+          clippy = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
+            boolArgs = [ "--no-default-features" "--no-deps" ];
             setup = schneeSetup;
           };
           bench = {

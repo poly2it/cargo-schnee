@@ -9,6 +9,10 @@ const STDERR_ERROR: u64 = 0x63787470;
 
 pub(super) struct NixDaemonConn {
     stream: std::os::unix::net::UnixStream,
+    /// Nix version string sent by the daemon during the handshake.
+    /// Available when the negotiated worker protocol is ≥ 1.33; older
+    /// daemons do not advertise their version on the wire.
+    nix_version: Option<String>,
 }
 
 impl NixDaemonConn {
@@ -26,9 +30,19 @@ impl NixDaemonConn {
         let timeout = Some(std::time::Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
-        let mut conn = Self { stream };
+        let mut conn = Self {
+            stream,
+            nix_version: None,
+        };
         conn.handshake()?;
         Ok(conn)
+    }
+
+    /// The Nix version string the daemon advertised during the handshake,
+    /// e.g. `"2.34.7"` or `"2.93.0"` (Lix). `None` if the negotiated worker
+    /// protocol is older than 1.33.
+    pub(super) fn nix_version(&self) -> Option<&str> {
+        self.nix_version.as_deref()
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -74,6 +88,7 @@ impl NixDaemonConn {
         if version >= (1 << 8) | 33 {
             let ver = self.read_string()?;
             debug!("Daemon version: {}", ver);
+            self.nix_version = Some(ver);
         }
 
         // Protocol >= 1.35: daemon sends trust level

@@ -54,9 +54,40 @@ pub(super) fn construct_derivation(
     src_store: &str,
     document_private_items: bool,
     passthru_closure: &[String],
+    // When `Some`, swap rustc for clippy-driver on local (workspace) compile
+    // units.  Dep units keep using rustc so their per-unit derivations stay
+    // byte-identical to a regular check / build run.
+    clippy_path: Option<&str>,
+    // clippy-driver's nix store closure.  Only added to inputSrcs of units
+    // that actually use clippy_path so dep units are unaffected.
+    clippy_closure: &[String],
+    // Lint args forwarded to clippy-driver after the rustc command line.
+    // Only applied to units that actually run clippy so dep-unit derivation
+    // hashes stay stable when the caller toggles deny-warnings on or off.
+    clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules to inject into every compile unit's rustc
+    // command line.  Each pair is `(src_relative, replacement)` where
+    // `src_relative` is interpreted relative to `src_store` — empty string
+    // remaps the project-src root itself.  Sorted shortest-first inside
+    // `build_compile_script` so rustc's "last matching wins" rule resolves
+    // longer (more specific) entries on top of shorter ones.
+    path_prefix_remaps: &[(String, String)],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+
+    // Decide whether this unit should be linted.  Doc and BuildScriptRun
+    // are excluded — Doc runs rustdoc, BuildScriptRun executes a binary.
+    // Only local (workspace) units swap; deps keep their cached rustc drvs.
+    let use_clippy = clippy_path.is_some()
+        && unit.is_local
+        && !matches!(unit.kind, UnitKind::Doc | UnitKind::BuildScriptRun);
+    let effective_rustc = if use_clippy {
+        clippy_path.unwrap()
+    } else {
+        rustc_path
+    };
+
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -92,7 +123,7 @@ pub(super) fn construct_derivation(
             units,
             key_to_idx,
             dep_drv_map,
-            rustc_path,
+            effective_rustc,
             proc_macro_rlib,
             resolved_sysroot,
             &coreutils_bin_dir,
@@ -100,6 +131,9 @@ pub(super) fn construct_derivation(
             profile,
             target,
             win_sdk_lib_dirs,
+            if use_clippy { clippy_lint_args } else { &[] },
+            path_prefix_remaps,
+            src_store,
         )?,
     };
 
@@ -178,6 +212,13 @@ pub(super) fn construct_derivation(
     for path in rustc_closure {
         input_srcs.insert(path.clone());
     }
+    // clippy-driver's closure is added only to local units that actually run
+    // clippy.  Adding it unconditionally would invalidate dep unit caches.
+    if use_clippy {
+        for path in clippy_closure {
+            input_srcs.insert(path.clone());
+        }
+    }
     input_srcs.insert(coreutils_store.to_string());
 
     if unit.needs_linker || unit.kind == UnitKind::BuildScriptRun {
@@ -246,6 +287,15 @@ fn build_compile_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
+    // Extra rustc / clippy-driver flags appended after every other
+    // arg.  Used to forward post-`--` clippy lint flags such as
+    // `--deny warnings`; empty for normal compile units.
+    extra_rustc_args: &[String],
+    // `--remap-path-prefix` rules.  See `construct_derivation` doc.
+    path_prefix_remaps: &[(String, String)],
+    // Project-src store path; remaps with `src_relative = ""` rewrite this
+    // root, longer entries rewrite subdirectories.
+    src_store: &str,
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -390,6 +440,34 @@ fn build_compile_script(
             parts.push("-L".into());
             parts.push(format!("dependency={}", placeholder));
         }
+    }
+
+    // `--remap-path-prefix`: rewrite source paths in diagnostics, debug
+    // info, and macro expansions.  Each `(src_relative, replacement)` is
+    // interpreted relative to `src_store` so callers don't have to know the
+    // per-build content-addressed hash; empty `src_relative` rewrites the
+    // project-src root itself.  rustc resolves multiple remaps with
+    // "last matching wins" — sort shortest-first so longer (more specific)
+    // entries override shorter ones for paths that match both.
+    let mut sorted_remaps: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
+    sorted_remaps.sort_by_key(|(src_relative, _)| src_relative.len());
+    for (src_relative, replacement) in sorted_remaps {
+        let from = if src_relative.is_empty() {
+            src_store.to_string()
+        } else {
+            format!("{}/{}", src_store, src_relative)
+        };
+        parts.push("--remap-path-prefix".into());
+        parts.push(shell_quote(&format!("{}={}", from, replacement)));
+    }
+
+    // Caller-supplied flags forwarded to clippy-driver (or rustc).  For
+    // clippy units this is e.g. `["--deny", "warnings"]` from
+    // `cargo schnee clippy -- --deny warnings`; empty for regular
+    // compile units.  Appended last so the deny level applies on top of
+    // any allow level set by earlier flags.
+    for arg in extra_rustc_args {
+        parts.push(shell_quote(arg));
     }
 
     // Build the script
@@ -897,8 +975,12 @@ pub(super) fn nix_store_closure(store_path: &str) -> Result<Vec<String>> {
 }
 
 pub(super) fn nix_derivation_add(json: &serde_json::Value) -> Result<String> {
-    let json_str = serde_json::to_string(json)?;
-    debug!("nix derivation add input: {}", json_str);
+    use super::derivation_format::{NixDerivation, StoreDir, TargetNix};
+    let target = TargetNix::detect()?;
+    let store = StoreDir::detect();
+    let derivation = NixDerivation::from_ir(json, target, &store)?;
+    let json_str = serde_json::to_string(&derivation)?;
+    debug!("nix derivation add input ({:?}): {}", target, json_str);
     let mut child = Command::new("nix")
         .args([
             "derivation",

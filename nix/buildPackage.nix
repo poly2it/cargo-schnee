@@ -23,6 +23,15 @@
   extraSources ? {},
   env ? {},
   passthruEnv ? [],
+  # Canonical name of the project-src in the consuming repo, e.g. `"crates"`
+  # for a workspace under `crates/`.  When set, every compile unit's rustc
+  # gets `--remap-path-prefix=<src_store>=<sourceRootPrefix>` so paths in
+  # diagnostics, debug info, and macro expansions emerge as
+  # `<sourceRootPrefix>/<crate>/...` instead of pointing into the per-build
+  # store hash.  Per-extraSource remaps are auto-derived from each entry's
+  # `inTreeName` so sibling-workspace path-deps keep their natural
+  # repo-relative form.  `null` (the default) emits no remaps.
+  sourceRootPrefix ? null,
   wrapBinaries ? false,
   doCheck ? true,
   preCheck ? "",
@@ -33,6 +42,13 @@
   postInstall ? "",
   postFixup ? "",
   meta ? {},
+  # Set true to skip the cargo build step entirely.  Used by testPackage /
+  # clippyPackage which run their work in checkPhase only.
+  dontBuild ? false,
+  # Override the derived installPhase.  When null (default), buildPackage
+  # uses its native or Windows install phase that copies binaries out of
+  # target/.  Test / lint wrappers pass a marker-writing script instead.
+  installPhase ? null,
   ...
 }@args:
 
@@ -273,7 +289,8 @@ let
     runHook postInstall
   '';
 
-  installPhase = if isWindows then installPhaseWindows else installPhaseNative;
+  derivedInstallPhase = if isWindows then installPhaseWindows else installPhaseNative;
+  effectiveInstallPhase = if installPhase != null then installPhase else derivedInstallPhase;
 
   # -- wrapBinaries (postFixup) -------------------------------------------
   wrapBinariesScript = lib.optionalString wrapBinaries ''
@@ -307,6 +324,27 @@ let
     CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
   };
 
+  # -- pathPrefixRemaps ---------------------------------------------------
+  # Compose the `--remap-path-prefix` rules from `sourceRootPrefix` plus
+  # per-extraSource identity remaps (each entry lands at
+  # `<src_store>/<inTreeName>` in the sandbox, so identity-remap each back to
+  # its inTreeName — without this, a sourceRootPrefix-driven root remap
+  # would over-prefix sibling-workspace path-deps).
+  rootRemap = lib.optionalAttrs (sourceRootPrefix != null) {"" = sourceRootPrefix;};
+  extraSourceRemaps = lib.mapAttrs' (relPath: _:
+    let name = sanitiseName relPath; in lib.nameValuePair name name
+  ) extraSources;
+  effectivePathPrefixRemaps = rootRemap // extraSourceRemaps;
+
+  # Encode as a JSON list of two-element arrays so cargo-schnee can
+  # deserialise into `Vec<(String, String)>` without ambiguity.  Empty
+  # combined map emits no env var so unmodified consumers see no change.
+  pathPrefixRemapsAttrs = lib.optionalAttrs (effectivePathPrefixRemaps != {}) {
+    CARGO_SCHNEE_PATH_PREFIX_REMAPS = builtins.toJSON (
+      lib.mapAttrsToList (from: to: [from to]) effectivePathPrefixRemaps
+    );
+  };
+
   # -- extra args passthrough ---------------------------------------------
   # Forward unrecognised attributes (e.g. postUnpack, patches, …) to
   # buildRustPackage, excluding the ones we consumed above.
@@ -314,9 +352,10 @@ let
     "pkgs" "src" "cargoLock" "cargoHash" "cargoDeps"
     "pname" "version" "package" "hostPkgs" "target" "rustToolchain"
     "nativeBuildInputs" "buildInputs" "cargoExtraArgs"
-    "extraSources" "env" "passthruEnv" "wrapBinaries" "doCheck"
+    "extraSources" "env" "passthruEnv" "sourceRootPrefix" "wrapBinaries" "doCheck"
     "preCheck" "postCheck"
     "buildType" "preBuild" "postBuild" "postInstall" "postFixup" "meta"
+    "dontBuild" "installPhase"
   ];
   extraAttrs = removeAttrs args consumedKeys;
 
@@ -330,7 +369,8 @@ in
     inherit src;
     inherit buildType;
     inherit cargoBuildFlags;
-    inherit installPhase;
+    inherit dontBuild;
+    installPhase = effectiveInstallPhase;
     inherit preBuild postBuild postInstall meta;
 
     nativeBuildInputs = [ pkgs.nix ]
@@ -359,12 +399,15 @@ in
 
     postFixup = wrapBinariesScript + postFixup;
 
-    env = wineEnvAttrs // env // passthruEnvAttrs;
-  } // lib.optionalAttrs (target != null) {
+    env = wineEnvAttrs // env // passthruEnvAttrs // pathPrefixRemapsAttrs;
+  } // lib.optionalAttrs (target != null) (
     # Bypass cargoBuildHook/cargoCheckHook which inject the host --target.
-    buildPhase = buildPhaseForTarget;
-    checkPhase = checkPhaseForTarget;
-  } // lib.optionalAttrs isWindows {
+    # buildPhase is only set when we actually want to build — wrappers that
+    # run their work in checkPhase (testPackage, clippyPackage) pass
+    # dontBuild = true and rely on the standard dontBuild noop.
+    { checkPhase = checkPhaseForTarget; }
+    // lib.optionalAttrs (!dontBuild) { buildPhase = buildPhaseForTarget; }
+  ) // lib.optionalAttrs isWindows {
     # patchelf/strip don't work on PE binaries
     dontFixup = true;
   })
