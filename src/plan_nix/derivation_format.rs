@@ -1,6 +1,16 @@
 //! Strongly-typed JSON shapes for `nix derivation add` across the Nix 2.x
-//! schema timeline, plus runtime detection of which shape the local store
+//! schema timeline, plus runtime detection of which shape the local CLI
 //! accepts.
+//!
+//! Detection probes `nix --version` and dispatches on the CLI's version,
+//! NOT the daemon's. The output of this module is fed to a `nix
+//! derivation add` subprocess, so the receiving parser is the local CLI
+//! binary's. On systems where the daemon and the CLI happen to be
+//! different versions (e.g. a rolling daemon upgrade where the user's
+//! PATH still resolves the older CLI), targeting the daemon would emit
+//! JSON the CLI cannot parse. The cargo-schnee daemon-protocol path uses
+//! ATerm bytes via `add_text_to_store` — JSON formatting does not enter
+//! that path.
 //!
 //! cargo-schnee's internal IR — built by [`construct_derivation`] in
 //! `derivation.rs` — predates the schema-versioning era. Conversion to the
@@ -48,13 +58,12 @@
 //!   `Derivation::from_json` in `src/libstore/derivations.cc`.
 
 use anyhow::{Context, Result};
-use log::debug;
+use tracing::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use super::daemon::NixDaemonConn;
 
 // ---------------------------------------------------------------------------
 // Store directory
@@ -116,9 +125,20 @@ impl TargetNix {
         }
     }
 
-    /// Detect once per process. Prefers the daemon handshake, falling back
-    /// to `nix --version` only if the daemon is unreachable or its protocol
-    /// predates 1.33 (when the version string was added to the handshake).
+    /// Detect once per process by probing the local `nix` CLI binary.
+    ///
+    /// **The detection target is the CLI, not the daemon.** This module's
+    /// only consumer is the `nix_derivation_add` fallback in
+    /// `derivation.rs`, which spawns `nix derivation add` as a
+    /// subprocess of the local `nix` binary — its JSON parser is what
+    /// reads our output. On systems where the daemon process and the
+    /// CLI binary are different Nix versions (e.g. an in-place daemon
+    /// upgrade where the system PATH still resolves to the old CLI),
+    /// targeting the daemon would emit JSON the CLI cannot parse. The
+    /// daemon version is irrelevant here because the daemon-side
+    /// integration in this crate uses the binary worker protocol via
+    /// `add_text_to_store`, which speaks ATerm bytes rather than the
+    /// versioned JSON format.
     pub(super) fn detect() -> Result<Self> {
         static CACHED: OnceLock<TargetNix> = OnceLock::new();
         if let Some(t) = CACHED.get() {
@@ -131,23 +151,15 @@ impl TargetNix {
 }
 
 fn detect_uncached() -> Result<TargetNix> {
-    if let Some(version) = detect_via_daemon() {
-        debug!("Detected Nix version via daemon handshake: {}", version);
-        let (major, minor) = parse_version(&version)
-            .with_context(|| format!("Could not parse Nix version from daemon: {:?}", version))?;
-        return Ok(TargetNix::for_version(major, minor));
-    }
-    debug!("Daemon unavailable or pre-1.33; falling back to `nix --version`");
     let version = run_nix_version_cli()?;
     let (major, minor) = parse_version(&version).with_context(|| {
         format!("Could not parse Nix version from `nix --version`: {:?}", version)
     })?;
+    debug!(
+        "Detected Nix CLI version {}.{} via `nix --version`",
+        major, minor,
+    );
     Ok(TargetNix::for_version(major, minor))
-}
-
-fn detect_via_daemon() -> Option<String> {
-    let conn = NixDaemonConn::connect().ok()?;
-    conn.nix_version().map(str::to_owned)
 }
 
 fn run_nix_version_cli() -> Result<String> {
@@ -375,15 +387,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_daemon_and_cli_version_strings() {
-        // Daemon protocol >= 1.33 sends a bare version string.
-        assert_eq!(parse_version("2.34.7"), Some((2, 34)));
-        assert_eq!(parse_version("2.31.3\n"), Some((2, 31)));
+    fn parses_cli_version_strings() {
         // `nix --version` CLI output.
         assert_eq!(parse_version("nix (Nix) 2.31.3\n"), Some((2, 31)));
         assert_eq!(parse_version("nix (Nix) 2.34.7"), Some((2, 34)));
         // Lix CLI marker.
         assert_eq!(parse_version("lix (Lix, like Nix) 2.93.0"), Some((2, 93)));
+        // Bare version (e.g. from `nix-store --version` or daemon
+        // diagnostic logs); kept for robustness even though the live
+        // detector only consumes `nix --version`.
+        assert_eq!(parse_version("2.34.7"), Some((2, 34)));
         // Edge cases — fail loudly rather than guess.
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("nix-2.18.1\n"), None);
