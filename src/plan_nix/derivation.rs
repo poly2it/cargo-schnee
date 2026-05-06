@@ -2,7 +2,7 @@ use super::util::{collect_store_paths, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
 use anyhow::{Context, Result};
-use log::debug;
+use tracing::debug;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -424,7 +424,7 @@ fn build_compile_script(
             parts.push("--extern".into());
             parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
         } else {
-            log::warn!(
+            tracing::warn!(
                 "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
                 unit.key,
                 extern_name,

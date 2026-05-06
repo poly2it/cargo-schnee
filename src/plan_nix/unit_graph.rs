@@ -216,16 +216,17 @@ pub(super) fn extract_units_from_bcx(
             }
         }
 
-        if log::log_enabled!(log::Level::Debug) {
-            let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
-            dep_names.sort();
-            log::debug!(
-                "dep_extern_map for {} after first pass ({} entries): {:?}",
-                key,
-                dep_extern_map.len(),
-                dep_names,
-            );
-        }
+        // tracing's macros are lazy — the format args are not evaluated
+        // unless the event is enabled — so the explicit log_enabled
+        // gate that the `log` crate needed is no longer required.
+        let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
+        dep_names.sort();
+        tracing::debug!(
+            "dep_extern_map for {} after first pass ({} entries): {:?}",
+            key,
+            dep_extern_map.len(),
+            dep_names,
+        );
 
         // Fix missing optional deps activated by features but absent from the
         // unit graph edge list.  This happens when optional deps are declared
@@ -272,7 +273,7 @@ pub(super) fn extract_units_from_bcx(
                     }) {
                         let dep_key = key_map[candidate].clone();
                         let already_present = dep_extern_map.contains_key(&extern_name);
-                        log::debug!(
+                        tracing::debug!(
                             "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
                              already_in_dep_extern={}",
                             dep_toml_name,
@@ -290,7 +291,7 @@ pub(super) fn extract_units_from_bcx(
                         // Dep is behind a target-specific gate (e.g.
                         // cfg(windows)) and absent from the unit graph on
                         // this platform — expected, not actionable.
-                        log::debug!(
+                        tracing::debug!(
                             "Feature-activated dep {} (dep:{}) not in unit graph for {} \
                              (platform-gated, expected)",
                             extern_name,
@@ -298,7 +299,7 @@ pub(super) fn extract_units_from_bcx(
                             key,
                         );
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
                             extern_name,
                             dep_toml_name,
@@ -311,7 +312,7 @@ pub(super) fn extract_units_from_bcx(
             for (extern_name, dep_key) in
                 find_missing_feature_deps(&dep_extern_map, &features, &feature_dep_activations)
             {
-                log::info!(
+                tracing::info!(
                     "Adding missing optional dep {} -> {} for {} \
                      (feature-activated, possibly behind platform gate)",
                     extern_name,
@@ -415,7 +416,7 @@ pub(super) fn extract_units_from_bcx(
         for u in &nix_units {
             for (ext_name, dep_key) in &u.dep_extern {
                 if !valid_keys.contains(dep_key.as_str()) {
-                    log::warn!(
+                    tracing::warn!(
                         "Stale dep_extern after unification: {} has {} -> key {} \
                          which does NOT match any NixUnit",
                         u.key,
@@ -893,7 +894,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
 /// cargo's v2 resolver produces separate host/target feature sets for the same
 /// crate (e.g. proc_macro2 with and without `span-locations`).
 fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
-    use log::info;
+    use tracing::info;
 
     // Group indices by a feature-agnostic key.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();

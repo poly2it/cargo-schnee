@@ -17,7 +17,6 @@ use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
 use clap::{Parser, Subcommand};
-use log::LevelFilter;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};
@@ -51,6 +50,22 @@ struct SchneeArgs {
     /// Verify in-process .drv path computation against nix derivation add (debug)
     #[arg(long, global = true)]
     verify_drv_paths: bool,
+
+    /// Disable the unit-graph cache for this run.  Bypasses both the
+    /// in-tree `target/.schnee-cache.json` cache and the
+    /// `CARGO_SCHNEE_UNIT_GRAPH` env-var hand-off, forcing a full cargo
+    /// bootstrap.  Use this when investigating a suspected stale-graph
+    /// issue.
+    #[arg(long, global = true)]
+    no_graph_cache: bool,
+
+    /// Number of parallel daemon connections to use for derivation
+    /// registration.  Defaults to the number of available CPU cores,
+    /// capped per topo level by the level's width.  Set to `1` to
+    /// reproduce the pre-parallel behaviour for diagnosing
+    /// non-determinism.
+    #[arg(long, global = true)]
+    registration_jobs: Option<usize>,
 
     #[command(subcommand)]
     command: SchneeCommand,
@@ -344,6 +359,47 @@ enum SchneeCommand {
         #[arg(long)]
         vendor_dir: PathBuf,
     },
+    /// Compute the unit graph and write it to a JSON file. Used by
+    /// `nix/unitGraph.nix` to pre-compute the graph as a content-addressed
+    /// derivation that downstream `buildPackage` invocations consume via
+    /// `CARGO_SCHNEE_UNIT_GRAPH`.
+    ComputeGraph {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: PathBuf,
+        /// Build artifacts in release mode, with optimizations
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to plan for (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+        /// Cargo subcommand intent the graph is being computed for. Defaults
+        /// to `build`. Affects which units cargo's resolver materialises
+        /// (e.g. `test` and `doc` add additional units).
+        #[arg(long, default_value = "build")]
+        intent: String,
+        /// Where to write the resulting graph JSON.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 /// Recursively copy the contents of `src_dir` into `dst_dir`, overwriting
@@ -606,7 +662,7 @@ fn find_external_path_deps(project_dir: &Path) -> Result<HashMap<PathBuf, String
     }
 
     if !external.is_empty() {
-        log::info!(
+        tracing::info!(
             "Found {} external path dep(s): {:?}",
             external.len(),
             external.values().collect::<Vec<_>>()
@@ -795,7 +851,7 @@ fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
                         .with_context(|| format!("Failed to copy {}", src_path.display()))?;
                 }
             }
-            log::info!(
+            tracing::info!(
                 "Extra source copy: {} files from {}",
                 files.len(),
                 source_dir.display()
@@ -803,7 +859,7 @@ fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
         }
         None => {
             copy_dir_excluding(source_dir, dest, &["target", ".git", ".direnv", "result"])?;
-            log::info!("Extra source copy (no git): {}", source_dir.display());
+            tracing::info!("Extra source copy (no git): {}", source_dir.display());
         }
     }
     Ok(())
@@ -1087,7 +1143,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                         }
                     }
                 }
-                Err(e) => log::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
+                Err(e) => tracing::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
             }
         }
         if count > 0 {
@@ -1097,7 +1153,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
 
     // Detect external path dependencies
     let external_deps = find_external_path_deps(project_dir).unwrap_or_else(|e| {
-        log::warn!("Failed to detect external path deps: {}", e);
+        tracing::warn!("Failed to detect external path deps: {}", e);
         HashMap::new()
     });
 
@@ -1110,13 +1166,13 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
             Ok(nar_data) => {
                 let store_path = nar::compute_nar_store_path("project-src", &nar_data);
                 if Path::new(&store_path).exists() {
-                    log::info!("Source store path exists: {}", store_path);
+                    tracing::info!("Source store path exists: {}", store_path);
                     return Ok(store_path);
                 }
-                log::info!("Source store path miss, falling back to subprocess");
+                tracing::info!("Source store path miss, falling back to subprocess");
             }
             Err(e) => {
-                log::info!(
+                tracing::info!(
                     "NAR serialization failed ({}), falling back to subprocess",
                     e
                 );
@@ -1141,10 +1197,10 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                         .with_context(|| format!("Failed to copy {}", src_path.display()))?;
                 }
             }
-            log::info!("Source copy: {} files via git2", files.len());
+            tracing::info!("Source copy: {} files via git2", files.len());
         }
         None => {
-            log::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
+            tracing::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
             copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
         }
     }
@@ -1188,7 +1244,7 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
     let repo = match git2::Repository::discover(project_dir) {
         Ok(r) => r,
         Err(_) => {
-            log::info!("Not a git repo, using hardcoded excludes");
+            tracing::info!("Not a git repo, using hardcoded excludes");
             return Ok(None);
         }
     };
@@ -1227,7 +1283,7 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
         }
     }
 
-    log::info!("Source: {} files via git2", files.len());
+    tracing::info!("Source: {} files via git2", files.len());
     Ok(Some(files))
 }
 
@@ -1305,6 +1361,78 @@ struct UnitGraphCacheEntry {
     units: Vec<plan_nix::NixUnit>,
     target_cfg_envs: Vec<(String, String)>,
     host_cfg_envs: Vec<(String, String)>,
+    /// Cache key the entry was generated for. Always populated — both
+    /// the in-tree `target/.schnee-cache.json` cache and the
+    /// `cargo-schnee compute-graph` standalone files write it, so the
+    /// env-var hand-off path and the on-disk-cache path use the same
+    /// validation routine. Old caches written without this field
+    /// deserialise as the default empty string and miss validation,
+    /// triggering a fresh bootstrap.
+    #[serde(default)]
+    cache_key: String,
+}
+
+/// Read and validate a unit-graph entry from `path`. Returns the entry
+/// only if its embedded `cache_key` matches `expected_key` exactly. On
+/// any kind of mismatch (missing file, parse error, wrong key, no key)
+/// emits a warning and returns `None` so the caller falls back to a
+/// fresh bootstrap.
+fn parse_unit_graph_file(path: &Path, expected_key: &str) -> Option<UnitGraphCacheEntry> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read unit-graph file {}: {}",
+                path.display(),
+                e,
+            );
+            return None;
+        }
+    };
+    let entry: UnitGraphCacheEntry = match serde_json::from_str(&data) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to parse unit-graph file {}: {}",
+                path.display(),
+                e,
+            );
+            return None;
+        }
+    };
+    if entry.cache_key.is_empty() {
+        tracing::warn!(
+            "Unit-graph file {} has no cache_key field (likely an old cache)",
+            path.display(),
+        );
+        return None;
+    }
+    if entry.cache_key != expected_key {
+        tracing::warn!(
+            "Unit-graph file {} cache_key mismatch (expected {}, got {})",
+            path.display(),
+            expected_key,
+            entry.cache_key,
+        );
+        return None;
+    }
+    Some(entry)
+}
+
+/// Read a unit-graph entry from `CARGO_SCHNEE_UNIT_GRAPH`, returning it
+/// only if the embedded `cache_key` matches `expected_key`.
+///
+/// The env var may point at a JSON file directly or at a directory
+/// containing `graph.json` (the layout `nix/unitGraph.nix` writes).
+fn try_load_unit_graph_from_env(expected_key: &str) -> Option<UnitGraphCacheEntry> {
+    let raw = std::env::var("CARGO_SCHNEE_UNIT_GRAPH").ok()?;
+    let path = std::path::PathBuf::from(&raw);
+    let path = if path.is_dir() {
+        path.join("graph.json")
+    } else {
+        path
+    };
+    parse_unit_graph_file(&path, expected_key)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -1418,7 +1546,7 @@ fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<
                         }
                     }
                     Err(e) => {
-                        log::warn!("Invalid workspace member glob pattern '{}': {}", pattern, e);
+                        tracing::warn!("Invalid workspace member glob pattern '{}': {}", pattern, e);
                     }
                 }
             }
@@ -1743,6 +1871,15 @@ fn run_build_pipeline(
     // Empty for non-clippy commands and ignored for dependency units so
     // their per-unit derivations stay byte-shared with regular runs.
     clippy_lint_args: &[String],
+    // Bypass the unit-graph cache (both `target/.schnee-cache.json` and the
+    // `CARGO_SCHNEE_UNIT_GRAPH` env var). Set by the global
+    // `--no-graph-cache` flag on `SchneeArgs`.
+    no_graph_cache: bool,
+    // Worker count for parallel derivation registration. `None` defaults
+    // to the number of available CPU cores; `Some(1)` reproduces the
+    // pre-parallel behaviour. Capped per level by the level's width
+    // inside `run_plan_nix`.
+    registration_jobs: Option<usize>,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1756,7 +1893,7 @@ fn run_build_pipeline(
     let ws_root_manifest_canon = ws_root_manifest.canonicalize().unwrap_or(ws_root_manifest);
     let packages = if packages.is_empty() && manifest_path != ws_root_manifest_canon {
         let pkg_name = read_package_name(&manifest_path)?;
-        log::info!(
+        tracing::info!(
             "Scoping build to package '{}' (manifest at {})",
             pkg_name,
             manifest_path.display(),
@@ -1855,9 +1992,27 @@ fn run_build_pipeline(
         features_str,
         no_default_features,
     );
-    let cached_entry = cache.unit_graphs.get(&unit_graph_key);
+    // If `CARGO_SCHNEE_UNIT_GRAPH` points at a graph generated for the
+    // same `unit_graph_key`, fold its contents into the in-memory cache so
+    // the lookup below treats it identically to a `target/`-cached entry.
+    // This is the in-derivation hand-off used by `nix/buildPackage.nix`,
+    // where `target/` is throwaway and the file cache provides nothing.
+    if !no_graph_cache && !cache.unit_graphs.contains_key(&unit_graph_key) {
+        if let Some(entry) = try_load_unit_graph_from_env(&unit_graph_key) {
+            tracing::info!(
+                "Loaded unit graph from CARGO_SCHNEE_UNIT_GRAPH ({} units)",
+                entry.units.len(),
+            );
+            cache.unit_graphs.insert(unit_graph_key.clone(), entry);
+        }
+    }
+    let cached_entry = if no_graph_cache {
+        None
+    } else {
+        cache.unit_graphs.get(&unit_graph_key)
+    };
     let cached_units = cached_entry.map(|e| {
-        log::info!("Unit graph cache hit ({} units)", e.units.len());
+        tracing::info!("Unit graph cache hit ({} units)", e.units.len());
         (e.src_store.clone(), e.units.clone())
     });
     let cached_cfg_envs = cached_entry.map(|e| e.target_cfg_envs.clone());
@@ -1875,7 +2030,7 @@ fn run_build_pipeline(
         .filter_map(|name| match std::env::var(&name) {
             Ok(val) => Some((name, val)),
             Err(_) => {
-                log::warn!(
+                tracing::warn!(
                     "passthruEnv: {} is declared but not set in the environment — \
                      it will not be forwarded to build scripts",
                     name,
@@ -1919,11 +2074,14 @@ fn run_build_pipeline(
         clippy,
         clippy_lint_args,
         &path_prefix_remaps,
+        registration_jobs,
     )?;
 
-    // Update unit graph cache
+    // Update unit graph cache. The `cache_key` field is populated for
+    // both in-tree and `compute-graph`-emitted entries so the load
+    // path uses the same defence-in-depth check regardless of source.
     cache.unit_graphs.insert(
-        unit_graph_key,
+        unit_graph_key.clone(),
         UnitGraphCacheEntry {
             src_store: src_store.clone(),
             units: plan_units
@@ -1936,6 +2094,7 @@ fn run_build_pipeline(
                 .collect(),
             target_cfg_envs: cfg_envs,
             host_cfg_envs,
+            cache_key: unit_graph_key,
         },
     );
 
@@ -2189,7 +2348,7 @@ fn run_build_pipeline(
             if dest.exists()
                 && let Err(e) = std::fs::remove_file(&dest)
             {
-                log::debug!("Failed to remove old file {}: {}", dest.display(), e);
+                tracing::debug!("Failed to remove old file {}: {}", dest.display(), e);
             }
             std::fs::copy(entry.path(), &dest).with_context(|| {
                 format!(
@@ -2234,7 +2393,7 @@ fn run_build_pipeline(
                 if clean_dest.exists()
                     && let Err(e) = std::fs::remove_file(&clean_dest)
                 {
-                    log::debug!(
+                    tracing::debug!(
                         "Failed to remove old binary {}: {}",
                         clean_dest.display(),
                         e
@@ -2297,7 +2456,7 @@ fn run_build_pipeline(
 
     // Save cache
     if let Err(e) = cache.save(project_dir) {
-        log::warn!("Failed to save build cache: {}", e);
+        tracing::warn!("Failed to save build cache: {}", e);
     }
 
     if let Some(profile_path) = write_profile_to {
@@ -2370,20 +2529,83 @@ fn cleanup_stale_temps() {
     }
 }
 
+/// Always installs a `fmt` layer to stderr matching the previous
+/// `env_logger` output (no target prefix, no timestamps). When
+/// `CARGO_SCHNEE_TRACE=<path>` is set, a `tracing-chrome` layer is
+/// additionally installed that writes a `chrome://tracing` JSON file
+/// to that path. The returned `FlushGuard` joins the writer thread on
+/// drop, so the trace file is flushed cleanly when `main` returns.
+///
+/// Filter precedence: `SCHNEE_LOG` env var, then `RUST_LOG`, then the
+/// `--verbose` count (0=warn, 1=info, 2=debug, ≥3=trace, scoped to the
+/// `cargo_schnee` module).
+///
+/// File-creation failures for `CARGO_SCHNEE_TRACE` are warned about
+/// rather than panicking — pre-flighting the create avoids
+/// `tracing_chrome::ChromeLayerBuilder::build()`'s internal `expect`,
+/// which would crash cargo-schnee at startup over a missing parent
+/// directory or perms-denied path.
+fn init_tracing(verbose: u8) -> Option<tracing_chrome::FlushGuard> {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let default_level = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let env_filter = EnvFilter::try_from_env("SCHNEE_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new(format!("cargo_schnee={default_level}")));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time();
+
+    // Pre-flight the trace file. `ChromeLayerBuilder::build()` panics
+    // via `expect` if `File::create` fails; we'd rather warn and
+    // continue without the chrome layer than crash the binary because a
+    // diagnostic env var pointed somewhere unwritable.
+    let chrome = std::env::var("CARGO_SCHNEE_TRACE")
+        .ok()
+        .and_then(|path| match std::fs::File::create(&path) {
+            Ok(file) => Some(
+                tracing_chrome::ChromeLayerBuilder::new()
+                    .writer(std::io::BufWriter::new(file))
+                    .include_args(true)
+                    .build(),
+            ),
+            Err(e) => {
+                eprintln!(
+                    "warning: CARGO_SCHNEE_TRACE={:?}: cannot open trace file ({}); chrome trace disabled",
+                    path, e,
+                );
+                None
+            }
+        });
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    let guard = if let Some((chrome_layer, flush_guard)) = chrome {
+        registry.with(chrome_layer).init();
+        Some(flush_guard)
+    } else {
+        registry.init();
+        None
+    };
+    let _ = tracing_log::LogTracer::init();
+    guard
+}
+
 fn main() -> Result<()> {
     let Cargo::Schnee(args) = Cargo::parse();
 
-    let log_level = match args.verbose {
-        0 => LevelFilter::Warn,
-        1 => LevelFilter::Info,
-        2 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
-    };
-    env_logger::Builder::new()
-        .filter_module("cargo_schnee", log_level)
-        .format_target(false)
-        .format_timestamp(None)
-        .init();
+    let _trace_guard = init_tracing(args.verbose);
 
     let interrupted = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
@@ -2395,6 +2617,17 @@ fn main() -> Result<()> {
     let verbose = args.verbose;
     let write_profile_to = args.write_profile_to;
     let verify_drv_paths = args.verify_drv_paths;
+    let no_graph_cache = args.no_graph_cache;
+    // CLI flag wins over env var; the env var is so callers that can't
+    // pass cargo-schnee args through (e.g. `lib.buildPackage` consumers
+    // who'd otherwise need their own `--registration-jobs` plumbing) can
+    // still override the default. Same env-var precedence pattern as
+    // `CARGO_SCHNEE_TRACE` and `CARGO_SCHNEE_UNIT_GRAPH`.
+    let registration_jobs = args.registration_jobs.or_else(|| {
+        std::env::var("CARGO_SCHNEE_REGISTRATION_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    });
 
     match args.command {
         SchneeCommand::Check {
@@ -2426,6 +2659,8 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
         }
         SchneeCommand::Build {
@@ -2457,6 +2692,8 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
         }
         SchneeCommand::Run {
@@ -2490,6 +2727,8 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
 
             // Find the binary to run
@@ -2563,6 +2802,8 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
 
             // Find test binaries (TestCompile roots)
@@ -2623,6 +2864,8 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
@@ -2728,6 +2971,7 @@ fn main() -> Result<()> {
                 false,
                 &[],
                 &[],
+                registration_jobs,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -2781,6 +3025,8 @@ fn main() -> Result<()> {
                 false,
                 true,
                 &lint_args,
+                no_graph_cache,
+                registration_jobs,
             )?;
         }
         SchneeCommand::Doc {
@@ -2817,6 +3063,8 @@ fn main() -> Result<()> {
                 document_private_items,
                 false,
                 &[],
+                no_graph_cache,
+                registration_jobs,
             )?;
 
             // Merge doc outputs into target/doc/
@@ -2898,11 +3146,132 @@ fn main() -> Result<()> {
                 false,
                 &[],
                 &[],
+                registration_jobs,
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {
                 println!("{}", drv_path);
             }
+        }
+        SchneeCommand::ComputeGraph {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref exclude,
+            ref features,
+            no_default_features,
+            ref intent,
+            ref output,
+        } => {
+            let manifest_path = resolve_manifest(manifest_path)?;
+            let project_dir_buf = resolve_workspace_root(&manifest_path)?;
+            let project_dir = project_dir_buf.as_path();
+
+            // Profile / target resolution mirrors `run_build_pipeline`.
+            let profile_cfg = if release {
+                plan_nix::ProfileConfig::release()
+            } else if let Some(p) = profile {
+                match p.as_str() {
+                    "dev" => plan_nix::ProfileConfig::dev(),
+                    "release" => plan_nix::ProfileConfig::release(),
+                    _ => plan_nix::ProfileConfig {
+                        name: p.clone(),
+                        opt_level: "0",
+                        debug_info: true,
+                    },
+                }
+            } else {
+                plan_nix::ProfileConfig::dev()
+            };
+            let target_config = match target {
+                Some(t) => plan_nix::TargetConfig::with_target(t),
+                None => plan_nix::TargetConfig::native(),
+            };
+
+            // Cache-key composition mirrors `run_build_pipeline` so the
+            // env-var hand-off in the build path matches this exactly.
+            let lockfile_path = find_lockfile(project_dir)?;
+            let lockfile_hash = hash_file(&lockfile_path)?;
+            let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
+            let user_intent = match intent.as_str() {
+                "build" => UserIntent::Build,
+                "check" => UserIntent::Check { test: false },
+                "test" => UserIntent::Test,
+                "bench" => UserIntent::Bench,
+                "doc" => UserIntent::Doc {
+                    deps: false,
+                    json: false,
+                },
+                other => anyhow::bail!(
+                    "unknown --intent {:?}: expected build/check/test/bench/doc",
+                    other,
+                ),
+            };
+            let intent_key = match user_intent {
+                UserIntent::Build => "build",
+                UserIntent::Check { .. } => "check",
+                UserIntent::Test => "test",
+                UserIntent::Bench => "bench",
+                UserIntent::Doc { .. } => "doc",
+                _ => "build",
+            };
+            let unit_graph_key = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                lockfile_hash,
+                manifest_hash,
+                profile_cfg.name,
+                target_config.target_triple,
+                intent_key,
+                package.join(","),
+                exclude.join(","),
+                features.join(","),
+                no_default_features,
+            );
+
+            let (units, cfg_envs, host_cfg_envs) = plan_nix::fresh_unit_graph(
+                project_dir,
+                vendor_dir,
+                &profile_cfg,
+                &target_config,
+                user_intent,
+                package,
+                exclude,
+                features,
+                no_default_features,
+            )?;
+
+            // Match the convention used by the in-tree cache: drv_path is
+            // recomputed by every consumer, so don't bake it in.
+            let units: Vec<plan_nix::NixUnit> = units
+                .into_iter()
+                .map(|mut u| {
+                    u.clear_drv_path();
+                    u
+                })
+                .collect();
+
+            let unit_count = units.len();
+            let entry = UnitGraphCacheEntry {
+                src_store: project_dir.to_string_lossy().to_string(),
+                units,
+                target_cfg_envs: cfg_envs,
+                host_cfg_envs,
+                cache_key: unit_graph_key,
+            };
+
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create parent of {}", output.display())
+                })?;
+            }
+            let json = serde_json::to_string_pretty(&entry)
+                .context("Failed to serialise unit graph entry")?;
+            std::fs::write(output, json)
+                .with_context(|| format!("Failed to write {}", output.display()))?;
+            tracing::info!("Wrote {} units to {}", unit_count, output.display());
         }
     }
 
@@ -3205,5 +3574,56 @@ version = "1.2.3"
         copy_dir_recursive(src.path(), dst.path()).unwrap();
         // No error, destination remains valid
         assert!(dst.path().exists());
+    }
+
+    fn write_graph(tmp: &tempfile::TempDir, key: &str) -> PathBuf {
+        let entry = UnitGraphCacheEntry {
+            src_store: "/nix/store/aaa-src".into(),
+            units: Vec::new(),
+            target_cfg_envs: Vec::new(),
+            host_cfg_envs: Vec::new(),
+            cache_key: key.to_string(),
+        };
+        let path = tmp.path().join("graph.json");
+        std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn unit_graph_file_loads_when_key_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "expected-key");
+        let loaded = parse_unit_graph_file(&path, "expected-key");
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().cache_key, "expected-key");
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_key_mismatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "a");
+        assert!(parse_unit_graph_file(&path, "b").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_key_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "");
+        assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.json");
+        assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_parse_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("malformed.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(parse_unit_graph_file(&path, "any").is_none());
     }
 }
