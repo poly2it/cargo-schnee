@@ -32,9 +32,18 @@
 {
   pkgs,
   src,
-  # Vendored crate-source derivation (e.g. from `pkgs.rustPlatform.fetchCargoTarball`
-  # or a hand-rolled vendor dir).  Required.
-  cargoDeps,
+  # Pre-vendored crate-source derivation.  Mutually exclusive with
+  # `cargoLock`; one of the two is required.
+  cargoDeps ? null,
+  # Path to `Cargo.lock`.  When set, deps are vendored via
+  # `pkgs.rustPlatform.importCargoLock`.  Matches `lib.buildPackage`'s
+  # call shape so consumers can swap helpers without restructuring.
+  cargoLock ? null,
+  # Override the derivation pname / version.  When null, both are
+  # derived from the workspace's root Cargo.toml (or from the matching
+  # workspace member when `package` is set).
+  pname ? null,
+  version ? null,
   # `-p <name>` selector.  Workspace builds with no selection pick all
   # default members per cargo's resolver; the planner emits all roots
   # but this prototype only consumes the first.
@@ -66,10 +75,72 @@ let
   inherit (pkgs) lib;
   schneeBin = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
-  basePname = if name != null then name else baseNameOf (toString src);
+  # -- vendoring ----------------------------------------------------------
+  effectiveCargoDeps =
+    if cargoDeps != null then cargoDeps
+    else if cargoLock != null then
+      pkgs.rustPlatform.importCargoLock { lockFile = cargoLock; }
+    else throw "cargo-schnee buildPackagePure: cargoLock or cargoDeps required";
+
+  # -- pname / version auto-detection ------------------------------------
+  # Read the root Cargo.toml.  If it's a single-package manifest
+  # (`[package]` at root), use it.  If it's a workspace, look up the
+  # member that matches `package` (mirrors `lib.buildPackage`'s logic
+  # but without glob expansion — simple member paths only).
+  rootCargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+
+  memberCargoToml =
+    if package != null && (rootCargoToml ? workspace) then
+      let
+        members = rootCargoToml.workspace.members or [];
+        # Pick the first non-glob member whose Cargo.toml has the
+        # matching package name.  Glob members like `crates/*` aren't
+        # auto-expanded here; the consumer can pass `pname` explicitly.
+        findMember = builtins.foldl' (acc: m:
+          if acc != null then acc
+          else if lib.hasInfix "*" m then null
+          else
+            let
+              cargoPath = src + "/${m}/Cargo.toml";
+            in
+              if !builtins.pathExists cargoPath then null
+              else
+                let toml = builtins.fromTOML (builtins.readFile cargoPath);
+                in if (toml.package.name or "") == package then toml else null
+        ) null members;
+      in findMember
+    else null;
+
+  effectiveCargoToml =
+    if memberCargoToml != null then memberCargoToml
+    else if rootCargoToml ? package then rootCargoToml
+    else null;
+
+  detectedPname =
+    if effectiveCargoToml != null
+    then effectiveCargoToml.package.name or null
+    else null;
+  detectedVersion =
+    if effectiveCargoToml != null
+    then
+      let v = effectiveCargoToml.package.version or null;
+      in if builtins.isString v then v else null
+    else null;
+
+  finalPname =
+    if pname != null then pname
+    else if detectedPname != null then detectedPname
+    else if package != null then package
+    else if name != null then name
+    else baseNameOf (toString src);
+  finalVersion =
+    if version != null then version
+    else if detectedVersion != null then detectedVersion
+    else "0.0.0";
+
   # `outputOf` requires the planner's output to be a valid drv path —
   # name must end in `.drv`.
-  drvName = "${basePname}-${intent}.drv";
+  drvName = "${finalPname}-${finalVersion}-${intent}.drv";
 
   # rustToolchain provides rustc, cargo, rustdoc, clippy-driver — all
   # needed by cargo-schnee's planner to extract the unit graph and
@@ -136,7 +207,7 @@ let
       cp "$ROOT" "$out"
     '' ];
 
-    inherit cargoDeps;
+    cargoDeps = effectiveCargoDeps;
 
     # The planner needs daemon access from inside the sandbox to
     # register the unit drvs (`add_text_to_store`).  This is the *only*
@@ -168,7 +239,7 @@ let
   # under bin/ (and lib/ for cdylib / staticlib outputs).  Mirrors the
   # filter logic in `lib.buildPackage`'s installPhaseNative but reads
   # from the root drv's $out rather than from cargo's target/release/.
-  installed = pkgs.runCommand "${basePname}-${intent}" {
+  installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
     inherit rawOutput;
     passthru = { inherit rawOutput planner; };
   } ''
