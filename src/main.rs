@@ -67,6 +67,17 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     registration_jobs: Option<usize>,
 
+    /// Plan and register derivations, then write the resulting root drv
+    /// paths (one per line) to the given file and exit without realising
+    /// anything.  Used by Nix-side helpers (`lib.buildPackage` etc.) to
+    /// avoid the recursive-nix realise call that causes build-user slot
+    /// inversion under concurrent invocations.  The outer Nix scheduler
+    /// realises the root drv path itself via a dynamic-derivation
+    /// reference.  Incompatible with `run` / `bench` / interactive
+    /// progress.
+    #[arg(long, global = true, value_name = "PATH")]
+    plan_only: Option<PathBuf>,
+
     #[command(subcommand)]
     command: SchneeCommand,
 }
@@ -1381,22 +1392,14 @@ fn parse_unit_graph_file(path: &Path, expected_key: &str) -> Option<UnitGraphCac
     let data = match std::fs::read_to_string(path) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!(
-                "Could not read unit-graph file {}: {}",
-                path.display(),
-                e,
-            );
+            tracing::warn!("Could not read unit-graph file {}: {}", path.display(), e,);
             return None;
         }
     };
     let entry: UnitGraphCacheEntry = match serde_json::from_str(&data) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(
-                "Failed to parse unit-graph file {}: {}",
-                path.display(),
-                e,
-            );
+            tracing::warn!("Failed to parse unit-graph file {}: {}", path.display(), e,);
             return None;
         }
     };
@@ -1546,7 +1549,11 @@ fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Invalid workspace member glob pattern '{}': {}", pattern, e);
+                        tracing::warn!(
+                            "Invalid workspace member glob pattern '{}': {}",
+                            pattern,
+                            e
+                        );
                     }
                 }
             }
@@ -1880,6 +1887,10 @@ fn run_build_pipeline(
     // pre-parallel behaviour. Capped per level by the level's width
     // inside `run_plan_nix`.
     registration_jobs: Option<usize>,
+    // When `Some(path)`, write the root drv paths (one per line) to
+    // `path` after registration completes and return early without
+    // realising anything.  See `SchneeArgs::plan_only`.
+    plan_only: Option<&Path>,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -2047,9 +2058,8 @@ fn run_build_pipeline(
     // knowing the per-build store hash.
     let path_prefix_remaps: Vec<(String, String)> =
         match std::env::var("CARGO_SCHNEE_PATH_PREFIX_REMAPS") {
-            Ok(s) if !s.is_empty() => serde_json::from_str(&s).with_context(|| {
-                format!("parse CARGO_SCHNEE_PATH_PREFIX_REMAPS as JSON: {}", s)
-            })?,
+            Ok(s) if !s.is_empty() => serde_json::from_str(&s)
+                .with_context(|| format!("parse CARGO_SCHNEE_PATH_PREFIX_REMAPS as JSON: {}", s))?,
             _ => Vec::new(),
         };
 
@@ -2099,6 +2109,27 @@ fn run_build_pipeline(
     );
 
     let plan_duration = plan_start.elapsed();
+
+    // --plan-only: write root drv paths and return without realising.
+    // Realisation moves to the outer Nix scheduler via a dynamic-derivation
+    // reference, eliminating the recursive-nix slot inversion deadlock that
+    // bites under concurrent `lib.buildPackage` invocations.
+    if let Some(out_path) = plan_only {
+        let mut content = String::new();
+        for (drv_path, _, _) in &root_drvs {
+            content.push_str(drv_path);
+            content.push('\n');
+        }
+        std::fs::write(out_path, content)
+            .with_context(|| format!("Writing plan output to {}", out_path.display()))?;
+        if let Err(e) = cache.save(project_dir) {
+            tracing::warn!("Failed to save build cache: {}", e);
+        }
+        return Ok(BuildResult {
+            root_drvs: Vec::new(),
+            target_debug: PathBuf::new(),
+        });
+    }
 
     // Build all root derivations
     let project_pkg_name = read_bin_target_name(&manifest_path).ok();
@@ -2628,6 +2659,8 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
     });
+    let plan_only = args.plan_only.clone();
+    let plan_only_ref = plan_only.as_deref();
 
     match args.command {
         SchneeCommand::Check {
@@ -2661,6 +2694,7 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
         }
         SchneeCommand::Build {
@@ -2694,6 +2728,7 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
         }
         SchneeCommand::Run {
@@ -2729,7 +2764,12 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find the binary to run
             let bin_roots: Vec<_> = result
@@ -2804,7 +2844,12 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find test binaries (TestCompile roots)
             let test_roots: Vec<_> = result
@@ -2866,7 +2911,12 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
             let bench_roots: Vec<_> = result
@@ -3027,6 +3077,7 @@ fn main() -> Result<()> {
                 &lint_args,
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
         }
         SchneeCommand::Doc {
@@ -3065,7 +3116,12 @@ fn main() -> Result<()> {
                 &[],
                 no_graph_cache,
                 registration_jobs,
+                plan_only_ref,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Merge doc outputs into target/doc/
             let target_doc = result.target_debug.parent().unwrap().join("doc");
@@ -3263,9 +3319,8 @@ fn main() -> Result<()> {
             };
 
             if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create parent of {}", output.display())
-                })?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create parent of {}", output.display()))?;
             }
             let json = serde_json::to_string_pretty(&entry)
                 .context("Failed to serialise unit graph entry")?;
