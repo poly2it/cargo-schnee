@@ -154,9 +154,45 @@ let
     outputHashAlgo = "sha256";
   };
 
-in
   # `outputOf` is the dyn-derivations primitive: nix realises `planner`
   # first, reads its output as a derivation, then builds that.  Result
   # is the build of the cargo-schnee-emitted root drv, scheduled by the
   # outer nix daemon under one global `max-jobs`.
-  builtins.outputOf planner.outPath "out"
+  rawOutput = builtins.outputOf planner.outPath "out";
+
+  # cargo-schnee's per-unit drv emits the linker output directly with a
+  # cargo-internal hash suffix (e.g. `greeter-3079f61af44b7b4e`) plus
+  # `.d` / `.rmeta` siblings.  Standard nixpkgs convention is
+  # `$out/bin/<name>`, so wrap the raw output in a thin install step
+  # that picks the executable, strips the hash suffix, and lays it out
+  # under bin/ (and lib/ for cdylib / staticlib outputs).  Mirrors the
+  # filter logic in `lib.buildPackage`'s installPhaseNative but reads
+  # from the root drv's $out rather than from cargo's target/release/.
+  installed = pkgs.runCommand "${basePname}-${intent}" {
+    inherit rawOutput;
+    passthru = { inherit rawOutput planner; };
+  } ''
+    mkdir -p $out/bin $out/lib
+    for f in $rawOutput/*; do
+      [ -f "$f" ] || continue
+      name="$(basename "$f")"
+      case "$name" in
+        *.d|*.rmeta|build-script-*|*-build-script|diagnostics) continue ;;
+      esac
+      clean="$(echo "$name" | ${pkgs.gnused}/bin/sed -E 's/-[0-9a-f]{16}$//')"
+      case "$name" in
+        *.so|*.so.*|*.a|*.dylib)
+          install -m644 "$f" "$out/lib/$clean"
+          ;;
+        *)
+          if [ -x "$f" ]; then
+            install -m755 "$f" "$out/bin/$clean"
+          fi
+          ;;
+      esac
+    done
+    rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true
+  '';
+
+in
+  installed
