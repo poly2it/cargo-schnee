@@ -217,6 +217,15 @@ pub struct NixUnit {
     /// vs the target. For native builds host == target so this is irrelevant.
     #[serde(default)]
     pub(crate) for_host: bool,
+    /// Whether this unit must be compiled with `--test`.  Set for any
+    /// integration/unit/example/bench target included via cargo's
+    /// `--all-targets` selection: cargo's bcx represents these as
+    /// `CompileMode::Check { test: true }` (or `CompileMode::Test`),
+    /// and rustc needs `--test` to synthesise a `main` and the test
+    /// harness.  Without it, integration test crates fail at compile
+    /// time with E0601 (`main function not found in crate ...`).
+    #[serde(default)]
+    pub(crate) compile_test: bool,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
 }

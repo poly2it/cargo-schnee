@@ -112,6 +112,30 @@ pub(super) fn extract_units_from_bcx(
             UnitKind::Compile
         };
 
+        // `cargo check --all-targets` pulls integration tests and
+        // benches into the unit graph as `CompileMode::Check { test: true }`.
+        // Those targets need rustc's `--test` flag to synthesise a
+        // `main` and the test harness — without it integration tests
+        // fail with E0601 (`main function not found`).
+        //
+        // Lib/bin targets ALSO get `Check { test: true }` from cargo
+        // when --all-targets includes them (so `cfg(test)` blocks
+        // inside lib/bin source get checked).  Those must NOT get
+        // `--test` — the lib's downstream consumers in the same
+        // graph link against its rmeta as a normal library, and a
+        // `--test`-built rmeta exposes a test harness rather than
+        // the lib's public API, breaking `extern crate` resolution
+        // (E0463 `can't find crate ...`).
+        //
+        // Match on target kind: only test / bench / example targets
+        // get the `--test` bump.  Lib/bin Check{test:true} units
+        // could in principle take `--cfg test` to make cfg(test)
+        // blocks visible, but cargo-schnee hasn't done that
+        // historically and adding it would change every cached
+        // check derivation; leave that for a follow-up.
+        let compile_test = matches!(unit.mode, CompileMode::Check { test: true })
+            && (unit.target.is_test() || unit.target.is_bench());
+
         // Source file
         let source_file = unit
             .target
@@ -399,6 +423,7 @@ pub(super) fn extract_units_from_bcx(
             is_root,
             target_name,
             for_host,
+            compile_test,
             drv_path: None,
         });
     }
@@ -1166,6 +1191,7 @@ mod tests {
             is_root: false,
             target_name: String::new(),
             for_host: false,
+            compile_test: false,
             drv_path: None,
         }
     }

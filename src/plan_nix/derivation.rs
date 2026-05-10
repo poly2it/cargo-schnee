@@ -361,8 +361,12 @@ fn build_compile_script(
         parts.push("prefer-dynamic".into());
     }
 
-    // --test for test harness units (test and bench both use CompileMode::Test)
-    if unit.kind == UnitKind::TestCompile {
+    // --test for test harness units (test and bench both use
+    // CompileMode::Test) AND for any Check unit pulled in via
+    // `--all-targets` whose mode is `CompileMode::Check { test: true }`
+    // — integration tests need rustc to synthesise a `main` and the
+    // harness even in check/clippy intent.
+    if unit.kind == UnitKind::TestCompile || unit.compile_test {
         parts.push("--test".into());
     }
 
@@ -1117,6 +1121,7 @@ mod tests {
             is_root: true,
             target_name: name.to_string(),
             for_host: false,
+            compile_test: false,
             drv_path: None,
         }
     }
