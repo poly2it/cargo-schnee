@@ -2132,10 +2132,34 @@ fn run_build_pipeline(
 
     let plan_duration = plan_start.elapsed();
 
+    // Always construct the aggregator drv after registration: it depends
+    // on every root drv and produces a `$out/root-<idx>` symlink farm
+    // pointing at each root's realised output.  Both the CLI realise path
+    // and the Nix-side `lib.buildPackage` go through this single
+    // derivation; CLI realises directly via `nix-store --realise`, lib.*
+    // chains via `builtins.outputOf`.  Avoids the per-root realisation
+    // conflict that hit `lib.buildPackage` previously and unifies the two
+    // pipelines onto one drv graph.
+    let pname_for_agg = if let Ok(name) = read_package_name(&manifest_path) {
+        name
+    } else if !packages.is_empty() {
+        packages[0].clone()
+    } else {
+        "workspace".to_string()
+    };
+    let aggregator_drv = plan_nix::construct_aggregator_drv(
+        &pname_for_agg,
+        intent_str,
+        &root_drvs,
+        &target_config.nix_system,
+    )
+    .context("Constructing aggregator drv")?;
+
     // --plan-only: write root drv paths and return without realising.
     // Realisation moves to the outer Nix scheduler via a dynamic-derivation
-    // reference, eliminating the recursive-nix slot inversion deadlock that
-    // bites under concurrent `lib.buildPackage` invocations.
+    // reference on the aggregator, eliminating the recursive-nix slot
+    // inversion deadlock that bites under concurrent `lib.buildPackage`
+    // invocations.
     if let Some(out_path) = plan_only {
         let mut content = String::new();
         for (drv_path, _, _) in &root_drvs {
@@ -2146,21 +2170,7 @@ fn run_build_pipeline(
             .with_context(|| format!("Writing plan output to {}", out_path.display()))?;
 
         if let Some(agg_out) = plan_aggregator_out {
-            let pname_for_agg = if let Ok(name) = read_package_name(&manifest_path) {
-                name
-            } else if !packages.is_empty() {
-                packages[0].clone()
-            } else {
-                "workspace".to_string()
-            };
-            let agg_drv = plan_nix::construct_aggregator_drv(
-                &pname_for_agg,
-                intent_str,
-                &root_drvs,
-                &target_config.nix_system,
-            )
-            .context("Constructing aggregator drv")?;
-            std::fs::write(agg_out, format!("{}\n", agg_drv)).with_context(|| {
+            std::fs::write(agg_out, format!("{}\n", aggregator_drv)).with_context(|| {
                 format!("Writing aggregator drv path to {}", agg_out.display())
             })?;
         }
@@ -2174,13 +2184,16 @@ fn run_build_pipeline(
         });
     }
 
-    // Build all root derivations
+    // CLI realise path: ask the daemon to build the aggregator drv.  Its
+    // transitive deps are every per-unit drv the planner registered, so
+    // the daemon emits the same `building '/nix/store/...' lines we
+    // already parse for the inline "Compiling foo v1.2" status output —
+    // unchanged DX, plus one trailing build line for the aggregator
+    // itself (a near-instant symlink farm).
     let project_pkg_name = read_bin_target_name(&manifest_path).ok();
     let mut cmd = Command::new("nix-store");
     cmd.arg("--realise");
-    for (drv_path, _, _) in &root_drvs {
-        cmd.arg(drv_path);
-    }
+    cmd.arg(&aggregator_drv);
     let mut child = cmd
         .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
         .stdout(Stdio::piped())
@@ -2370,10 +2383,18 @@ fn run_build_pipeline(
         }
         std::process::exit(1);
     }
-    let out_paths: Vec<String> = stdout_content
+    // Aggregator output: a single $out path with `root-<idx>`
+    // symlinks pointing at each root's realised output.  Project the
+    // per-root paths into the same shape the rest of the pipeline
+    // expects (one realised path per root, in registration order).
+    let aggregator_out_path = stdout_content
         .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("nix-store --realise emitted no output paths"))?
+        .to_string();
+    let out_paths: Vec<String> = (0..root_drvs.len())
+        .map(|idx| format!("{}/root-{}", aggregator_out_path, idx))
         .collect();
     let build_end = Instant::now();
     let build_duration = build_end.duration_since(build_start);
