@@ -1,60 +1,66 @@
 # lib.testPackage — first-class test API for cargo-schnee.
 #
-# Runs `cargo test` for a single package (by default) inside a sandboxed
-# derivation, sharing per-unit compilation derivations bit-for-bit with the
-# corresponding `buildPackage` invocation thanks to content addressing.
-#
-# Skips the `cargo build` step entirely; cargoCheckHook drives the test
-# compilation and execution in one pass.
+# Builds the test binaries for a single package (by default) via the
+# same dyn-derivation pipeline `lib.buildPackage` uses, then executes
+# them in a downstream `runCommand` whose `$out` is a pass marker.
+# Concurrent test invocations share recursive-nix-free realisation
+# semantics with their build counterparts — no slot inversion.
 { self }:
 
 {
+  pkgs,
   package ? null,
-  # Test scope.  Default is `["--package" package]` when `package` is set,
-  # otherwise `[]` which lets cargo apply its own scoping (current package
-  # by manifest, or the workspace).  Pass `["--workspace"]` to opt in to
-  # the full graph, or `[]` explicitly to disable the implicit `--package`.
+  # Test scope.  Default is `["--package" package]` when `package` is
+  # set, else `[]`.  Matches the previous testPackage API.
   testScope ? null,
-  # Extra args appended after `<scope>`.  Use for `--lib`, `--features X`,
-  # `-- --test-threads=1`, etc.
+  # Extra args appended to the cargo-schnee subcommand.  Use for
+  # `--lib`, `--features X`, etc.
   cargoTestExtraArgs ? [],
+  # Args passed to each test binary at run time.  Use for
+  # `--test-threads=1`, `--nocapture`, filtering, etc.
+  testRunnerArgs ? [],
   ...
 }@args:
 
 let
-  pkgs = args.pkgs;
   inherit (pkgs) lib;
 
-  defaultScope =
-    if package != null then [ "--package" package ] else [];
+  defaultScope = if package != null then [ "--package" package ] else [];
   effectiveScope = if testScope != null then testScope else defaultScope;
-  cargoTestFlags = effectiveScope ++ cargoTestExtraArgs;
+  cargoArgs = effectiveScope ++ cargoTestExtraArgs;
 
-  forwardArgs = removeAttrs args [ "testScope" "cargoTestExtraArgs" "preBuild" "preCheck" ];
+  forwarded = removeAttrs args [
+    "testScope" "cargoTestExtraArgs" "testRunnerArgs"
+  ];
 
-  # With dontBuild = true the entire buildPhase is skipped — including its
-  # preBuild hook.  Splice the caller's preBuild into preCheck so source-
-  # tree mutations (codegen injection, etc.) still happen before cargo test
-  # runs; the working directory is identical at both points.
-  callerPreBuild = args.preBuild or "";
-  callerPreCheck = args.preCheck or "";
-  effectivePreCheck =
-    if callerPreBuild == ""
-    then callerPreCheck
-    else callerPreBuild + "\n" + callerPreCheck;
+  built = self.lib.buildPackage (forwarded // {
+    inherit package;
+    intent = "test";
+    cargoExtraArgs = (args.cargoExtraArgs or []) ++ cargoArgs;
+  });
+
+  runnerArgsStr = lib.escapeShellArgs testRunnerArgs;
+
 in
-self.lib.buildPackage (forwardArgs // {
-  inherit package;
-  doCheck = true;
-  dontBuild = true;
-  wrapBinaries = false;
-  inherit cargoTestFlags;
-  preCheck = effectivePreCheck;
-
-  installPhase = ''
-    runHook preInstall
+  pkgs.runCommand "${built.name}-result" {
+    inherit built;
+    passthru = { inherit built; };
+  } ''
+    set -euo pipefail
     mkdir -p $out
+
+    found=0
+    for bin in "$built"/bin/*; do
+      [ -x "$bin" ] || continue
+      found=1
+      echo "Running $(basename "$bin")..."
+      "$bin" ${runnerArgsStr}
+    done
+
+    if [ "$found" = 0 ]; then
+      echo "no test binaries found in $built/bin" >&2
+      exit 1
+    fi
+
     touch $out/ok
-    runHook postInstall
-  '';
-})
+  ''

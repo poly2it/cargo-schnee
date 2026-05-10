@@ -1,8 +1,30 @@
 # lib.buildPackage — first-class build API for cargo-schnee.
 #
-# Wraps buildRustPackage with cargo-schnee's toolchain wrapper, invariants,
-# and a custom install phase.  Consumers pass a flat attribute set instead of
-# wiring makeCargoWrapper + cargoOverrides + requiredSystemFeatures manually.
+# Pipeline (post-recursive-nix-removal):
+#
+#   1. `planner` derivation runs `cargo-schnee --plan-only` inside its
+#      sandbox.  It still uses the daemon's `add_text_to_store` RPC to
+#      register all unit drvs (and so still requires the
+#      `recursive-nix` system feature *for the planner only*) but does
+#      NOT call `nix-store --realise`.  The sandbox holds one build
+#      user briefly, exits, and never blocks on sub-builds.  Concurrent
+#      planners therefore don't deadlock on the build-user pool.
+#
+#   2. `builtins.outputOf planner.outPath "out"` resolves to a
+#      derivation reference: nix realises the planner first, reads its
+#      output as a drv, then schedules that drv on the *outer*
+#      scheduler — flat unit DAG, one global `max-jobs`, no slot
+#      inversion possible regardless of CI concurrency.
+#
+#   3. A thin `runCommand` install step lays out the cargo-schnee root
+#      drv's output under `$out/bin` and `$out/lib` in nixpkgs
+#      convention, applies `postInstall`, and (optionally) wraps
+#      binaries with `makeWrapper` for `wrapBinaries`.
+#
+# Replaces the previous buildRustPackage-based implementation, which
+# wedged CI under concurrent invocations because every planner
+# sandbox held a build user while waiting on its inner units' own
+# user-pool acquisition.
 { self }:
 
 {
@@ -20,86 +42,92 @@
   nativeBuildInputs ? [],
   buildInputs ? [],
   cargoExtraArgs ? [],
+  # Args appended after `--` to the cargo-schnee subcommand.  Used by
+  # clippyPackage to pass lint flags through to clippy-driver.
+  postDashArgs ? [],
   extraSources ? {},
   env ? {},
   passthruEnv ? [],
-  # Canonical name of the project-src in the consuming repo, e.g. `"crates"`
-  # for a workspace under `crates/`.  When set, every compile unit's rustc
-  # gets `--remap-path-prefix=<src_store>=<sourceRootPrefix>` so paths in
-  # diagnostics, debug info, and macro expansions emerge as
-  # `<sourceRootPrefix>/<crate>/...` instead of pointing into the per-build
-  # store hash.  Per-extraSource remaps are auto-derived from each entry's
-  # `inTreeName` so sibling-workspace path-deps keep their natural
-  # repo-relative form.  `null` (the default) emits no remaps.
   sourceRootPrefix ? null,
   wrapBinaries ? false,
-  doCheck ? true,
+  doCheck ? false,
   preCheck ? "",
   postCheck ? "",
   buildType ? "release",
+  features ? [],
+  noDefaultFeatures ? false,
   preBuild ? "",
   postBuild ? "",
   postInstall ? "",
   postFixup ? "",
   meta ? {},
-  # Set true to skip the cargo build step entirely.  Used by testPackage /
-  # clippyPackage which run their work in checkPhase only.
   dontBuild ? false,
-  # Override the derived installPhase.  When null (default), buildPackage
-  # uses its native or Windows install phase that copies binaries out of
-  # target/.  Test / lint wrappers pass a marker-writing script instead.
   installPhase ? null,
+  # Cargo subcommand intent.  Default is `build`; consumers like
+  # `lib.testPackage` and `lib.clippyPackage` override to `test` /
+  # `clippy`.  Internal-ish — most callers use the `lib.*` wrappers.
+  intent ? "build",
   ...
 }@args:
 
 let
   inherit (pkgs) lib;
+  schneeBin = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
-  # -- cross-compilation --------------------------------------------------
-  effectiveHostPkgs = if hostPkgs != null then hostPkgs else pkgs;
-  isWindows = target != null && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
+  # -- features not yet supported in the dyn-derivation pipeline -----
+  # cargoHash needs the cargoLock vendor path. doCheck inline runs the
+  # test phase in the same drv as the build; the new pipeline splits
+  # build and test into separate derivations, so use lib.testPackage
+  # instead. postBuild / postCheck / postFixup were buildRustPackage
+  # hook points with no equivalent in the direct-derivation model.
+  unsupported = lib.filterAttrs (n: v: v) {
+    "cargoHash" = cargoHash != null;
+    "doCheck = true (use lib.testPackage)" = doCheck;
+    "preCheck (use lib.testPackage)" = preCheck != "";
+    "postCheck (use lib.testPackage)" = postCheck != "";
+    "postBuild" = postBuild != "";
+    "postFixup" = postFixup != "";
+    "dontBuild" = dontBuild;
+    "installPhase override" = installPhase != null;
+    "hostPkgs (cross-compile not yet validated)" = hostPkgs != null;
+  };
+  _ = if unsupported != {} then
+    throw ''
+      cargo-schnee buildPackage: ${
+        lib.concatStringsSep ", " (lib.attrNames unsupported)
+      } not yet supported by the dyn-derivation pipeline.
+      See cargo-schnee's plan for migration status.''
+    else null;
 
-  # CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER etc.
-  cargoTargetEnvPrefix = lib.toUpper (builtins.replaceStrings ["-"] ["_"] target);
+  # -- vendoring ----------------------------------------------------------
+  effectiveCargoDeps =
+    if cargoDeps != null then cargoDeps
+    else if cargoLock != null then
+      pkgs.rustPlatform.importCargoLock { lockFile = cargoLock; }
+    else throw "cargo-schnee buildPackage: cargoLock or cargoDeps required";
 
   # -- pname / version auto-detection ------------------------------------
   rootCargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
 
-  # For workspace builds with `package` set, find the member's Cargo.toml
-  # by scanning workspace.members for a path whose Cargo.toml has a matching name.
-  # Members may contain globs (e.g. "crates/*", "*"), so we expand those first.
-
-  # Expand a single member pattern into concrete directory paths.
-  # "crates/foo" (no glob)   -> [ "crates/foo" ]
-  # "crates/*"               -> list subdirectories of <src>/crates/
-  # "*"                      -> list subdirectories of <src>/
-  # "crates/*/sub"           -> list <src>/crates/X/sub for each X
-  #
-  # Only a single '*' segment is supported (matching Cargo's glob behaviour).
   expandMember = m:
     let
       hasGlob = lib.hasInfix "*" m;
-      # Split the pattern into segments around the glob.
       parts = lib.splitString "/*" m;
-      # prefix: everything before the glob ("crates" for "crates/*", "" for "*")
       prefix = builtins.head parts;
-      # suffix: everything after the glob ("/sub" for "crates/*/sub", "" for "crates/*")
       suffix = lib.concatStrings (builtins.tail parts);
-      # Trim leading "/" from suffix if present
       cleanSuffix = lib.removePrefix "/" suffix;
-      parentDir = if prefix == "*" || prefix == "" then src else src + "/${prefix}";
+      parentDir =
+        if prefix == "*" || prefix == "" then src else src + "/${prefix}";
       entries = builtins.readDir parentDir;
       dirs = lib.filterAttrs (_: type: type == "directory") entries;
-      expanded = builtins.filter (p: builtins.pathExists (src + "/${p}/Cargo.toml")) (
-        map (name:
-          let
-            base = if prefix == "*" || prefix == "" then name else "${prefix}/${name}";
-          in
-            if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
-        ) (builtins.attrNames dirs)
-      );
-    in
-      if hasGlob then expanded else [ m ];
+      expanded = builtins.filter
+        (p: builtins.pathExists (src + "/${p}/Cargo.toml"))
+        (map (n:
+          let base =
+            if prefix == "*" || prefix == "" then n else "${prefix}/${n}";
+          in if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
+        ) (builtins.attrNames dirs));
+    in if hasGlob then expanded else [ m ];
 
   memberCargoToml =
     if package != null && (rootCargoToml ? workspace) then
@@ -109,10 +137,8 @@ let
         findMember = builtins.foldl' (acc: m:
           if acc != null then acc
           else
-            let
-              cargoPath = src + "/${m}/Cargo.toml";
-            in
-              if !builtins.pathExists cargoPath then null
+            let cargoPath = src + "/${m}/Cargo.toml";
+            in if !builtins.pathExists cargoPath then null
               else
                 let toml = builtins.fromTOML (builtins.readFile cargoPath);
                 in if (toml.package.name or "") == package then toml else null
@@ -122,178 +148,226 @@ let
 
   effectiveCargoToml =
     if memberCargoToml != null then memberCargoToml
-    else rootCargoToml;
+    else if rootCargoToml ? package then rootCargoToml
+    else null;
 
   detectedPname =
-    if package != null then package
-    else effectiveCargoToml.package.name or "unknown";
-  rawVersion = effectiveCargoToml.package.version or null;
-  detectedVersion = if builtins.isString rawVersion then rawVersion else "0.1.0";
-  finalPname = if pname != null then pname else detectedPname;
-  finalVersion = if version != null then version else detectedVersion;
+    if effectiveCargoToml != null
+    then effectiveCargoToml.package.name or null else null;
+  detectedVersion =
+    if effectiveCargoToml != null then
+      let v = effectiveCargoToml.package.version or null;
+      in if builtins.isString v then v else null
+    else null;
+
+  # Note: don't fall back to `baseNameOf (toString src)` — when src is a
+  # nix store path that ends up unsafe in derivation names (would imply
+  # a cyclic store-path reference).  Pick a stable string instead and
+  # rely on the consumer to pass `pname` explicitly for workspace-doc
+  # builds where no [package] table exists at the root.
+  finalPname =
+    if pname != null then pname
+    else if detectedPname != null then detectedPname
+    else if package != null then package
+    else "unknown";
+  finalVersion =
+    if version != null then version
+    else if detectedVersion != null then detectedVersion
+    else "0.0.0";
 
   # -- toolchain ----------------------------------------------------------
-  effectiveRustc = if rustToolchain != null then rustToolchain else pkgs.rustc;
-  effectiveCargo = if rustToolchain != null then rustToolchain else pkgs.cargo;
-
-  schneeToolchain = self.lib.makeCargoWrapper {
-    inherit pkgs;
-    rustToolchain = effectiveRustc;
-    cargo = lib.getExe' effectiveCargo "cargo";
-    overrides = self.lib.cargoOverrides { inherit pkgs; };
-  };
-
-  schneeRustPlatform = effectiveHostPkgs.makeRustPlatform {
-    cargo = schneeToolchain;
-    rustc = schneeToolchain;
-  };
-
-  # -- vendoring ----------------------------------------------------------
-  vendorArgs =
-    if cargoDeps != null then { inherit cargoDeps; }
-    else if cargoLock != null then { cargoLock = { lockFile = cargoLock; }; }
-    else if cargoHash != null then { inherit cargoHash; }
-    else throw "cargo-schnee buildPackage: one of cargoLock, cargoHash, or cargoDeps must be provided";
+  effectiveRustToolchain =
+    if rustToolchain != null then rustToolchain else pkgs.rustc;
 
   # -- cargo flags --------------------------------------------------------
-  # Note: --target is NOT added here.  When `target` is set we override
-  # buildPhase entirely (see below) to avoid conflicting with the host
-  # --target that cargoBuildHook bakes in via @rustcTargetSpec@.
-  cargoBuildFlags = cargoExtraArgs
-    ++ lib.optionals (package != null) [ "-p" package ];
+  profileFlag =
+    if buildType == "release" then [ "--release" ]
+    else if buildType == "dev" then [ ]
+    else [ "--profile" buildType ];
+  packageFlags = lib.optionals (package != null) [ "-p" package ];
+  targetFlags = lib.optionals (target != null) [ "--target" target ];
+  featureFlags = lib.concatMap (f: [ "--features" f ]) features;
+  noDefaultFlag = lib.optionals noDefaultFeatures [ "--no-default-features" ];
 
-  # -- custom build phase for explicit target ------------------------------
-  # cargoBuildHook always injects `--target <hostPlatform>`.  When the
-  # caller passes a different `target` (e.g. x86_64-pc-windows-msvc) we
-  # must bypass the hook and call cargo directly.
-  targetBuildFlags = lib.concatStringsSep " " (
-    [ "--target" target ]
-    ++ lib.optionals (buildType == "release") [ "--release" ]
-    ++ lib.optionals (buildType != "dev" && buildType != "release") [ "--profile" buildType ]
-    ++ lib.optionals (package != null) [ "-p" package ]
-    ++ cargoExtraArgs
-  );
+  schneeArgs =
+    profileFlag ++ targetFlags ++ packageFlags ++ featureFlags
+    ++ noDefaultFlag ++ cargoExtraArgs;
+  schneeArgsStr = lib.escapeShellArgs schneeArgs;
+  postDashArgsStr =
+    if postDashArgs == [] then ""
+    else "-- " + lib.escapeShellArgs postDashArgs;
 
-  buildPhaseForTarget = ''
-    runHook preBuild
-    cargo build ${targetBuildFlags}
-    runHook postBuild
-  '';
-
-  checkPhaseForTarget = ''
-    runHook preCheck
-    cargo test ${targetBuildFlags}
-    runHook postCheck
-  '';
-
-  # -- extraSources (postUnpack) ------------------------------------------
-  # For each { "../sibling" = ./source; } entry:
-  #  1. Copy source into workspace root (strip leading ../)
-  #  2. Patch Cargo.toml to rewrite the relative path
-  #  3. Update workspace exclude list
+  # -- extraSources injection (matches old behaviour) --------------------
   sanitiseName = relPath:
     let stripped = builtins.replaceStrings ["../"] [""] relPath;
     in if stripped == relPath
-       then throw "cargo-schnee buildPackage: extraSources keys must start with '../' (got '${relPath}')"
-       else stripped;
+      then throw "cargo-schnee buildPackage: extraSources keys must start with '../' (got '${relPath}')"
+      else stripped;
 
-  extraSourcesScript = lib.concatStringsSep "\n" (
-    lib.mapAttrsToList (relPath: source:
-      let inTreeName = sanitiseName relPath; in
-      ''
+  extraSourcesScript = lib.concatStringsSep "\n" (lib.mapAttrsToList
+    (relPath: source:
+      let inTreeName = sanitiseName relPath; in ''
         # extraSources: ${relPath} -> ${inTreeName}
-        mkdir -p "$(dirname "$sourceRoot/${inTreeName}")"
-        cp -r ${source} "$sourceRoot/${inTreeName}"
-        chmod -R u+w "$sourceRoot/${inTreeName}"
-
-        # Rewrite path dependency references in all Cargo.toml files
-        find "$sourceRoot" -name Cargo.toml -exec \
+        mkdir -p "$(dirname "workspace/${inTreeName}")"
+        cp -r ${source} "workspace/${inTreeName}"
+        chmod -R u+w "workspace/${inTreeName}"
+        find workspace -name Cargo.toml -exec \
           sed -i "s|${lib.escapeShellArg relPath}|${inTreeName}|g" {} +
-
-        # Add to workspace exclude list (if workspace section exists)
-        if grep -q '^\[workspace\]' "$sourceRoot/Cargo.toml" 2>/dev/null; then
-          if grep -q 'exclude' "$sourceRoot/Cargo.toml"; then
-            sed -i 's|exclude = \[|exclude = ["${inTreeName}", |' "$sourceRoot/Cargo.toml"
+        if grep -q '^\[workspace\]' "workspace/Cargo.toml" 2>/dev/null; then
+          if grep -q 'exclude' "workspace/Cargo.toml"; then
+            sed -i 's|exclude = \[|exclude = ["${inTreeName}", |' \
+              "workspace/Cargo.toml"
           else
-            sed -i '/^\[workspace\]/a exclude = ["${inTreeName}"]' "$sourceRoot/Cargo.toml"
+            sed -i '/^\[workspace\]/a exclude = ["${inTreeName}"]' \
+              "workspace/Cargo.toml"
           fi
         fi
-      ''
-    ) extraSources
-  );
+      '') extraSources);
 
-  # -- install phase ------------------------------------------------------
-  # Cargo maps the "dev" profile to the "debug" output directory.
-  profileDir =
-    if buildType == "release" then "release"
-    else if buildType == "dev" then "debug"
-    else buildType;
+  # -- sourceRootPrefix path remap --------------------------------------
+  rootRemap =
+    lib.optionalAttrs (sourceRootPrefix != null) { "" = sourceRootPrefix; };
+  extraSourceRemaps = lib.mapAttrs'
+    (relPath: _:
+      let n = sanitiseName relPath; in lib.nameValuePair n n)
+    extraSources;
+  effectivePathPrefixRemaps = rootRemap // extraSourceRemaps;
+  pathPrefixRemapsJson =
+    if effectivePathPrefixRemaps != {}
+    then builtins.toJSON
+      (lib.mapAttrsToList (f: t: [f t]) effectivePathPrefixRemaps)
+    else null;
 
-  # Cross-compiled output lands in target/<triple>/<profile>/.
-  releaseDir =
-    if target != null
-    then "target/${target}/${profileDir}"
-    else "target/${profileDir}";
+  # -- planner env --------------------------------------------------------
+  plannerEnv = env
+    // lib.optionalAttrs (passthruEnv != []) {
+      CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
+    }
+    // lib.optionalAttrs (pathPrefixRemapsJson != null) {
+      CARGO_SCHNEE_PATH_PREFIX_REMAPS = pathPrefixRemapsJson;
+    };
 
-  installPhaseWindows = ''
-    runHook preInstall
+  envExportLines = lib.concatMapStrings
+    (n: ''export ${n}=${lib.escapeShellArg (toString plannerEnv.${n})}
+'')
+    (lib.attrNames plannerEnv);
 
-    releaseDir="${releaseDir}"
-    mkdir -p $out/bin
+  binPath = lib.makeBinPath ([
+    effectiveRustToolchain
+    pkgs.stdenv.cc
+    pkgs.coreutils
+    pkgs.bashNonInteractive
+    pkgs.nix
+    pkgs.gnutar
+    pkgs.gzip
+    pkgs.findutils
+    pkgs.gnused
+    pkgs.gnugrep
+  ] ++ nativeBuildInputs);
 
-    for f in "$releaseDir"/*.exe; do
-      [ -f "$f" ] || continue
-      install -m755 "$f" "$out/bin/"
-    done
+  pkgConfigPath = lib.makeSearchPath "lib/pkgconfig" buildInputs;
 
-    # Install PDB debug symbol files if present
-    for f in "$releaseDir"/*.pdb; do
-      [ -f "$f" ] || continue
-      install -m644 "$f" "$out/bin/"
-    done
+  drvName = "${finalPname}-${finalVersion}-${intent}.drv";
 
-    # Install DLLs if any
-    for f in "$releaseDir"/*.dll; do
-      [ -f "$f" ] || continue
-      install -m755 "$f" "$out/bin/"
-    done
+  planner = derivation {
+    name = drvName;
+    system = pkgs.stdenv.hostPlatform.system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" ''
+      set -euo pipefail
+      export PATH=${binPath}
+      ${lib.optionalString (pkgConfigPath != "")
+        "export PKG_CONFIG_PATH=${pkgConfigPath}"}
+      ${envExportLines}
 
-    rmdir --ignore-fail-on-non-empty $out/bin 2>/dev/null || true
+      mkdir -p workspace
+      cp -r ${src}/. workspace/
+      chmod -R u+w workspace
 
-    runHook postInstall
-  '';
+      ${extraSourcesScript}
 
-  installPhaseNative = ''
-    runHook preInstall
+      cd workspace
 
-    releaseDir="${releaseDir}"
-    mkdir -p $out/bin $out/lib
+      # cargo-schnee's cargoSetupPostPatchHook compatibility: when the
+      # vendor dir is read-only (it is — store path), point cargoDepsCopy
+      # at the original so Cargo.lock validation can still run.
+      export cargoDepsCopy="$cargoDeps"
 
-    for f in "$releaseDir"/*; do
-      [ -f "$f" ] || continue
-      [ -x "$f" ] || continue
-      name="$(basename "$f")"
-      case "$name" in build-script-*|*.d) continue ;; esac
-      echo "$name" | grep -qE -- '-[0-9a-f]{16}$' && continue
-      case "$name" in *.so|*.so.*|*.a|*.dylib) continue ;; esac
-      install -m755 "$f" "$out/bin/"
-    done
+      ${preBuild}
 
-    # Install shared libraries if any
-    for f in "$releaseDir"/lib*.so "$releaseDir"/lib*.so.* "$releaseDir"/lib*.a "$releaseDir"/lib*.dylib; do
-      [ -f "$f" ] && install -m644 "$f" "$out/lib/" || true
-    done
+      # cargo plugin convention: argv[1] is the plugin name ("schnee").
+      # Global flags like --plan-only attach to the SchneeArgs subgroup
+      # and must come AFTER the plugin name.
+      ${schneeBin}/bin/cargo-schnee schnee \
+        --plan-only "$TMPDIR/plan-out.txt" \
+        ${intent} \
+        --vendor-dir "$cargoDeps" \
+        ${schneeArgsStr} ${postDashArgsStr}
 
-    rmdir --ignore-fail-on-non-empty $out/lib $out/bin 2>/dev/null || true
+      # Pick the first root drv.  cargo-schnee can emit multiple roots
+      # (e.g. multi-binary builds, tests of multiple packages); a future
+      # refinement can disambiguate by --bin or by intent-specific kind.
+      ROOT=$(head -1 "$TMPDIR/plan-out.txt")
+      cp "$ROOT" "$out"
+    '' ];
 
-    runHook postInstall
-  '';
+    cargoDeps = effectiveCargoDeps;
 
-  derivedInstallPhase = if isWindows then installPhaseWindows else installPhaseNative;
-  effectiveInstallPhase = if installPhase != null then installPhase else derivedInstallPhase;
+    requiredSystemFeatures = [ "recursive-nix" ];
+    NIX_CONFIG = "extra-experimental-features = "
+      + "flakes ca-derivations dynamic-derivations pipe-operators";
 
-  # -- wrapBinaries (postFixup) -------------------------------------------
-  wrapBinariesScript = lib.optionalString wrapBinaries ''
+    __contentAddressed = true;
+    outputHashMode = "text";
+    outputHashAlgo = "sha256";
+  };
+
+  rawOutput = builtins.outputOf planner.outPath "out";
+
+  # -- install step ------------------------------------------------------
+  isWindows = target != null
+    && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
+
+  # Doc derivation outputs include a `doc/` subtree of generated HTML.
+  # Other intents (build/check/test/clippy) emit linker output: a
+  # hash-suffixed binary plus .d / .rmeta sidecars.  Pick the layout
+  # matching the intent.
+  installScript =
+    if intent == "doc" then ''
+      mkdir -p $out/share/doc
+      if [ -d "$rawOutput/doc" ]; then
+        cp -r "$rawOutput/doc/." "$out/share/doc/"
+      fi
+    '' else if isWindows then ''
+      mkdir -p $out/bin
+      for f in $rawOutput/*.exe $rawOutput/*.dll $rawOutput/*.pdb; do
+        [ -f "$f" ] || continue
+        install -m755 "$f" "$out/bin/"
+      done
+    '' else ''
+      mkdir -p $out/bin $out/lib
+      for f in $rawOutput/*; do
+        [ -f "$f" ] || continue
+        name="$(basename "$f")"
+        case "$name" in
+          *.d|*.rmeta|build-script-*|*-build-script|diagnostics) continue ;;
+        esac
+        clean="$(echo "$name" | sed -E 's/-[0-9a-f]{16}$//')"
+        case "$name" in
+          *.so|*.so.*|*.a|*.dylib)
+            install -m644 "$f" "$out/lib/$clean"
+            ;;
+          *)
+            if [ -x "$f" ]; then
+              install -m755 "$f" "$out/bin/$clean"
+            fi
+            ;;
+        esac
+      done
+      rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true
+    '';
+
+  wrapBinariesScript = lib.optionalString (wrapBinaries && !isWindows) ''
     if [ -d "$out/bin" ]; then
       for bin in $out/bin/*; do
         [ -f "$bin" ] || continue
@@ -303,138 +377,17 @@ let
     fi
   '';
 
-  # -- Windows test runner (Wine) -----------------------------------------
-  # When targeting Windows with doCheck, automatically configure Wine so
-  # that consumers don't need to wire up the runner, HOME, DLL overrides,
-  # and display vars manually.
-  wineEnvAttrs = lib.optionalAttrs (isWindows && doCheck) {
-    "CARGO_TARGET_${cargoTargetEnvPrefix}_RUNNER" = "wine";
-    WINEDLLOVERRIDES = "mscoree=d;mshtml=d";
-    DISPLAY = "";
-  };
-
-  winePreCheck = lib.optionalString (isWindows && doCheck) ''
-    export HOME="$TMPDIR/wine-home"
-    mkdir -p "$HOME"
-    unset WAYLAND_DISPLAY
+  installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
+    inherit rawOutput meta;
+    nativeBuildInputs =
+      lib.optionals wrapBinaries [ pkgs.makeWrapper ];
+    passthru = { inherit rawOutput planner; };
+  } ''
+    set -euo pipefail
+    ${installScript}
+    ${postInstall}
+    ${wrapBinariesScript}
   '';
 
-  # -- passthruEnv --------------------------------------------------------
-  passthruEnvAttrs = lib.optionalAttrs (passthruEnv != []) {
-    CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
-  };
-
-  # -- unit-graph cache hand-off -----------------------------------------
-  # cargo-schnee's planner accepts a pre-computed unit graph via
-  # `CARGO_SCHNEE_UNIT_GRAPH=<path>` (file or directory containing
-  # `graph.json`) — see `self.lib.unitGraph` and the `compute-graph`
-  # subcommand. On match, the planner skips the ~7 s cargo-as-library
-  # bootstrap. On mismatch (different cargo-resolution inputs from the
-  # ones the graph was generated for), cargo-schnee logs a warning and
-  # falls back to a fresh bootstrap, so a stale graph is silently
-  # ignored rather than served.
-  #
-  # `buildPackage` does not call `lib.unitGraph` automatically because
-  # the resolver-input declaration belongs to the caller — features and
-  # package selection that today live inside `cargoExtraArgs` would have
-  # to be lifted out. Opt in by passing the realised path through
-  # `env.CARGO_SCHNEE_UNIT_GRAPH`:
-  #
-  #   buildPackage {
-  #     inherit pkgs src cargoDeps rustToolchain;
-  #     env = {
-  #       CARGO_SCHNEE_UNIT_GRAPH = "${self.lib.unitGraph {
-  #         inherit pkgs src cargoDeps rustToolchain;
-  #         buildType = "release";
-  #         features = [ "default" ];
-  #       }}";
-  #     };
-  #   }
-
-  # -- pathPrefixRemaps ---------------------------------------------------
-  # Compose the `--remap-path-prefix` rules from `sourceRootPrefix` plus
-  # per-extraSource identity remaps (each entry lands at
-  # `<src_store>/<inTreeName>` in the sandbox, so identity-remap each back to
-  # its inTreeName — without this, a sourceRootPrefix-driven root remap
-  # would over-prefix sibling-workspace path-deps).
-  rootRemap = lib.optionalAttrs (sourceRootPrefix != null) {"" = sourceRootPrefix;};
-  extraSourceRemaps = lib.mapAttrs' (relPath: _:
-    let name = sanitiseName relPath; in lib.nameValuePair name name
-  ) extraSources;
-  effectivePathPrefixRemaps = rootRemap // extraSourceRemaps;
-
-  # Encode as a JSON list of two-element arrays so cargo-schnee can
-  # deserialise into `Vec<(String, String)>` without ambiguity.  Empty
-  # combined map emits no env var so unmodified consumers see no change.
-  pathPrefixRemapsAttrs = lib.optionalAttrs (effectivePathPrefixRemaps != {}) {
-    CARGO_SCHNEE_PATH_PREFIX_REMAPS = builtins.toJSON (
-      lib.mapAttrsToList (from: to: [from to]) effectivePathPrefixRemaps
-    );
-  };
-
-  # -- extra args passthrough ---------------------------------------------
-  # Forward unrecognised attributes (e.g. postUnpack, patches, …) to
-  # buildRustPackage, excluding the ones we consumed above.
-  consumedKeys = [
-    "pkgs" "src" "cargoLock" "cargoHash" "cargoDeps"
-    "pname" "version" "package" "hostPkgs" "target" "rustToolchain"
-    "nativeBuildInputs" "buildInputs" "cargoExtraArgs"
-    "extraSources" "env" "passthruEnv" "sourceRootPrefix" "wrapBinaries" "doCheck"
-    "preCheck" "postCheck"
-    "buildType" "preBuild" "postBuild" "postInstall" "postFixup" "meta"
-    "dontBuild" "installPhase"
-  ];
-  extraAttrs = removeAttrs args consumedKeys;
-
 in
-  assert lib.assertMsg (!(wrapBinaries && isWindows))
-    "cargo-schnee buildPackage: wrapBinaries is not supported for Windows targets (dontFixup is required for PE binaries)";
-
-  schneeRustPlatform.buildRustPackage (vendorArgs // extraAttrs // {
-    pname = finalPname;
-    version = finalVersion;
-    inherit src;
-    inherit buildType;
-    inherit cargoBuildFlags;
-    inherit dontBuild;
-    installPhase = effectiveInstallPhase;
-    inherit preBuild postBuild postInstall meta;
-
-    nativeBuildInputs = [ pkgs.nix ]
-      ++ nativeBuildInputs
-      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ]
-      ++ lib.optionals (isWindows && doCheck) [ pkgs.wineWow64Packages.stable ];
-
-    inherit buildInputs;
-
-    # cargo-schnee invariants — these must not leak to the consumer
-    requiredSystemFeatures = [ "recursive-nix" ];
-    NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
-    auditable = false;
-    inherit doCheck postCheck;
-    preCheck = winePreCheck + preCheck;
-
-    # Skip nixpkgs' cargoSetupPostUnpackHook (cp -Lr + chmod -R of the vendor
-    # dir).  cargo-schnee reads $cargoDeps directly via --vendor-dir.
-    dontCargoSetupPostUnpack = true;
-
-    # Set cargoDepsCopy so cargoSetupPostPatchHook's Cargo.lock validation
-    # still works against the original (read-only) vendor path.
-    postUnpack = ''
-      export cargoDepsCopy="$cargoDeps"
-    '' + (args.postUnpack or "") + extraSourcesScript;
-
-    postFixup = wrapBinariesScript + postFixup;
-
-    env = wineEnvAttrs // env // passthruEnvAttrs // pathPrefixRemapsAttrs;
-  } // lib.optionalAttrs (target != null) (
-    # Bypass cargoBuildHook/cargoCheckHook which inject the host --target.
-    # buildPhase is only set when we actually want to build — wrappers that
-    # run their work in checkPhase (testPackage, clippyPackage) pass
-    # dontBuild = true and rely on the standard dontBuild noop.
-    { checkPhase = checkPhaseForTarget; }
-    // lib.optionalAttrs (!dontBuild) { buildPhase = buildPhaseForTarget; }
-  ) // lib.optionalAttrs isWindows {
-    # patchelf/strip don't work on PE binaries
-    dontFixup = true;
-  })
+  installed

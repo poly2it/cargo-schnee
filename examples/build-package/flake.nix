@@ -35,8 +35,6 @@
         in
         {
           packages.greeter = callPackage ./nix/packages/greeter.nix {};
-          packages.greeter-pure = callPackage ./nix/packages/greeter-pure.nix {};
-          packages.greeter-pure-test = callPackage ./nix/packages/greeter-pure-test.nix {};
           packages.formatter = callPackage ./nix/packages/formatter.nix {};
           packages.doc = callPackage ./nix/packages/doc.nix {};
           packages.default = self.packages.${system}.greeter;

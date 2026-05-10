@@ -1,75 +1,56 @@
 # lib.clippyPackage — first-class clippy API for cargo-schnee.
 #
-# Runs `cargo clippy` for a single package (by default) inside a sandboxed
-# derivation.  Skips the cargo build step; clippy runs in checkPhase.
+# Routes through `lib.buildPackage` with `intent = "clippy"`, which
+# swaps rustc for clippy-driver on workspace compile units.  Lint
+# args after `--` are forwarded to clippy-driver via buildPackage's
+# `postDashArgs`.  Dependency units stay rustc-compiled so their
+# per-unit derivations are byte-shared with regular check / build
+# runs.
 #
-# `cargo clippy` is intercepted by the cargoOverrides wrapper and routed to
-# `cargo schnee clippy`, which mirrors the regular check pipeline but swaps
-# rustc for clippy-driver on local (workspace) compile units.  Dependency
-# units stay rustc-compiled so their per-unit derivations are byte-shared
-# with the corresponding buildPackage / testPackage runs.
+# Build success means lint clean (when `--deny warnings` is in
+# `lintArgs`, the default).  `$out/ok` marks success.
 { self }:
 
 {
+  pkgs,
   package ? null,
-  # Clippy scope.  Default `["--package" package]` when `package` is set,
-  # else `[]`.  Pass `["--workspace"]` to lint the whole workspace.
+  # Clippy scope.  Default `["--package" package]` when `package` is
+  # set, else `[]`.  Matches the previous clippyPackage API.
   clippyScope ? null,
-  # Extra args to `cargo clippy`, before `--`.  Defaults to `--no-deps`
-  # so external crates are not re-linted; pass [] to opt out.
+  # Extra args to `cargo schnee clippy`, before `--`.  Defaults to
+  # `--no-deps` so external crates are not re-linted.
   clippyExtraArgs ? [ "--no-deps" ],
-  # Lint args appended after `--`.  Default fails the build on warnings.
+  # Lint args appended after `--`.  Default fails the build on
+  # warnings.
   lintArgs ? [ "--deny" "warnings" ],
   ...
 }@args:
 
 let
-  pkgs = args.pkgs;
   inherit (pkgs) lib;
 
-  defaultScope =
-    if package != null then [ "--package" package ] else [];
+  defaultScope = if package != null then [ "--package" package ] else [];
   effectiveScope = if clippyScope != null then clippyScope else defaultScope;
+  preCargoArgs = effectiveScope ++ clippyExtraArgs;
 
-  cargoArgs = lib.escapeShellArgs (effectiveScope ++ clippyExtraArgs);
-  postDashes = lib.escapeShellArgs lintArgs;
-
-  forwardArgs = removeAttrs args [
+  forwarded = removeAttrs args [
     "clippyScope" "clippyExtraArgs" "lintArgs"
-    "preBuild" "preCheck"
   ];
 
-  # With dontBuild = true the entire buildPhase is skipped — including its
-  # preBuild hook.  Splice the caller's preBuild into preCheck so source-
-  # tree mutations (codegen injection, etc.) still happen before cargo
-  # clippy runs; the working directory is identical at both points.
-  callerPreBuild = args.preBuild or "";
-  callerPreCheck = args.preCheck or "";
-  effectivePreCheck =
-    if callerPreBuild == ""
-    then callerPreCheck
-    else callerPreBuild + "\n" + callerPreCheck;
+  built = self.lib.buildPackage (forwarded // {
+    inherit package;
+    intent = "clippy";
+    cargoExtraArgs = (args.cargoExtraArgs or []) ++ preCargoArgs;
+    postDashArgs = (args.postDashArgs or []) ++ lintArgs;
+  });
+
 in
-self.lib.buildPackage (forwardArgs // {
-  inherit package;
-  doCheck = true;
-  dontBuild = true;
-  wrapBinaries = false;
-
-  # Override cargoCheckHook's default `cargo test` invocation.  The wrapper
-  # routes `cargo clippy` through `cargo schnee clippy` which injects
-  # --vendor-dir from $cargoDeps automatically — no manual config.toml.
-  checkPhase = ''
-    runHook preCheck
-    cargo clippy ${cargoArgs} -- ${postDashes}
-    runHook postCheck
-  '';
-  preCheck = effectivePreCheck;
-
-  installPhase = ''
-    runHook preInstall
+  pkgs.runCommand "${built.name}-clippy-ok" {
+    inherit built;
+    passthru = { inherit built; };
+  } ''
     mkdir -p $out
-    touch $out/ok
-    runHook postInstall
-  '';
-})
+    # Clippy fails the build itself when --deny warnings triggers, so
+    # reaching this point means lint clean.
+    [ -d "$built" ] && touch $out/ok
+  ''
