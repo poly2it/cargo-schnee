@@ -1423,7 +1423,7 @@ pub fn run_plan_nix(
         .filter_map(|u| {
             u.drv_path
                 .clone()
-                .map(|p| (p, u.target_name.clone(), u.kind.clone()))
+                .map(|p| (p, u.target_name.clone(), u.kind))
         })
         .collect();
     if root_drvs.is_empty() {
