@@ -154,10 +154,23 @@ let
   detectedPname =
     if effectiveCargoToml != null
     then effectiveCargoToml.package.name or null else null;
+
+  # Workspace inheritance: a member crate can declare
+  # `version.workspace = true` and pick up the version from the
+  # root `[workspace.package].version`.  Resolve that here so the
+  # derivation name doesn't fall back to "0.0.0" for inherited
+  # versions.
+  workspaceVersion =
+    rootCargoToml.workspace.package.version or null;
   detectedVersion =
     if effectiveCargoToml != null then
       let v = effectiveCargoToml.package.version or null;
-      in if builtins.isString v then v else null
+      in
+        if builtins.isString v then v
+        else if builtins.isAttrs v && (v.workspace or false)
+                && builtins.isString workspaceVersion
+        then workspaceVersion
+        else null
     else null;
 
   # Note: don't fall back to `baseNameOf (toString src)` — when src is a

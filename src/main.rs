@@ -287,6 +287,10 @@ enum SchneeCommand {
         /// Skip linting dependencies (forwarded as cargo clippy --no-deps)
         #[arg(long)]
         no_deps: bool,
+        /// Lint test, example, and bench targets in addition to the
+        /// default lib + bin set (forwarded as cargo clippy --all-targets).
+        #[arg(long)]
+        all_targets: bool,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -1904,6 +1908,10 @@ fn run_build_pipeline(
     // When `Some(path)` (and `plan_only` is set), additionally register
     // an aggregator drv covering all roots and write its drv path here.
     plan_aggregator_out: Option<&Path>,
+    // When true, plan all targets (lib + bins + tests + examples +
+    // benches) instead of cargo's default selection.  Mirrors `cargo
+    // ... --all-targets`; useful for `cargo clippy --all-targets`.
+    all_targets: bool,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -2098,6 +2106,7 @@ fn run_build_pipeline(
         clippy_lint_args,
         &path_prefix_remaps,
         registration_jobs,
+        all_targets,
     )?;
 
     // Update unit graph cache. The `cache_key` field is populated for
@@ -2732,6 +2741,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
         }
         SchneeCommand::Build {
@@ -2767,6 +2777,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
         }
         SchneeCommand::Run {
@@ -2804,6 +2815,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
 
             if plan_only.is_some() {
@@ -2885,6 +2897,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
 
             if plan_only.is_some() {
@@ -2953,6 +2966,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
 
             if plan_only.is_some() {
@@ -3063,6 +3077,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 registration_jobs,
+                false,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -3082,6 +3097,7 @@ fn main() -> Result<()> {
             // implicitly always-on; we accept the flag for cargo-clippy
             // CLI compatibility but it is a no-op.
             no_deps: _no_deps,
+            all_targets,
             ref features,
             no_default_features,
             ref args,
@@ -3120,6 +3136,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                all_targets,
             )?;
         }
         SchneeCommand::Doc {
@@ -3160,6 +3177,7 @@ fn main() -> Result<()> {
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
+                false,
             )?;
 
             if plan_only.is_some() {
@@ -3246,6 +3264,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 registration_jobs,
+                false,
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {
@@ -3340,6 +3359,7 @@ fn main() -> Result<()> {
                 exclude,
                 features,
                 no_default_features,
+                false,
             )?;
 
             // Match the convention used by the in-tree cache: drv_path is

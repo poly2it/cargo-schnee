@@ -516,6 +516,7 @@ pub fn fresh_unit_graph(
     exclude: &[String],
     features: &[String],
     no_default_features: bool,
+    all_targets: bool,
 ) -> Result<(Vec<NixUnit>, Vec<(String, String)>, Vec<(String, String)>)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
@@ -599,6 +600,12 @@ pub fn fresh_unit_graph(
         )?;
     }
 
+    // --all-targets: extend cargo's default target set (lib + bins) to
+    // include tests, examples, and benches.  Mirrors `cargo --all-targets`.
+    if all_targets {
+        options.filter = ops::CompileFilter::new_all_targets();
+    }
+
     // Extract unit graph and target cfg — NO compilation happens here
     let interner = UnitInterner::new();
     let bcx = ops::create_bcx(&ws, &options, &interner, None)?;
@@ -662,6 +669,11 @@ pub fn run_plan_nix(
     // per topo level by the level's width so registration of small
     // levels does not over-allocate connections.
     registration_jobs: Option<usize>,
+    // Mirror of `cargo --all-targets`: when true, plan tests, examples
+    // and benches alongside the default lib + bins.  Used by
+    // `cargo schnee clippy --all-targets` so lint coverage extends to
+    // test modules and example crates.
+    all_targets: bool,
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -727,6 +739,7 @@ pub fn run_plan_nix(
             exclude,
             features,
             no_default_features,
+            all_targets,
         )?
     };
     tracing::Span::current().record("crate_count", nix_units.len());
