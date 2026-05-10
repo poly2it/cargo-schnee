@@ -52,10 +52,21 @@ let
     "clippyScope" "clippyExtraArgs" "lintArgs"
   ];
 
+  # Deduplicate args.  Skeptiva-style consumers prepend
+  # commonArgs.cargoExtraArgs onto clippyExtraArgs in their wrapper,
+  # which together with our own cargoExtraArgs forwarding leaves
+  # `--no-default-features` (and similar bool flags) appearing
+  # twice.  cargo-schnee's clippy CLI rejects duplicates.  Strip
+  # adjacent duplicates rather than full set-dedup so positional
+  # argument ordering for `--features X` style pairs is preserved.
+  dedup = xs:
+    builtins.foldl' (acc: x: if lib.elem x acc then acc else acc ++ [ x ])
+      [] xs;
+
   built = self.lib.buildPackage (forwarded // {
     inherit package;
     intent = "clippy";
-    cargoExtraArgs = (args.cargoExtraArgs or []) ++ preCargoArgs;
+    cargoExtraArgs = dedup ((args.cargoExtraArgs or []) ++ preCargoArgs);
     postDashArgs = (args.postDashArgs or []) ++ lintArgs;
   });
 
