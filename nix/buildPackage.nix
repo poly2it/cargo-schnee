@@ -1,20 +1,24 @@
 # lib.buildPackage — first-class build API for cargo-schnee.
 #
-# Pipeline (post-recursive-nix-removal):
+# Pipeline:
 #
 #   1. `planner` derivation runs `cargo-schnee --plan-only` inside its
-#      sandbox.  It still uses the daemon's `add_text_to_store` RPC to
-#      register all unit drvs (and so still requires the
-#      `recursive-nix` system feature *for the planner only*) but does
-#      NOT call `nix-store --realise`.  The sandbox holds one build
-#      user briefly, exits, and never blocks on sub-builds.  Concurrent
-#      planners therefore don't deadlock on the build-user pool.
+#      sandbox.  It uses the daemon's `add_text_to_store` RPC (and so
+#      requires the `recursive-nix` system feature) to register every
+#      unit drv plus an aggregator drv that depends on the workspace
+#      roots.  It does NOT call `nix-store --realise`: registration is
+#      pure metadata, no sub-builds are triggered.  The sandbox holds
+#      one build user briefly, exits, and never blocks on sub-builds.
+#      Concurrent planners therefore don't deadlock on the build-user
+#      pool — the slot-inversion deadlock the original implementation
+#      hit under high CI concurrency cannot happen at this layer.
 #
-#   2. `builtins.outputOf planner.outPath "out"` resolves to a
-#      derivation reference: nix realises the planner first, reads its
-#      output as a drv, then schedules that drv on the *outer*
-#      scheduler — flat unit DAG, one global `max-jobs`, no slot
-#      inversion possible regardless of CI concurrency.
+#   2. `builtins.outputOf aggregatorWrapper.outPath "out"` resolves to
+#      the aggregator drv: nix realises the planner first (which
+#      registers the unit drvs), reads the aggregator drv file the
+#      planner copied into its `$out`, and schedules that drv on the
+#      *outer* scheduler — flat unit DAG, one global `max-jobs`, no
+#      slot inversion possible regardless of CI concurrency.
 #
 #   3. A thin `runCommand` install step lays out the cargo-schnee root
 #      drv's output under `$out/bin` and `$out/lib` in nixpkgs
@@ -22,9 +26,18 @@
 #      binaries with `makeWrapper` for `wrapBinaries`.
 #
 # Replaces the previous buildRustPackage-based implementation, which
-# wedged CI under concurrent invocations because every planner
-# sandbox held a build user while waiting on its inner units' own
-# user-pool acquisition.
+# wedged CI under concurrent invocations because every planner sandbox
+# held a build user *while waiting on its inner units' own user-pool
+# acquisition* — the classic resource-ordering deadlock.  The new
+# pipeline confines recursive-nix to the brief, leaf-only registration
+# step, which never recurses into builds.
+#
+# The `recursive-nix` requirement is therefore part of the planner's
+# contract, not a residual cost to be eliminated.  Truly removing it
+# would require constructing ~600 wrapper derivations per workspace at
+# nix eval time to chain `builtins.outputOf` references for every unit
+# — supported in principle but architecturally expensive, with no
+# correctness or concurrency benefit over the current shape.
 { self }:
 
 {

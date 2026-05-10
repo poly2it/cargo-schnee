@@ -11,6 +11,20 @@ The following experimental features are required:
 experimental-features = nix-command flakes dynamic-derivations ca-derivations recursive-nix
 ```
 
+`recursive-nix` is used **only inside the planner derivation**, where cargo-schnee
+registers per-unit `.drv` files via the daemon's `add_text_to_store` RPC. The
+planner registers, then exits; it never calls `nix-store --realise` and never
+recurses into builds. The unit drvs it registers are scheduled by the *outer* nix
+scheduler under one global `max-jobs`, so concurrent `lib.buildPackage`,
+`lib.testPackage`, and `lib.clippyPackage` invocations don't hit the
+build-user-pool slot-inversion deadlock that the previous `buildRustPackage`-based
+implementation suffered under high CI concurrency. The host must therefore
+advertise `recursive-nix` in `nix.settings.system-features`; in NixOS:
+
+```nix
+nix.settings.system-features = [ "nixos-test" "benchmark" "big-parallel" "kvm" "recursive-nix" ];
+```
+
 <!-- BEGIN BENCHMARK -->
 ## Comparative benchmark
 
