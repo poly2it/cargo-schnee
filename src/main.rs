@@ -1378,6 +1378,26 @@ fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
 // Build cache — skip vendoring + derivation registration on unchanged builds
 // ---------------------------------------------------------------------------
 
+/// Render the bool fields of `UserIntent` variants into a cache-key
+/// suffix.  Returns "" for variants that have no fields.
+///
+/// Cargo's resolver materialises a different unit set for each variant
+/// *and* for the bool fields inside `Check { test }` / `Doc { deps,
+/// json }`.  Encoding only the bare variant name silently feeds the
+/// wrong cached graph to a build that toggles those flags — same shape
+/// as the missing `--all-targets` discriminator.  This helper is
+/// composed onto `intent_str` (the short, drv-name-safe variant label)
+/// so the cache key carries the full discriminant while drv names stay
+/// readable.
+fn format_intent_fields(user_intent: &UserIntent) -> String {
+    match user_intent {
+        UserIntent::Check { test } => format!("[test={test}]"),
+        UserIntent::Doc { deps, json } => format!("[deps={deps},json={json}]"),
+        UserIntent::Build | UserIntent::Test | UserIntent::Bench => String::new(),
+        _ => String::new(),
+    }
+}
+
 /// A single unit-graph cache entry, keyed by
 /// `hash(Cargo.lock + Cargo.toml + profile + target + intent + packages + features)`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
@@ -2013,13 +2033,22 @@ fn run_build_pipeline(
     let packages_str = packages.join(",");
     let exclude_str = exclude.join(",");
     let features_str = features.join(",");
+    // Cache-key composition: `intent_str` covers the variant name only.
+    // Cargo's resolver also branches on the bool fields of `Check { test }`
+    // and `Doc { deps, json }` — different fields, different unit set — so
+    // `format_intent_fields` appends them.  Without that, toggling
+    // `--no-deps` or the `test` flag silently feeds the wrong cached graph
+    // to subsequent builds (same class of bug as the missing
+    // `--all-targets` discriminator).
+    let intent_fields = format_intent_fields(&user_intent);
     let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
         lockfile_hash,
         manifest_hash,
         profile.name,
         target_config.target_triple,
         intent_str,
+        intent_fields,
         packages_str,
         exclude_str,
         features_str,
@@ -3359,18 +3388,20 @@ fn main() -> Result<()> {
                 UserIntent::Doc { .. } => "doc",
                 _ => "build",
             };
+            let intent_fields = format_intent_fields(&user_intent);
             // `compute-graph` always plans the default target set (no
             // `--all-targets`); embed that in the key so the cache check
             // in `run_build_pipeline` correctly rejects this entry on a
             // `--all-targets` build (where the unit set differs).
             let all_targets = false;
             let unit_graph_key = format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
                 lockfile_hash,
                 manifest_hash,
                 profile_cfg.name,
                 target_config.target_triple,
                 intent_key,
+                intent_fields,
                 package.join(","),
                 exclude.join(","),
                 features.join(","),
