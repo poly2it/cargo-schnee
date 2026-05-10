@@ -1127,6 +1127,33 @@ fn fixture_lib_bin_integration_test() {
     run_schnee_test(&manifest);
 }
 
+/// Workspace where two crates form a dev-dep cycle: `lib-upper` depends on
+/// `lib-lower` (production), and `lib-lower`'s integration tests pull in
+/// `lib-upper` as a dev-dep.  Cargo plans this as
+/// `lib-lower (Check{test:false}) ← lib-upper (Check{test:false})`
+/// for the production graph and
+/// `lib-lower (Check{test:true}) ← lib-upper` for the integration test
+/// — two distinct units that share a `-check` suffix.  If cargo-schnee's
+/// `compilation_identity` collapses the two `Check` modes into one
+/// NixUnit, the dev-dep edge from the test variant closes a cycle that
+/// breaks topological registration with `Topological sort failed: cycle
+/// detected`.  This fixture exercises that exact shape under
+/// `clippy --all-targets --deny warnings`.
+#[test]
+#[ignore]
+fn fixture_dev_dep_cycle() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dep-cycle");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd(
+        "clippy",
+        &manifest,
+        &["--release", "--no-deps", "--all-targets", "--", "--deny", "warnings"],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Doc tests
 // ---------------------------------------------------------------------------
