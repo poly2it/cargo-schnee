@@ -360,21 +360,27 @@ let
       lib.removeSuffix "\n"
         (builtins.readFile "${planner}/plan.txt")));
 
-  # Each plan line is a registered drv path.  Wrap it in a tiny
-  # text-output drv whose $out is the drv file, then outputOf the
-  # wrapper to chain to the cargo-schnee root drv via the outer
-  # scheduler.  See note below on lib filtering for why the lib root
-  # is skipped: leaving it in causes a content-addressed realisation
-  # conflict because the bin roots transitively realise the lib drv
-  # at its natural store path while the wrapper realises the same
-  # drv at the wrapper's `-rootN` path.
+  # Per-root wrapper derivations: each wrapper's text-output is
+  # byte-identical to the cargo-schnee-emitted root drv file, so
+  # `builtins.outputOf wrapper.outPath "out"` resolves the wrapper
+  # to a derivation reference for that root.  The outer scheduler
+  # then realises the underlying drv.
   #
-  # Cargo's lib unit is named by the cargo-normalised pname
-  # (`skeptiva-formatter` → `skeptiva_formatter`).  Bin units use
-  # their `[[bin]] name` verbatim.  Filter root drvs whose suffix
-  # matches the cargo-normalised pname; if the resulting list is
-  # empty (pure-library crate), fall back to including the lib so
-  # buildPackage still produces an installable output.
+  # KNOWN LIMITATION: this pattern hits a content-addressed
+  # realisation conflict whenever any root drv is transitively
+  # depended on by another plan-listed root — the wrapper realises
+  # the inner drv at the wrapper's `-rootN`-suffixed path, while
+  # the transitive realisation hits the inner drv's natural store
+  # path.  For single-package builds with one [lib] + several
+  # [[bin]] targets the lib root is filtered out below, which
+  # works because the bins transitively realise the lib anyway.
+  # For multi-crate workspaces with internal cross-deps (every
+  # `cargo build/check/clippy --workspace`), this isn't enough —
+  # the proper fix is to extend cargo-schnee's `--plan-only` to
+  # emit a single aggregator drv that depends on every root and
+  # produces a combined output, which buildPackage would
+  # outputOf in one step.  Until then, workspace-mode clippy /
+  # check / test will fail at realisation registration time.
   libUnitName = lib.replaceStrings [ "-" ] [ "_" ] finalPname;
   isLibRoot = drvPath:
     lib.hasSuffix "-${libUnitName}.drv"

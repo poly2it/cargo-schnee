@@ -31,7 +31,22 @@ let
 
   defaultScope = if package != null then [ "--package" package ] else [];
   effectiveScope = if clippyScope != null then clippyScope else defaultScope;
-  preCargoArgs = effectiveScope ++ clippyExtraArgs;
+
+  # cargo-schnee's clippy subcommand recognises a narrower flag set
+  # than `cargo clippy`.  Consumers built against the OLD buildPackage
+  # routinely pass `--workspace` and `--all-targets`; the former is
+  # cargo-schnee's default behaviour (no `-p` lints all workspace
+  # members), and the latter is a known feature gap (cargo-schnee
+  # doesn't yet plan test / example / bench targets — extending it
+  # is upstream work).  Strip both so callers continue to work; if
+  # `--all-targets` coverage matters, lint with intent="test" via
+  # lib.testPackage as a stopgap.
+  unsupportedClippyArgs = [ "--workspace" "--all-targets" ];
+  filteredScope =
+    lib.filter (a: !lib.elem a unsupportedClippyArgs) effectiveScope;
+  filteredExtraArgs =
+    lib.filter (a: !lib.elem a unsupportedClippyArgs) clippyExtraArgs;
+  preCargoArgs = filteredScope ++ filteredExtraArgs;
 
   forwarded = removeAttrs args [
     "clippyScope" "clippyExtraArgs" "lintArgs"
