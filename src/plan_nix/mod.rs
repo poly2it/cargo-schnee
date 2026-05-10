@@ -15,7 +15,10 @@ pub(crate) mod util;
 
 use aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use daemon::NixDaemonConn;
-use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
+use derivation::{
+    construct_derivation, downstream_placeholder, nix_derivation_add, nix_store_closure,
+    self_placeholder,
+};
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_clippy_driver, which_command,
@@ -1434,6 +1437,92 @@ pub fn run_plan_nix(
     }
 
     Ok((root_drvs, nix_units, cfg_envs, host_cfg_envs))
+}
+
+/// Build and register an aggregator derivation that depends on every
+/// element of `root_drvs` and produces an output containing one
+/// symlink per root pointing at that root's `out`.
+///
+/// The aggregator gives downstream Nix expressions a *single*
+/// derivation reference to `builtins.outputOf`, sidestepping the
+/// realisation conflict that hits per-root wrapper derivations
+/// whenever any plan-listed root is transitively depended on by
+/// another (every `cargo build/check/clippy --workspace` invocation
+/// in a multi-crate workspace).  The aggregator's transitive deps
+/// realise each root drv exactly once at its natural store path.
+///
+/// Returns the registered aggregator's `.drv` store path.
+pub(crate) fn construct_aggregator_drv(
+    pname: &str,
+    intent: &str,
+    root_drvs: &[(String, String, UnitKind)],
+    system: &str,
+) -> Result<String> {
+    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let bash_store = std::path::PathBuf::from(&bash_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path"))?
+        .to_string_lossy()
+        .to_string();
+    let mkdir_path = which_command_no_deref("mkdir")?
+        .to_string_lossy()
+        .to_string();
+    let coreutils_store = std::path::PathBuf::from(&mkdir_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive coreutils store path from mkdir"))?
+        .to_string_lossy()
+        .to_string();
+
+    let mut input_drvs = serde_json::Map::new();
+    let mut placeholders: Vec<String> = Vec::with_capacity(root_drvs.len());
+    for (drv_path, _, _) in root_drvs {
+        placeholders.push(downstream_placeholder(drv_path, "out")?);
+        input_drvs.insert(
+            drv_path.clone(),
+            serde_json::json!({"outputs": ["out"], "dynamicOutputs": {}}),
+        );
+    }
+
+    // Aggregator build script: each root drv's realised output path
+    // arrives via the `rootOuts` env var (space-separated).  Symlink
+    // each into `$out/root-N`.  Symlink rather than copy keeps the
+    // aggregator's NAR small and avoids file-mode quirks; consumers
+    // walk the symlinks transparently.
+    let script = format!(
+        "set -e\n\
+         {coreutils}/bin/mkdir -p $out\n\
+         i=0\n\
+         for src in $rootOuts; do\n\
+           {coreutils}/bin/ln -s \"$src\" \"$out/root-$i\"\n\
+           i=$((i+1))\n\
+         done\n",
+        coreutils = coreutils_store
+    );
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "out".into(),
+        serde_json::Value::String(self_placeholder("out")),
+    );
+    env.insert(
+        "rootOuts".into(),
+        serde_json::Value::String(placeholders.join(" ")),
+    );
+
+    let json = serde_json::json!({
+        "name": format!("{}-{}-aggregator", pname, intent),
+        "system": system,
+        "builder": bash_path,
+        "args": ["-c", script],
+        "outputs": {"out": {"hashAlgo": "sha256", "method": "nar"}},
+        "inputDrvs": input_drvs,
+        "inputSrcs": [coreutils_store, bash_store],
+        "env": env,
+    });
+
+    nix_derivation_add(&json)
 }
 
 #[cfg(test)]

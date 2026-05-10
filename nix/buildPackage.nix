@@ -327,16 +327,18 @@ let
       # and must come AFTER the plugin name.
       ${schneeBin}/bin/cargo-schnee schnee \
         --plan-only "$TMPDIR/plan-out.txt" \
+        --plan-aggregator-out "$TMPDIR/aggregator.txt" \
         ${intent} \
         --vendor-dir "$cargoDeps" \
         ${schneeArgsStr} ${postDashArgsStr}
 
       mkdir -p "$out"
       cp "$TMPDIR/plan-out.txt" "$out/plan.txt"
-      while IFS= read -r drv; do
-        [ -n "$drv" ] || continue
-        cp "$drv" "$out/$(basename "$drv")"
-      done < "$TMPDIR/plan-out.txt"
+      cp "$TMPDIR/aggregator.txt" "$out/aggregator.txt"
+      # Copy the aggregator drv file so the wrapper-cp pattern below
+      # can produce a byte-identical text-output for `outputOf`.
+      AGG=$(${pkgs.coreutils}/bin/head -1 "$TMPDIR/aggregator.txt")
+      cp "$AGG" "$out/$(basename "$AGG")"
     '' ];
 
     cargoDeps = effectiveCargoDeps;
@@ -350,64 +352,38 @@ let
     outputHashAlgo = "sha256";
   };
 
-  # IFD: realise the planner at eval time, read its plan.txt to learn
-  # which root drvs to outputOf.  Each line is an absolute /nix/store
-  # path of a registered drv.  cargo-schnee emits one root per
-  # bin / lib / test / doc / clippy unit produced by `cargo` for the
-  # selected -p / scope, in cargo's own order.
-  planLines = lib.filter (l: l != "") (
-    lib.splitString "\n" (
-      lib.removeSuffix "\n"
-        (builtins.readFile "${planner}/plan.txt")));
+  # IFD: realise the planner at eval time and read the aggregator drv
+  # path it emitted.  cargo-schnee's `--plan-aggregator-out` flag
+  # registers a single drv that depends on every root and produces a
+  # `$out` directory of symlinks to each root's realised output.
+  # Going through the aggregator gives us one `outputOf` chain for
+  # the whole package — the per-root wrapper-cp pattern caused
+  # content-addressed realisation conflicts in workspaces with
+  # cross-crate sharing.
+  aggregatorDrvPath = lib.removeSuffix "\n"
+    (builtins.readFile "${planner}/aggregator.txt");
 
-  # Per-root wrapper derivations: each wrapper's text-output is
-  # byte-identical to the cargo-schnee-emitted root drv file, so
-  # `builtins.outputOf wrapper.outPath "out"` resolves the wrapper
-  # to a derivation reference for that root.  The outer scheduler
-  # then realises the underlying drv.
-  #
-  # KNOWN LIMITATION: this pattern hits a content-addressed
-  # realisation conflict whenever any root drv is transitively
-  # depended on by another plan-listed root — the wrapper realises
-  # the inner drv at the wrapper's `-rootN`-suffixed path, while
-  # the transitive realisation hits the inner drv's natural store
-  # path.  For single-package builds with one [lib] + several
-  # [[bin]] targets the lib root is filtered out below, which
-  # works because the bins transitively realise the lib anyway.
-  # For multi-crate workspaces with internal cross-deps (every
-  # `cargo build/check/clippy --workspace`), this isn't enough —
-  # the proper fix is to extend cargo-schnee's `--plan-only` to
-  # emit a single aggregator drv that depends on every root and
-  # produces a combined output, which buildPackage would
-  # outputOf in one step.  Until then, workspace-mode clippy /
-  # check / test will fail at realisation registration time.
-  libUnitName = lib.replaceStrings [ "-" ] [ "_" ] finalPname;
-  isLibRoot = drvPath:
-    lib.hasSuffix "-${libUnitName}.drv"
-      (baseNameOf (builtins.unsafeDiscardStringContext drvPath));
-  binPlanLines = lib.filter (p: !isLibRoot p) planLines;
-  effectivePlanLines =
-    if binPlanLines == [] then planLines else binPlanLines;
+  aggregatorOrigName = baseNameOf
+    (builtins.unsafeDiscardStringContext aggregatorDrvPath);
 
-  mkRootBuild = idx: drvPath:
-    let
-      origName = baseNameOf
-        (builtins.unsafeDiscardStringContext drvPath);
-      wrapper = derivation {
-        name = "${finalPname}-${finalVersion}-root${toString idx}.drv";
-        system = pkgs.stdenv.hostPlatform.system;
-        builder = "${pkgs.bash}/bin/bash";
-        args = [ "-c" ''
-          ${pkgs.coreutils}/bin/cp ${planner}/${origName} $out
-        '' ];
-        __contentAddressed = true;
-        outputHashMode = "text";
-        outputHashAlgo = "sha256";
-      };
-    in
-      builtins.outputOf wrapper.outPath "out";
+  # Wrap the aggregator drv in a tiny text-output drv whose `$out` is
+  # a byte-identical copy of the registered aggregator file.  Then
+  # `builtins.outputOf wrapper.outPath "out"` resolves to the
+  # aggregator's realisation, which the outer daemon builds — and
+  # transitively builds every root.
+  aggregatorWrapper = derivation {
+    name = "${finalPname}-${finalVersion}-aggregator.drv";
+    system = pkgs.stdenv.hostPlatform.system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" ''
+      ${pkgs.coreutils}/bin/cp ${planner}/${aggregatorOrigName} $out
+    '' ];
+    __contentAddressed = true;
+    outputHashMode = "text";
+    outputHashAlgo = "sha256";
+  };
 
-  rootBuilds = lib.imap0 mkRootBuild effectivePlanLines;
+  aggregatorOutput = builtins.outputOf aggregatorWrapper.outPath "out";
 
   # -- install step ------------------------------------------------------
   isWindows = target != null
@@ -481,23 +457,22 @@ let
     fi
   '';
 
-  rootBuildLines = lib.concatMapStrings
-    (root: ''
-      ROOT=${root}
-      ${installRoot}
-    '')
-    rootBuilds;
-
   installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
     inherit meta;
-    rootBuildPaths = rootBuilds;
+    aggregator = aggregatorOutput;
     nativeBuildInputs =
       lib.optionals wrapBinaries [ pkgs.makeWrapper ];
-    passthru = { inherit planner rootBuilds; };
+    passthru = { inherit planner aggregatorWrapper aggregatorOutput; };
   } ''
     set -euo pipefail
     ${installInit}
-    ${rootBuildLines}
+    # Walk each root-N symlink in the aggregator output.  Each
+    # symlink target is a single cargo-schnee root drv's $out
+    # (binary, lib, doc subtree, etc.).
+    for ROOT in $aggregator/root-*; do
+      [ -d "$ROOT" ] || continue
+      ${installRoot}
+    done
     ${installFinish}
     ${postInstall}
     ${wrapBinariesScript}

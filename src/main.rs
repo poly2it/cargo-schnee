@@ -78,6 +78,16 @@ struct SchneeArgs {
     #[arg(long, global = true, value_name = "PATH")]
     plan_only: Option<PathBuf>,
 
+    /// In `--plan-only` mode, additionally construct and register an
+    /// aggregator derivation that depends on every root drv and
+    /// produces a single output containing one symlink per root.  The
+    /// path of the aggregator drv is written to the given file.
+    /// Downstream `lib.buildPackage` uses the aggregator as the
+    /// `builtins.outputOf` target, which avoids the per-root wrapper
+    /// realisation conflict that hits multi-crate workspaces.
+    #[arg(long, global = true, value_name = "PATH", requires = "plan_only")]
+    plan_aggregator_out: Option<PathBuf>,
+
     #[command(subcommand)]
     command: SchneeCommand,
 }
@@ -1891,6 +1901,9 @@ fn run_build_pipeline(
     // `path` after registration completes and return early without
     // realising anything.  See `SchneeArgs::plan_only`.
     plan_only: Option<&Path>,
+    // When `Some(path)` (and `plan_only` is set), additionally register
+    // an aggregator drv covering all roots and write its drv path here.
+    plan_aggregator_out: Option<&Path>,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -2122,6 +2135,27 @@ fn run_build_pipeline(
         }
         std::fs::write(out_path, content)
             .with_context(|| format!("Writing plan output to {}", out_path.display()))?;
+
+        if let Some(agg_out) = plan_aggregator_out {
+            let pname_for_agg = if let Ok(name) = read_package_name(&manifest_path) {
+                name
+            } else if !packages.is_empty() {
+                packages[0].clone()
+            } else {
+                "workspace".to_string()
+            };
+            let agg_drv = plan_nix::construct_aggregator_drv(
+                &pname_for_agg,
+                intent_str,
+                &root_drvs,
+                &target_config.nix_system,
+            )
+            .context("Constructing aggregator drv")?;
+            std::fs::write(agg_out, format!("{}\n", agg_drv)).with_context(|| {
+                format!("Writing aggregator drv path to {}", agg_out.display())
+            })?;
+        }
+
         if let Err(e) = cache.save(project_dir) {
             tracing::warn!("Failed to save build cache: {}", e);
         }
@@ -2661,6 +2695,8 @@ fn main() -> Result<()> {
     });
     let plan_only = args.plan_only.clone();
     let plan_only_ref = plan_only.as_deref();
+    let plan_aggregator_out = args.plan_aggregator_out.clone();
+    let plan_aggregator_out_ref = plan_aggregator_out.as_deref();
 
     match args.command {
         SchneeCommand::Check {
@@ -2695,6 +2731,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
         }
         SchneeCommand::Build {
@@ -2729,6 +2766,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
         }
         SchneeCommand::Run {
@@ -2765,6 +2803,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
 
             if plan_only.is_some() {
@@ -2845,6 +2884,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
 
             if plan_only.is_some() {
@@ -2912,6 +2952,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
 
             if plan_only.is_some() {
@@ -3078,6 +3119,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
         }
         SchneeCommand::Doc {
@@ -3117,6 +3159,7 @@ fn main() -> Result<()> {
                 no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
+                plan_aggregator_out_ref,
             )?;
 
             if plan_only.is_some() {
