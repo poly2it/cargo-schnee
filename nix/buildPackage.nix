@@ -267,10 +267,21 @@ let
 
   pkgConfigPath = lib.makeSearchPath "lib/pkgconfig" buildInputs;
 
-  drvName = "${finalPname}-${finalVersion}-${intent}.drv";
+  plannerName = "${finalPname}-${finalVersion}-${intent}-planner";
 
+  # Planner derivation's $out is a directory containing:
+  #   - plan.txt: one root drv path per line (cargo-schnee --plan-only).
+  #   - <hash>-<unit>.drv: a copy of every root drv file referenced by
+  #     plan.txt, byte-identical to the originals registered in the
+  #     store via add_text_to_store.
+  #
+  # The drv copies let us build per-root wrapper derivations whose
+  # `outputOf "out"` resolves to each cargo-schnee root drv.  Since the
+  # wrapper bytes match the originals, dedup wins: the realised builds
+  # are the same per-unit drvs the planner registered, scheduled by
+  # nix's outer scheduler under one global max-jobs.
   planner = derivation {
-    name = drvName;
+    name = plannerName;
     system = pkgs.stdenv.hostPlatform.system;
     builder = "${pkgs.bash}/bin/bash";
     args = [ "-c" ''
@@ -304,11 +315,12 @@ let
         --vendor-dir "$cargoDeps" \
         ${schneeArgsStr} ${postDashArgsStr}
 
-      # Pick the first root drv.  cargo-schnee can emit multiple roots
-      # (e.g. multi-binary builds, tests of multiple packages); a future
-      # refinement can disambiguate by --bin or by intent-specific kind.
-      ROOT=$(head -1 "$TMPDIR/plan-out.txt")
-      cp "$ROOT" "$out"
+      mkdir -p "$out"
+      cp "$TMPDIR/plan-out.txt" "$out/plan.txt"
+      while IFS= read -r drv; do
+        [ -n "$drv" ] || continue
+        cp "$drv" "$out/$(basename "$drv")"
+      done < "$TMPDIR/plan-out.txt"
     '' ];
 
     cargoDeps = effectiveCargoDeps;
@@ -318,40 +330,86 @@ let
       + "flakes ca-derivations dynamic-derivations pipe-operators";
 
     __contentAddressed = true;
-    outputHashMode = "text";
+    outputHashMode = "recursive";
     outputHashAlgo = "sha256";
   };
 
-  rawOutput = builtins.outputOf planner.outPath "out";
+  # IFD: realise the planner at eval time, read its plan.txt to learn
+  # which root drvs to outputOf.  Each line is an absolute /nix/store
+  # path of a registered drv.  cargo-schnee emits one root per
+  # bin / lib / test / doc / clippy unit produced by `cargo` for the
+  # selected -p / scope, in cargo's own order.
+  planLines = lib.filter (l: l != "") (
+    lib.splitString "\n" (
+      lib.removeSuffix "\n"
+        (builtins.readFile "${planner}/plan.txt")));
+
+  # Each per-root build is realised through a tiny wrapper drv whose
+  # output is byte-identical to the cargo-schnee-emitted root drv file.
+  # `builtins.outputOf wrapper.outPath "out"` resolves the wrapper as
+  # a derivation reference, the daemon reads its $out as a drv, and
+  # builds it under the *outer* scheduler — same mechanism as the
+  # single-root case, just one wrapper per cargo unit.
+  mkRootBuild = idx: drvPath:
+    let
+      # `drvPath` carries string context referencing the original drv
+      # (because it came from IFD on the planner output).  Strip the
+      # context for use in the wrapper's *name*: the name participates
+      # in the wrapper's hash, which must not transitively pull the
+      # original drv into the wrapper's input closure.  The actual
+      # `cp` source uses the contexted path so the planner's output
+      # remains a real input dependency.
+      origName = baseNameOf
+        (builtins.unsafeDiscardStringContext drvPath);
+      wrapper = derivation {
+        # Sequence-suffixed name; ends in `.drv` so the wrapper's
+        # output path is a valid derivation path that `outputOf` can
+        # interpret as a sub-derivation reference.
+        name = "${finalPname}-${finalVersion}-root${toString idx}.drv";
+        system = pkgs.stdenv.hostPlatform.system;
+        builder = "${pkgs.bash}/bin/bash";
+        args = [ "-c" ''
+          ${pkgs.coreutils}/bin/cp ${planner}/${origName} $out
+        '' ];
+        __contentAddressed = true;
+        outputHashMode = "text";
+        outputHashAlgo = "sha256";
+      };
+    in
+      builtins.outputOf wrapper.outPath "out";
+
+  rootBuilds = lib.imap0 mkRootBuild planLines;
 
   # -- install step ------------------------------------------------------
   isWindows = target != null
     && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
 
-  # Doc derivation outputs include a `doc/` subtree of generated HTML.
-  # Other intents (build/check/test/clippy) emit linker output: a
-  # hash-suffixed binary plus .d / .rmeta sidecars.  Pick the layout
-  # matching the intent.
-  installScript =
+  # Per-root layout copy.  Doc emits a `doc/` subtree of HTML; other
+  # intents emit linker output (a hash-suffixed binary plus .d /
+  # .rmeta sidecars).  Each root's loop runs against `$ROOT` injected
+  # at install time.
+  installRoot =
     if intent == "doc" then ''
-      mkdir -p $out/share/doc
-      if [ -d "$rawOutput/doc" ]; then
-        cp -r "$rawOutput/doc/." "$out/share/doc/"
+      if [ -d "$ROOT/doc" ]; then
+        # --no-preserve=mode so files copied from a read-only nix
+        # store input land writeable, allowing subsequent doc roots
+        # to merge into the same tree without permission errors.
+        cp -r --no-preserve=mode "$ROOT/doc/." "$out/share/doc/"
       fi
     '' else if isWindows then ''
-      mkdir -p $out/bin
-      for f in $rawOutput/*.exe $rawOutput/*.dll $rawOutput/*.pdb; do
+      for f in "$ROOT"/*.exe "$ROOT"/*.dll "$ROOT"/*.pdb; do
         [ -f "$f" ] || continue
         install -m755 "$f" "$out/bin/"
       done
     '' else ''
-      mkdir -p $out/bin $out/lib
-      for f in $rawOutput/*; do
+      for f in "$ROOT"/*; do
         [ -f "$f" ] || continue
         name="$(basename "$f")"
         case "$name" in
           *.d|*.rmeta|build-script-*|*-build-script|diagnostics) continue ;;
         esac
+        # Strip the 16-hex content-hash suffix cargo appends to per-unit
+        # compile outputs.
         clean="$(echo "$name" | sed -E 's/-[0-9a-f]{16}$//')"
         case "$name" in
           *.so|*.so.*|*.a|*.dylib)
@@ -359,13 +417,30 @@ let
             ;;
           *)
             if [ -x "$f" ]; then
-              install -m755 "$f" "$out/bin/$clean"
+              # Cargo compiles bins whose [[bin]] name contains dashes
+              # to underscore-named files (Rust identifiers can't have
+              # dashes); the user-facing dashed name is normally
+              # provided as a sibling copy in target/release/, but
+              # per-unit outputs only contain the compiled file.
+              # Translate to the dashed form so consumers' meta-
+              # .mainProgram references and `nix run` work.  Bins with
+              # genuinely underscored names will lose the underscore;
+              # workaround is to set [[bin]] name explicitly.
+              dashed="$(echo "$clean" | tr _ -)"
+              install -m755 "$f" "$out/bin/$dashed"
             fi
             ;;
         esac
       done
-      rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true
     '';
+
+  installInit =
+    if intent == "doc" then ''mkdir -p "$out/share/doc"''
+    else ''mkdir -p "$out/bin" "$out/lib"'';
+
+  installFinish =
+    if intent == "doc" then ""
+    else ''rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true'';
 
   wrapBinariesScript = lib.optionalString (wrapBinaries && !isWindows) ''
     if [ -d "$out/bin" ]; then
@@ -377,14 +452,24 @@ let
     fi
   '';
 
+  rootBuildLines = lib.concatMapStrings
+    (root: ''
+      ROOT=${root}
+      ${installRoot}
+    '')
+    rootBuilds;
+
   installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
-    inherit rawOutput meta;
+    inherit meta;
+    rootBuildPaths = rootBuilds;
     nativeBuildInputs =
       lib.optionals wrapBinaries [ pkgs.makeWrapper ];
-    passthru = { inherit rawOutput planner; };
+    passthru = { inherit planner rootBuilds; };
   } ''
     set -euo pipefail
-    ${installScript}
+    ${installInit}
+    ${rootBuildLines}
+    ${installFinish}
     ${postInstall}
     ${wrapBinariesScript}
   '';
