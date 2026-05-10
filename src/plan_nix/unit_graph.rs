@@ -391,11 +391,6 @@ pub(super) fn extract_units_from_bcx(
         // don't collide in diagnostics or `$out` filenames.  Compilation
         // identity already distinguishes them, so the keys differ; this
         // just keeps human-readable names unique too.
-        let drv_test_marker = if compile_test && kind == UnitKind::Check {
-            "-test"
-        } else {
-            ""
-        };
         nix_units.push(NixUnit {
             key,
             drv_name: sanitize_drv_name(&format!(
@@ -404,7 +399,7 @@ pub(super) fn extract_units_from_bcx(
                 unit.pkg.version(),
                 unit.target.name(),
                 mode_suffix_for_drv_name(&kind),
-                drv_test_marker,
+                check_test_suffix(compile_test, kind),
             )),
             kind,
             source_file: source_file_str,
@@ -500,6 +495,20 @@ pub(super) fn mode_suffix_for_drv_name(kind: &UnitKind) -> &'static str {
         UnitKind::Check => "-check",
         UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
+    }
+}
+
+/// Returns "-test" when this is a `Check { test: true }` unit, "" otherwise.
+/// Used everywhere a key, drv name, or grouping identity needs to distinguish
+/// the two `Check` variants (see `compilation_identity` for the full
+/// rationale).  Returns "" for non-`Check` units even when `compile_test` is
+/// set, since the test bit only collapses semantically inside `Check` mode —
+/// `TestCompile` and others already encode their test-ness in the kind.
+fn check_test_suffix(compile_test: bool, kind: UnitKind) -> &'static str {
+    if compile_test && kind == UnitKind::Check {
+        "-test"
+    } else {
+        ""
     }
 }
 
@@ -914,11 +923,6 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
     // For Check units the test bool distinguishes two distinct cargo
     // unit graph nodes (lib in `cfg(test)` mode vs without).  They must
     // not unify across that split — see compilation_identity.
-    let test_suffix = if u.compile_test && u.kind == UnitKind::Check {
-        "-test"
-    } else {
-        ""
-    };
     let kind_suffix = if u.for_host { "-host" } else { "" };
     let mut ct = u.crate_types.clone();
     ct.sort();
@@ -928,7 +932,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         u.edition,
         u.source_file,
         mode_suffix,
-        test_suffix,
+        check_test_suffix(u.compile_test, u.kind),
         kind_suffix,
         u.manifest_dir,
         ct,
@@ -1026,11 +1030,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         // Mirrors compilation_identity: a Check unit's `test: true` mode
         // is distinct from `test: false`.  Without this the two groups'
         // survivors would collide on the new key.
-        let test_suffix = if u.compile_test && u.kind == UnitKind::Check {
-            "-test"
-        } else {
-            ""
-        };
+        let test_suffix = check_test_suffix(u.compile_test, u.kind);
         let kind_suffix = if u.for_host { "-host" } else { "" };
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();

@@ -31,9 +31,9 @@ use cargo::core::compiler::UnitInterner;
 use cargo::ops::{self, CompileOptions};
 use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
-use tracing::info;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Build configuration
@@ -151,7 +151,7 @@ fn extract_cfg_envs(cfgs: &[cargo_platform::Cfg]) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 /// The kind of derivation a NixUnit represents.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnitKind {
     /// Regular rustc compilation (lib, bin, proc-macro, etc.)
     Compile,
@@ -585,10 +585,9 @@ pub fn fresh_unit_graph(
     }
     // Set cross-compilation target if specified
     if target.is_cross() {
-        options.build_config.requested_kinds =
-            vec![cargo::core::compiler::CompileKind::Target(
-                cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
-            )];
+        options.build_config.requested_kinds = vec![cargo::core::compiler::CompileKind::Target(
+            cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
+        )];
     }
     // Package selection: -p/--package narrows the build to specific crates,
     // --exclude removes crates from the default workspace set.
@@ -619,8 +618,7 @@ pub fn fresh_unit_graph(
     let interner = UnitInterner::new();
     let bcx = ops::create_bcx(&ws, &options, &interner, None)?;
     let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir, user_intent)?;
-    let bcx_cfg_envs =
-        extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
+    let bcx_cfg_envs = extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
     let bcx_host_cfg_envs = if target.is_cross() {
         extract_cfg_envs(
             bcx.target_data
@@ -708,49 +706,48 @@ pub fn run_plan_nix(
         crate_count = tracing::field::Empty,
     )
     .entered();
-    let (mut nix_units, cfg_envs, host_cfg_envs) = if let Some((old_src_store, mut units)) =
-        cached_units
-    {
-        // Fix up source paths: replace old src_store prefix with current one
-        if old_src_store != src_str {
-            for unit in &mut units {
-                if unit.source_file.starts_with(&old_src_store) {
-                    unit.source_file =
-                        format!("{}{}", src_str, &unit.source_file[old_src_store.len()..]);
-                }
-                if unit.manifest_dir.starts_with(&old_src_store) {
-                    unit.manifest_dir =
-                        format!("{}{}", src_str, &unit.manifest_dir[old_src_store.len()..]);
+    let (mut nix_units, cfg_envs, host_cfg_envs) =
+        if let Some((old_src_store, mut units)) = cached_units {
+            // Fix up source paths: replace old src_store prefix with current one
+            if old_src_store != src_str {
+                for unit in &mut units {
+                    if unit.source_file.starts_with(&old_src_store) {
+                        unit.source_file =
+                            format!("{}{}", src_str, &unit.source_file[old_src_store.len()..]);
+                    }
+                    if unit.manifest_dir.starts_with(&old_src_store) {
+                        unit.manifest_dir =
+                            format!("{}{}", src_str, &unit.manifest_dir[old_src_store.len()..]);
+                    }
                 }
             }
-        }
-        // Clear drv_path from cached units (will be recomputed)
-        for unit in &mut units {
-            unit.drv_path = None;
-        }
-        let cfg = cached_cfg_envs.unwrap_or_default();
-        let host_cfg = cached_host_cfg_envs.unwrap_or_default();
-        info!(
-            "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
-            units.len(),
-            cfg.len(),
-            old_src_store != src_str
-        );
-        (units, cfg, host_cfg)
-    } else {
-        fresh_unit_graph(
-            src,
-            vendor_dir,
-            profile,
-            target,
-            user_intent,
-            packages,
-            exclude,
-            features,
-            no_default_features,
-            all_targets,
-        )?
-    };
+            // Clear drv_path from cached units (will be recomputed)
+            for unit in &mut units {
+                unit.drv_path = None;
+            }
+            let cfg = cached_cfg_envs.unwrap_or_default();
+            let host_cfg = cached_host_cfg_envs.unwrap_or_default();
+            info!(
+                "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
+                units.len(),
+                cfg.len(),
+                old_src_store != src_str
+            );
+            (units, cfg, host_cfg)
+        } else {
+            fresh_unit_graph(
+                src,
+                vendor_dir,
+                profile,
+                target,
+                user_intent,
+                packages,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+            )?
+        };
     tracing::Span::current().record("crate_count", nix_units.len());
     drop(_extract_span);
     tracing::info!(units = nix_units.len(), "extract_units complete");
@@ -1195,12 +1192,8 @@ pub fn run_plan_nix(
     )
     .entered();
     for (level_idx, level) in topo_levels.iter().enumerate() {
-        let _level_span = tracing::info_span!(
-            "level",
-            idx = level_idx,
-            width = level.len(),
-        )
-        .entered();
+        let _level_span =
+            tracing::info_span!("level", idx = level_idx, width = level.len(),).entered();
         // Construct derivation JSONs — all deps are resolved from previous levels
         let jsons: Vec<(usize, serde_json::Value)> = level
             .iter()
@@ -1298,15 +1291,9 @@ pub fn run_plan_nix(
         let valid_paths: std::collections::HashSet<String> = if verify_drv_paths {
             std::collections::HashSet::new()
         } else if let Some(ref mut conn) = daemon {
-            let _s = tracing::info_span!(
-                "query_valid_paths_batched",
-                n = level_units.len(),
-            )
-            .entered();
-            let paths: Vec<&str> = level_units
-                .iter()
-                .map(|u| u.drv_path.as_str())
-                .collect();
+            let _s =
+                tracing::info_span!("query_valid_paths_batched", n = level_units.len(),).entered();
+            let paths: Vec<&str> = level_units.iter().map(|u| u.drv_path.as_str()).collect();
             match conn.query_valid_paths(&paths) {
                 Ok(set) => set,
                 Err(e) => {
@@ -1327,9 +1314,8 @@ pub fn run_plan_nix(
         // option, performance does not matter.
         if verify_drv_paths {
             for unit in level_units {
-                let nix_path = nix_derivation_add(&unit.json).with_context(|| {
-                    format!("Failed to add derivation for {}", unit.unit_key)
-                })?;
+                let nix_path = nix_derivation_add(&unit.json)
+                    .with_context(|| format!("Failed to add derivation for {}", unit.unit_key))?;
                 if nix_path != unit.drv_path {
                     let drv_content = std::fs::read(&nix_path).unwrap_or_default();
                     let aterm_matches = drv_content == unit.aterm;
