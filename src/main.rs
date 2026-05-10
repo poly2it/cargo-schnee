@@ -2014,7 +2014,7 @@ fn run_build_pipeline(
     let exclude_str = exclude.join(",");
     let features_str = features.join(",");
     let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         lockfile_hash,
         manifest_hash,
         profile.name,
@@ -2024,6 +2024,7 @@ fn run_build_pipeline(
         exclude_str,
         features_str,
         no_default_features,
+        all_targets,
     );
     // If `CARGO_SCHNEE_UNIT_GRAPH` points at a graph generated for the
     // same `unit_graph_key`, fold its contents into the in-memory cache so
@@ -3358,8 +3359,13 @@ fn main() -> Result<()> {
                 UserIntent::Doc { .. } => "doc",
                 _ => "build",
             };
+            // `compute-graph` always plans the default target set (no
+            // `--all-targets`); embed that in the key so the cache check
+            // in `run_build_pipeline` correctly rejects this entry on a
+            // `--all-targets` build (where the unit set differs).
+            let all_targets = false;
             let unit_graph_key = format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 lockfile_hash,
                 manifest_hash,
                 profile_cfg.name,
@@ -3369,6 +3375,7 @@ fn main() -> Result<()> {
                 exclude.join(","),
                 features.join(","),
                 no_default_features,
+                all_targets,
             );
 
             let (units, cfg_envs, host_cfg_envs) = plan_nix::fresh_unit_graph(
@@ -3381,7 +3388,7 @@ fn main() -> Result<()> {
                 exclude,
                 features,
                 no_default_features,
-                false,
+                all_targets,
             )?;
 
             // Match the convention used by the in-tree cache: drv_path is
