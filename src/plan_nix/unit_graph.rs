@@ -113,28 +113,21 @@ pub(super) fn extract_units_from_bcx(
         };
 
         // `cargo check --all-targets` pulls integration tests and
-        // benches into the unit graph as `CompileMode::Check { test: true }`.
-        // Those targets need rustc's `--test` flag to synthesise a
-        // `main` and the test harness — without it integration tests
-        // fail with E0601 (`main function not found`).
+        // benches into the unit graph as `CompileMode::Check { test: true }`,
+        // and ALSO emits a `Check { test: true }` lib unit alongside the
+        // existing `Check { test: false }` lib so cargo can link the
+        // integration tests against the test variant (cfg(test) active,
+        // dev-deps in scope) while bins keep linking the non-test
+        // variant.  These are two distinct cargo units with different
+        // dep sets and rmeta outputs; cargo-schnee must mirror them as
+        // two distinct NixUnits.  `make_unit_key` /
+        // `compilation_identity` distinguish them via the test bool so
+        // cargo's edges resolve to the right side.
         //
-        // Lib/bin targets ALSO get `Check { test: true }` from cargo
-        // when --all-targets includes them (so `cfg(test)` blocks
-        // inside lib/bin source get checked).  Those must NOT get
-        // `--test` — the lib's downstream consumers in the same
-        // graph link against its rmeta as a normal library, and a
-        // `--test`-built rmeta exposes a test harness rather than
-        // the lib's public API, breaking `extern crate` resolution
-        // (E0463 `can't find crate ...`).
-        //
-        // Match on target kind: only test / bench / example targets
-        // get the `--test` bump.  Lib/bin Check{test:true} units
-        // could in principle take `--cfg test` to make cfg(test)
-        // blocks visible, but cargo-schnee hasn't done that
-        // historically and adding it would change every cached
-        // check derivation; leave that for a follow-up.
-        let compile_test = matches!(unit.mode, CompileMode::Check { test: true })
-            && (unit.target.is_test() || unit.target.is_bench());
+        // `--test` then applies whenever `Check { test: true }`: it's
+        // what activates `#[cfg(test)]` and the test harness, regardless
+        // of target kind.
+        let compile_test = matches!(unit.mode, CompileMode::Check { test: true });
 
         // Source file
         let source_file = unit
@@ -393,14 +386,25 @@ pub(super) fn extract_units_from_bcx(
         let target_name = root_target_names.get(&key).cloned().unwrap_or_default();
         let for_host = matches!(unit.kind, CompileKind::Host);
 
+        // For `Check { test: true }` units, append `-test` to the drv
+        // name so the test and non-test variants of the same target
+        // don't collide in diagnostics or `$out` filenames.  Compilation
+        // identity already distinguishes them, so the keys differ; this
+        // just keeps human-readable names unique too.
+        let drv_test_marker = if compile_test && kind == UnitKind::Check {
+            "-test"
+        } else {
+            ""
+        };
         nix_units.push(NixUnit {
             key,
             drv_name: sanitize_drv_name(&format!(
-                "{}-{}-{}{}",
+                "{}-{}-{}{}{}",
                 unit.pkg.name(),
                 unit.pkg.version(),
                 unit.target.name(),
                 mode_suffix_for_drv_name(&kind),
+                drv_test_marker,
             )),
             kind,
             source_file: source_file_str,
@@ -505,7 +509,8 @@ fn compilation_identity(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -559,7 +564,8 @@ fn make_unit_key(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -905,12 +911,27 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
     };
+    // For Check units the test bool distinguishes two distinct cargo
+    // unit graph nodes (lib in `cfg(test)` mode vs without).  They must
+    // not unify across that split — see compilation_identity.
+    let test_suffix = if u.compile_test && u.kind == UnitKind::Check {
+        "-test"
+    } else {
+        ""
+    };
     let kind_suffix = if u.for_host { "-host" } else { "" };
     let mut ct = u.crate_types.clone();
     ct.sort();
     format!(
-        "{}/{}/{}{}{}/{}:{:?}",
-        u.crate_name, u.edition, u.source_file, mode_suffix, kind_suffix, u.manifest_dir, ct,
+        "{}/{}/{}{}{}{}/{}:{:?}",
+        u.crate_name,
+        u.edition,
+        u.source_file,
+        mode_suffix,
+        test_suffix,
+        kind_suffix,
+        u.manifest_dir,
+        ct,
     )
 }
 
@@ -1002,15 +1023,24 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             UnitKind::Doc => "-doc",
             UnitKind::Compile => "",
         };
+        // Mirrors compilation_identity: a Check unit's `test: true` mode
+        // is distinct from `test: false`.  Without this the two groups'
+        // survivors would collide on the new key.
+        let test_suffix = if u.compile_test && u.kind == UnitKind::Check {
+            "-test"
+        } else {
+            ""
+        };
         let kind_suffix = if u.for_host { "-host" } else { "" };
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();
         let unified_identity = format!(
-            "{}-{}-{}{}{}-{}-{:?}-{}",
+            "{}-{}-{}{}{}{}-{}-{:?}-{}",
             pkg_name,
             pkg_version,
             target_name_field,
             mode_suffix,
+            test_suffix,
             kind_suffix,
             u.edition,
             crate_types_sorted,
@@ -1029,8 +1059,14 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         // Use target_name_field directly (not .replace('_', "-")) to match
         // make_unit_key which uses unit.target.name() without conversion.
         let new_key = sanitize_drv_name(&format!(
-            "{}-{}-{}{}{}-{}",
-            pkg_name, pkg_version, target_name_field, mode_suffix, type_suffix, short_hash,
+            "{}-{}-{}{}{}{}-{}",
+            pkg_name,
+            pkg_version,
+            target_name_field,
+            mode_suffix,
+            test_suffix,
+            type_suffix,
+            short_hash,
         ));
 
         // Update redirect map with the actual new key.
