@@ -1718,6 +1718,7 @@ fn write_profile(
                     shell::DrvKind::TestCompile => " (test)",
                     shell::DrvKind::Check => " (check)",
                     shell::DrvKind::Doc => " (doc)",
+                    shell::DrvKind::Aggregator => " (aggregator)",
                     shell::DrvKind::Compile => "",
                 };
                 let label = if version.is_empty() {
