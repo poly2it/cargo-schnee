@@ -252,6 +252,9 @@ let
 '')
     (lib.attrNames plannerEnv);
 
+  # Native tools available to the planner sandbox.  cc-wrapper picks
+  # up `${stdenv.cc}/bin` and that's what cargo's build scripts find as
+  # `cc`; rustToolchain provides rustc/cargo/rustdoc/clippy-driver.
   binPath = lib.makeBinPath ([
     effectiveRustToolchain
     pkgs.stdenv.cc
@@ -265,7 +268,16 @@ let
     pkgs.gnugrep
   ] ++ nativeBuildInputs);
 
-  pkgConfigPath = lib.makeSearchPath "lib/pkgconfig" buildInputs;
+  # Resolve `.dev` (or other) outputs preferentially for inputs that
+  # ship `.pc` files in a separate output (the standard nixpkgs
+  # multi-output convention).  Falls back to the main output if there's
+  # no `.dev`.  Mirrors what stdenv's pkg-config setup hook does.
+  pickOutput = output: pkg: pkg.${output} or pkg;
+  pkgConfigPath = lib.makeSearchPath "lib/pkgconfig"
+    (map (pickOutput "dev") buildInputs);
+  cIncludePath = lib.makeSearchPath "include"
+    (map (pickOutput "dev") buildInputs);
+  libraryPath = lib.makeLibraryPath buildInputs;
 
   plannerName = "${finalPname}-${finalVersion}-${intent}-planner";
 
@@ -289,6 +301,10 @@ let
       export PATH=${binPath}
       ${lib.optionalString (pkgConfigPath != "")
         "export PKG_CONFIG_PATH=${pkgConfigPath}"}
+      ${lib.optionalString (cIncludePath != "")
+        "export C_INCLUDE_PATH=${cIncludePath}"}
+      ${lib.optionalString (libraryPath != "")
+        "export LIBRARY_PATH=${libraryPath}"}
       ${envExportLines}
 
       mkdir -p workspace
@@ -344,27 +360,34 @@ let
       lib.removeSuffix "\n"
         (builtins.readFile "${planner}/plan.txt")));
 
-  # Each per-root build is realised through a tiny wrapper drv whose
-  # output is byte-identical to the cargo-schnee-emitted root drv file.
-  # `builtins.outputOf wrapper.outPath "out"` resolves the wrapper as
-  # a derivation reference, the daemon reads its $out as a drv, and
-  # builds it under the *outer* scheduler — same mechanism as the
-  # single-root case, just one wrapper per cargo unit.
+  # Each plan line is a registered drv path.  Wrap it in a tiny
+  # text-output drv whose $out is the drv file, then outputOf the
+  # wrapper to chain to the cargo-schnee root drv via the outer
+  # scheduler.  See note below on lib filtering for why the lib root
+  # is skipped: leaving it in causes a content-addressed realisation
+  # conflict because the bin roots transitively realise the lib drv
+  # at its natural store path while the wrapper realises the same
+  # drv at the wrapper's `-rootN` path.
+  #
+  # Cargo's lib unit is named by the cargo-normalised pname
+  # (`skeptiva-formatter` → `skeptiva_formatter`).  Bin units use
+  # their `[[bin]] name` verbatim.  Filter root drvs whose suffix
+  # matches the cargo-normalised pname; if the resulting list is
+  # empty (pure-library crate), fall back to including the lib so
+  # buildPackage still produces an installable output.
+  libUnitName = lib.replaceStrings [ "-" ] [ "_" ] finalPname;
+  isLibRoot = drvPath:
+    lib.hasSuffix "-${libUnitName}.drv"
+      (baseNameOf (builtins.unsafeDiscardStringContext drvPath));
+  binPlanLines = lib.filter (p: !isLibRoot p) planLines;
+  effectivePlanLines =
+    if binPlanLines == [] then planLines else binPlanLines;
+
   mkRootBuild = idx: drvPath:
     let
-      # `drvPath` carries string context referencing the original drv
-      # (because it came from IFD on the planner output).  Strip the
-      # context for use in the wrapper's *name*: the name participates
-      # in the wrapper's hash, which must not transitively pull the
-      # original drv into the wrapper's input closure.  The actual
-      # `cp` source uses the contexted path so the planner's output
-      # remains a real input dependency.
       origName = baseNameOf
         (builtins.unsafeDiscardStringContext drvPath);
       wrapper = derivation {
-        # Sequence-suffixed name; ends in `.drv` so the wrapper's
-        # output path is a valid derivation path that `outputOf` can
-        # interpret as a sub-derivation reference.
         name = "${finalPname}-${finalVersion}-root${toString idx}.drv";
         system = pkgs.stdenv.hostPlatform.system;
         builder = "${pkgs.bash}/bin/bash";
@@ -378,7 +401,7 @@ let
     in
       builtins.outputOf wrapper.outPath "out";
 
-  rootBuilds = lib.imap0 mkRootBuild planLines;
+  rootBuilds = lib.imap0 mkRootBuild effectivePlanLines;
 
   # -- install step ------------------------------------------------------
   isWindows = target != null
