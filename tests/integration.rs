@@ -1127,6 +1127,33 @@ fn fixture_lib_bin_integration_test() {
     run_schnee_test(&manifest);
 }
 
+/// Workspace where two crates form a dev-dep cycle: `lib-upper` depends on
+/// `lib-lower` (production), and `lib-lower`'s integration tests pull in
+/// `lib-upper` as a dev-dep.  Cargo plans this as
+/// `lib-lower (Check{test:false}) ← lib-upper (Check{test:false})`
+/// for the production graph and
+/// `lib-lower (Check{test:true}) ← lib-upper` for the integration test
+/// — two distinct units that share a `-check` suffix.  If cargo-schnee's
+/// `compilation_identity` collapses the two `Check` modes into one
+/// NixUnit, the dev-dep edge from the test variant closes a cycle that
+/// breaks topological registration with `Topological sort failed: cycle
+/// detected`.  This fixture exercises that exact shape under
+/// `clippy --all-targets --deny warnings`.
+#[test]
+#[ignore]
+fn fixture_dev_dep_cycle() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dep-cycle");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd(
+        "clippy",
+        &manifest,
+        &["--release", "--no-deps", "--all-targets", "--", "--deny", "warnings"],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Doc tests
 // ---------------------------------------------------------------------------
@@ -1174,5 +1201,65 @@ fn fixture_minimal_lib_doc_private_items() {
     assert!(
         doc_content.contains("helper"),
         "Private fn 'helper' should appear in docs with --document-private-items"
+    );
+}
+
+/// Determinism check for parallel registration: building the same
+/// fixture with `--registration-jobs=1` and with the default parallel
+/// path must produce the same set of registered `.drv` paths. The
+/// chunk_round_robin partitioner is deterministic and `register_unit`
+/// is purely a function of the unit's content-addressed inputs, so
+/// changing fan-out width should never affect the resulting
+/// `dep_drv_map`.
+///
+/// Uses `cargo schnee build -v` so the per-unit `Added <key> -> <drv>`
+/// log lines (info level) are emitted to stderr. Compares the sorted
+/// set of those lines across the two runs.
+#[test]
+#[ignore]
+fn registration_jobs_serial_matches_parallel() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    fn drv_lines(stderr: &str) -> Vec<String> {
+        let mut out: Vec<String> = stderr
+            .lines()
+            .filter_map(|l| {
+                // INFO log lines may carry an ANSI prefix from
+                // tracing-subscriber's `fmt` layer; the body shape is
+                // stable: `... Added <key> -> /nix/store/<hash>-<name>.drv`.
+                let idx = l.find(" Added ")?;
+                let tail = &l[idx + " Added ".len()..];
+                Some(tail.trim().to_string())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    clean_target(&fixture_dir);
+    let (_, stderr_serial) = run_schnee_cmd(
+        "build",
+        &manifest,
+        &["--verbose", "--registration-jobs", "1"],
+    );
+
+    clean_target(&fixture_dir);
+    let (_, stderr_parallel) = run_schnee_cmd("build", &manifest, &["--verbose"]);
+
+    let serial = drv_lines(&stderr_serial);
+    let parallel = drv_lines(&stderr_parallel);
+
+    assert!(
+        !serial.is_empty(),
+        "expected at least one 'Added' log line in serial stderr; \
+         did `--verbose` not raise the fmt-layer level? \nstderr:\n{}",
+        stderr_serial,
+    );
+    assert_eq!(
+        serial, parallel,
+        "serial vs parallel registration produced different drv sets",
     );
 }

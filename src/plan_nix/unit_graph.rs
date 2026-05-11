@@ -112,6 +112,23 @@ pub(super) fn extract_units_from_bcx(
             UnitKind::Compile
         };
 
+        // `cargo check --all-targets` pulls integration tests and
+        // benches into the unit graph as `CompileMode::Check { test: true }`,
+        // and ALSO emits a `Check { test: true }` lib unit alongside the
+        // existing `Check { test: false }` lib so cargo can link the
+        // integration tests against the test variant (cfg(test) active,
+        // dev-deps in scope) while bins keep linking the non-test
+        // variant.  These are two distinct cargo units with different
+        // dep sets and rmeta outputs; cargo-schnee must mirror them as
+        // two distinct NixUnits.  `make_unit_key` /
+        // `compilation_identity` distinguish them via the test bool so
+        // cargo's edges resolve to the right side.
+        //
+        // `--test` then applies whenever `Check { test: true }`: it's
+        // what activates `#[cfg(test)]` and the test harness, regardless
+        // of target kind.
+        let compile_test = matches!(unit.mode, CompileMode::Check { test: true });
+
         // Source file
         let source_file = unit
             .target
@@ -216,16 +233,17 @@ pub(super) fn extract_units_from_bcx(
             }
         }
 
-        if log::log_enabled!(log::Level::Debug) {
-            let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
-            dep_names.sort();
-            log::debug!(
-                "dep_extern_map for {} after first pass ({} entries): {:?}",
-                key,
-                dep_extern_map.len(),
-                dep_names,
-            );
-        }
+        // tracing's macros are lazy — the format args are not evaluated
+        // unless the event is enabled — so the explicit log_enabled
+        // gate that the `log` crate needed is no longer required.
+        let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
+        dep_names.sort();
+        tracing::debug!(
+            "dep_extern_map for {} after first pass ({} entries): {:?}",
+            key,
+            dep_extern_map.len(),
+            dep_names,
+        );
 
         // Fix missing optional deps activated by features but absent from the
         // unit graph edge list.  This happens when optional deps are declared
@@ -272,7 +290,7 @@ pub(super) fn extract_units_from_bcx(
                     }) {
                         let dep_key = key_map[candidate].clone();
                         let already_present = dep_extern_map.contains_key(&extern_name);
-                        log::debug!(
+                        tracing::debug!(
                             "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
                              already_in_dep_extern={}",
                             dep_toml_name,
@@ -290,7 +308,7 @@ pub(super) fn extract_units_from_bcx(
                         // Dep is behind a target-specific gate (e.g.
                         // cfg(windows)) and absent from the unit graph on
                         // this platform — expected, not actionable.
-                        log::debug!(
+                        tracing::debug!(
                             "Feature-activated dep {} (dep:{}) not in unit graph for {} \
                              (platform-gated, expected)",
                             extern_name,
@@ -298,7 +316,7 @@ pub(super) fn extract_units_from_bcx(
                             key,
                         );
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
                             extern_name,
                             dep_toml_name,
@@ -311,7 +329,7 @@ pub(super) fn extract_units_from_bcx(
             for (extern_name, dep_key) in
                 find_missing_feature_deps(&dep_extern_map, &features, &feature_dep_activations)
             {
-                log::info!(
+                tracing::info!(
                     "Adding missing optional dep {} -> {} for {} \
                      (feature-activated, possibly behind platform gate)",
                     extern_name,
@@ -368,14 +386,20 @@ pub(super) fn extract_units_from_bcx(
         let target_name = root_target_names.get(&key).cloned().unwrap_or_default();
         let for_host = matches!(unit.kind, CompileKind::Host);
 
+        // For `Check { test: true }` units, append `-test` to the drv
+        // name so the test and non-test variants of the same target
+        // don't collide in diagnostics or `$out` filenames.  Compilation
+        // identity already distinguishes them, so the keys differ; this
+        // just keeps human-readable names unique too.
         nix_units.push(NixUnit {
             key,
             drv_name: sanitize_drv_name(&format!(
-                "{}-{}-{}{}",
+                "{}-{}-{}{}{}",
                 unit.pkg.name(),
                 unit.pkg.version(),
                 unit.target.name(),
                 mode_suffix_for_drv_name(&kind),
+                check_test_suffix(compile_test, kind),
             )),
             kind,
             source_file: source_file_str,
@@ -398,6 +422,7 @@ pub(super) fn extract_units_from_bcx(
             is_root,
             target_name,
             for_host,
+            compile_test,
             drv_path: None,
         });
     }
@@ -415,7 +440,7 @@ pub(super) fn extract_units_from_bcx(
         for u in &nix_units {
             for (ext_name, dep_key) in &u.dep_extern {
                 if !valid_keys.contains(dep_key.as_str()) {
-                    log::warn!(
+                    tracing::warn!(
                         "Stale dep_extern after unification: {} has {} -> key {} \
                          which does NOT match any NixUnit",
                         u.key,
@@ -473,13 +498,28 @@ pub(super) fn mode_suffix_for_drv_name(kind: &UnitKind) -> &'static str {
     }
 }
 
+/// Returns "-test" when this is a `Check { test: true }` unit, "" otherwise.
+/// Used everywhere a key, drv name, or grouping identity needs to distinguish
+/// the two `Check` variants (see `compilation_identity` for the full
+/// rationale).  Returns "" for non-`Check` units even when `compile_test` is
+/// set, since the test bit only collapses semantically inside `Check` mode —
+/// `TestCompile` and others already encode their test-ness in the kind.
+fn check_test_suffix(compile_test: bool, kind: UnitKind) -> &'static str {
+    if compile_test && kind == UnitKind::Check {
+        "-test"
+    } else {
+        ""
+    }
+}
+
 /// Compute a "compilation identity" for a unit — units with the same identity
 /// produce identical rustc output and can be deduplicated.
 fn compilation_identity(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -533,7 +573,8 @@ fn make_unit_key(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -879,12 +920,22 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
     };
+    // For Check units the test bool distinguishes two distinct cargo
+    // unit graph nodes (lib in `cfg(test)` mode vs without).  They must
+    // not unify across that split — see compilation_identity.
     let kind_suffix = if u.for_host { "-host" } else { "" };
     let mut ct = u.crate_types.clone();
     ct.sort();
     format!(
-        "{}/{}/{}{}{}/{}:{:?}",
-        u.crate_name, u.edition, u.source_file, mode_suffix, kind_suffix, u.manifest_dir, ct,
+        "{}/{}/{}{}{}{}/{}:{:?}",
+        u.crate_name,
+        u.edition,
+        u.source_file,
+        mode_suffix,
+        check_test_suffix(u.compile_test, u.kind),
+        kind_suffix,
+        u.manifest_dir,
+        ct,
     )
 }
 
@@ -893,7 +944,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
 /// cargo's v2 resolver produces separate host/target feature sets for the same
 /// crate (e.g. proc_macro2 with and without `span-locations`).
 fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
-    use log::info;
+    use tracing::info;
 
     // Group indices by a feature-agnostic key.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -976,15 +1027,20 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             UnitKind::Doc => "-doc",
             UnitKind::Compile => "",
         };
+        // Mirrors compilation_identity: a Check unit's `test: true` mode
+        // is distinct from `test: false`.  Without this the two groups'
+        // survivors would collide on the new key.
+        let test_suffix = check_test_suffix(u.compile_test, u.kind);
         let kind_suffix = if u.for_host { "-host" } else { "" };
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();
         let unified_identity = format!(
-            "{}-{}-{}{}{}-{}-{:?}-{}",
+            "{}-{}-{}{}{}{}-{}-{:?}-{}",
             pkg_name,
             pkg_version,
             target_name_field,
             mode_suffix,
+            test_suffix,
             kind_suffix,
             u.edition,
             crate_types_sorted,
@@ -1003,8 +1059,14 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         // Use target_name_field directly (not .replace('_', "-")) to match
         // make_unit_key which uses unit.target.name() without conversion.
         let new_key = sanitize_drv_name(&format!(
-            "{}-{}-{}{}{}-{}",
-            pkg_name, pkg_version, target_name_field, mode_suffix, type_suffix, short_hash,
+            "{}-{}-{}{}{}{}-{}",
+            pkg_name,
+            pkg_version,
+            target_name_field,
+            mode_suffix,
+            test_suffix,
+            type_suffix,
+            short_hash,
         ));
 
         // Update redirect map with the actual new key.
@@ -1165,6 +1227,7 @@ mod tests {
             is_root: false,
             target_name: String::new(),
             for_host: false,
+            compile_test: false,
             drv_path: None,
         }
     }

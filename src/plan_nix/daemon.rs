@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::debug;
+use tracing::debug;
 
 const WORKER_MAGIC_1: u64 = 0x6e697863;
 const WORKER_MAGIC_2: u64 = 0x6478696f;
@@ -7,15 +7,42 @@ const STDERR_NEXT: u64 = 0x6f6c6d67;
 const STDERR_LAST: u64 = 0x616c7473;
 const STDERR_ERROR: u64 = 0x63787470;
 
+// Worker protocol opcodes used in this module. Extracted from the upstream
+// `nix/src/libstore/worker-protocol.hh` enum.
+const WOP_ADD_TEXT_TO_STORE: u64 = 8;
+const WOP_QUERY_VALID_PATHS: u64 = 31;
+
 pub(super) struct NixDaemonConn {
     stream: std::os::unix::net::UnixStream,
+    /// Worker protocol version negotiated during the handshake, encoded
+    /// as `(major << 8) | minor`. Several opcodes (`wopQueryValidPaths`,
+    /// for one) take an extra argument from a particular protocol
+    /// version onwards; consumers consult this rather than recomputing
+    /// the min(client, daemon) at the call site.
+    negotiated_protocol: u64,
 }
 
 impl NixDaemonConn {
     pub(super) fn connect() -> Result<Self> {
         use anyhow::Context;
-        let socket_path = std::env::var("NIX_DAEMON_SOCKET_PATH")
-            .unwrap_or_else(|_| "/nix/var/nix/daemon-socket/socket".to_string());
+        // Resolve the daemon socket the same way upstream Nix CLI tools do:
+        // honour `NIX_REMOTE=unix://<path>` first (this is what
+        // recursive-nix builds set so the build sees the daemon's
+        // restricted view at `<tmpDir>/.nix-socket` rather than the
+        // system socket — see Nix's
+        // `src/libstore/unix/build/derivation-builder.cc::NIX_REMOTE`),
+        // then fall back to `NIX_DAEMON_SOCKET_PATH`, then the default
+        // system socket. Using the system socket from inside a
+        // recursive-nix build can fail with EACCES or ECONNRESET on
+        // configurations that don't permit it.
+        let socket_path = if let Ok(remote) = std::env::var("NIX_REMOTE")
+            && let Some(path) = remote.strip_prefix("unix://")
+        {
+            path.to_string()
+        } else {
+            std::env::var("NIX_DAEMON_SOCKET_PATH")
+                .unwrap_or_else(|_| "/nix/var/nix/daemon-socket/socket".to_string())
+        };
         let stream = std::os::unix::net::UnixStream::connect(&socket_path).with_context(|| {
             format!(
                 "Failed to connect to Nix daemon at {}. \
@@ -26,7 +53,10 @@ impl NixDaemonConn {
         let timeout = Some(std::time::Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
-        let mut conn = Self { stream };
+        let mut conn = Self {
+            stream,
+            negotiated_protocol: 0,
+        };
         conn.handshake()?;
         Ok(conn)
     }
@@ -52,6 +82,7 @@ impl NixDaemonConn {
         self.write_u64(client_version)?;
 
         let version = std::cmp::min(proto_version, client_version);
+        self.negotiated_protocol = version;
         debug!(
             "Negotiated protocol version: {}.{}",
             version >> 8,
@@ -70,7 +101,10 @@ impl NixDaemonConn {
 
         self.stream.flush()?;
 
-        // Protocol >= 1.33: daemon sends its version string
+        // Protocol >= 1.33: daemon sends its version string. Read and
+        // log it for diagnostics; the value is intentionally not used
+        // for JSON-format dispatch (the CLI version determines that —
+        // see `derivation_format::TargetNix::detect`).
         if version >= (1 << 8) | 33 {
             let ver = self.read_string()?;
             debug!("Daemon version: {}", ver);
@@ -88,20 +122,35 @@ impl NixDaemonConn {
         Ok(())
     }
 
-    /// Check whether a store path is valid (registered in the Nix DB).
-    /// Uses wopIsValidPath (opcode 1).
-    pub(super) fn is_valid_path(&mut self, path: &str) -> Result<bool> {
+    /// Batched validity probe. Sends every path in
+    /// one request and returns the subset the daemon considers valid.
+    /// One round-trip regardless of input length, replacing the
+    /// per-path RTTs that dominate registration of large workspaces.
+    ///
+    /// Worker protocol ≥ 1.27 takes an additional `substitute` flag;
+    /// we always pass `false` because cargo-schnee already short-
+    /// circuits via the in-process `.drv` path computation and never
+    /// wants the daemon to fetch from substituters during the
+    /// registration phase.
+    pub(super) fn query_valid_paths(
+        &mut self,
+        paths: &[&str],
+    ) -> Result<std::collections::HashSet<String>> {
         use std::io::Write;
 
-        self.write_u64(1)?; // wopIsValidPath
-        self.write_string(path)?;
+        self.write_u64(WOP_QUERY_VALID_PATHS)?;
+        self.write_string_list(paths)?;
+        if self.negotiated_protocol >= ((1 << 8) | 27) {
+            self.write_u64(0)?; // substitute = false
+        }
         self.stream.flush()?;
 
         self.process_stderr()?;
-        Ok(self.read_u64()? != 0)
+        let valid = self.read_string_list()?;
+        Ok(valid.into_iter().collect())
     }
 
-    /// Register a text file in the Nix store (wopAddTextToStore, opcode 8).
+    /// Register a text file in the Nix store (wopAddTextToStore).
     /// Returns the resulting store path.
     pub(super) fn add_text_to_store(
         &mut self,
@@ -111,7 +160,7 @@ impl NixDaemonConn {
     ) -> Result<String> {
         use std::io::Write;
 
-        self.write_u64(8)?; // wopAddTextToStore
+        self.write_u64(WOP_ADD_TEXT_TO_STORE)?;
         self.write_string(name)?;
         self.write_bytes(content)?;
         self.write_string_list(refs)?;
@@ -174,6 +223,27 @@ impl NixDaemonConn {
             self.write_string(s)?;
         }
         Ok(())
+    }
+
+    fn read_string_list(&mut self) -> Result<Vec<String>> {
+        // Sanity bound — a valid response is at most one entry per path
+        // we sent, but the framing doesn't expose that here. Guards
+        // against a runaway count from a corrupted stream allocating
+        // gigabytes before the strings actually arrive.
+        const MAX_STRING_LIST_LEN: usize = 1 << 20;
+        let count = self.read_u64()? as usize;
+        if count > MAX_STRING_LIST_LEN {
+            anyhow::bail!(
+                "Nix daemon advertised string-list of {} entries, exceeding {} limit",
+                count,
+                MAX_STRING_LIST_LEN,
+            );
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.read_string()?);
+        }
+        Ok(out)
     }
 
     /// Read stderr protocol messages until STDERR_LAST (success).

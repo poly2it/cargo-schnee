@@ -34,6 +34,11 @@ let
         shift
         args=()
         ${varInits}
+        # Setup runs before arg parsing so any args it injects (e.g.
+        # --vendor-dir from schneeSetup) land at the start of the cargo
+        # invocation rather than after a caller-supplied `--` separator,
+        # which would smuggle them into the test harness.
+        ${setup}
         while [ $# -gt 0 ]; do
           case "$1" in
             ${forwardCases}
@@ -42,7 +47,6 @@ let
             *) shift ;;
           esac
         done
-        ${setup}
         ${command} "''${args[@]}"
         __ec=$?
         ${postRun}

@@ -9,16 +9,20 @@
 mod aterm;
 mod daemon;
 mod derivation;
+mod derivation_format;
 mod unit_graph;
 pub(crate) mod util;
 
 use aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use daemon::NixDaemonConn;
-use derivation::{construct_derivation, nix_derivation_add, nix_store_closure};
+use derivation::{
+    construct_derivation, downstream_placeholder, nix_derivation_add, nix_store_closure,
+    self_placeholder,
+};
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
-    find_cross_linker, find_sysroot_rlib, which_command, which_command_no_deref, which_rustc,
-    which_rustdoc,
+    find_cross_linker, find_sysroot_rlib, which_clippy_driver, which_command,
+    which_command_no_deref, which_rustc, which_rustdoc,
 };
 
 use anyhow::{Context, Result};
@@ -27,9 +31,9 @@ use cargo::core::compiler::UnitInterner;
 use cargo::ops::{self, CompileOptions};
 use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
-use log::info;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Build configuration
@@ -147,7 +151,7 @@ fn extract_cfg_envs(cfgs: &[cargo_platform::Cfg]) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 /// The kind of derivation a NixUnit represents.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnitKind {
     /// Regular rustc compilation (lib, bin, proc-macro, etc.)
     Compile,
@@ -213,6 +217,15 @@ pub struct NixUnit {
     /// vs the target. For native builds host == target so this is irrelevant.
     #[serde(default)]
     pub(crate) for_host: bool,
+    /// Whether this unit must be compiled with `--test`.  Set for any
+    /// integration/unit/example/bench target included via cargo's
+    /// `--all-targets` selection: cargo's bcx represents these as
+    /// `CompileMode::Check { test: true }` (or `CompileMode::Test`),
+    /// and rustc needs `--test` to synthesise a `main` and the test
+    /// harness.  Without it, integration test crates fail at compile
+    /// time with E0601 (`main function not found in crate ...`).
+    #[serde(default)]
+    pub(crate) compile_test: bool,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
 }
@@ -368,7 +381,7 @@ fn check_system_libraries(
             .unwrap_or(false);
 
         if !ok {
-            log::warn!(
+            tracing::warn!(
                 "System library '{}' (needed by {}) not found via pkg-config. \
                  Add the corresponding package to buildInputs to make it available.",
                 links_name,
@@ -391,6 +404,240 @@ fn check_system_libraries(
 /// `cached_units` allows skipping the expensive `create_bcx()` call on cache hit.
 /// If `Some((old_src_store, units))`, path prefixes are fixed up and units are used directly.
 /// Returns `(root_drv_path, units_for_caching)`.
+/// Per-unit data needed for derivation registration in a topological
+/// level. Computed once per level so the batched validity probe and the
+/// possibly-parallel writes both work from the same struct.
+struct LevelUnit {
+    /// Index into the outer `nix_units` slice.
+    i: usize,
+    /// Copy of `nix_units[i].key`. Embedded so worker threads can produce
+    /// useful diagnostics without sharing access to the outer slice.
+    unit_key: String,
+    json: serde_json::Value,
+    drv_file_name: String,
+    aterm: Vec<u8>,
+    refs: Vec<String>,
+    drv_path: String,
+}
+
+fn ensure_path_match(observed: &str, unit: &LevelUnit) -> Result<()> {
+    if observed != unit.drv_path {
+        anyhow::bail!(
+            "Path mismatch for {}:\n  computed: {}\n  observed: {}",
+            unit.unit_key,
+            unit.drv_path,
+            observed,
+        );
+    }
+    Ok(())
+}
+
+/// Register a single unit by adding its `.drv` ATerm bytes via the
+/// daemon, with one reconnect attempt on transient failure, falling
+/// through to `nix derivation add` (CLI) when the daemon is unreachable.
+///
+/// `conn` reflects the *connection state for the current chunk*: a
+/// successful reconnect updates it in place; a permanent failure clears
+/// it so subsequent calls skip the daemon path entirely. Either way the
+/// returned path is verified against the in-process computation.
+fn register_unit(conn: &mut Option<NixDaemonConn>, unit: &LevelUnit) -> Result<String> {
+    let refs: Vec<&str> = unit.refs.iter().map(|s| s.as_str()).collect();
+
+    if let Some(c) = conn.as_mut() {
+        match c.add_text_to_store(&unit.drv_file_name, &unit.aterm, &refs) {
+            Ok(p) => {
+                ensure_path_match(&p, unit)?;
+                return Ok(p);
+            }
+            Err(e) => {
+                info!(
+                    "Daemon error for {}: {}, attempting reconnect",
+                    unit.unit_key, e,
+                );
+            }
+        }
+        // First connection failed; try a fresh one.
+        match NixDaemonConn::connect() {
+            Ok(mut new_c) => match new_c.add_text_to_store(&unit.drv_file_name, &unit.aterm, &refs)
+            {
+                Ok(p) => {
+                    ensure_path_match(&p, unit)?;
+                    *conn = Some(new_c);
+                    return Ok(p);
+                }
+                Err(e2) => {
+                    info!(
+                        "Reconnected daemon also failed for {}: {}, falling back to CLI",
+                        unit.unit_key, e2,
+                    );
+                    *conn = None;
+                }
+            },
+            Err(e2) => {
+                info!(
+                    "Daemon reconnect failed for {}: {}, falling back to CLI",
+                    unit.unit_key, e2,
+                );
+                *conn = None;
+            }
+        }
+    }
+
+    let p = nix_derivation_add(&unit.json)
+        .with_context(|| format!("Failed to add derivation for {}", unit.unit_key))?;
+    ensure_path_match(&p, unit)?;
+    Ok(p)
+}
+
+/// Distribute `units` round-robin across `n` chunks. Returns exactly
+/// `n` Vecs, possibly empty for over-provisioned cases. Round-robin
+/// keeps per-chunk wall time roughly even across workers when unit
+/// build cost is correlated with index — which it tends to be after
+/// `compute_topo_levels` orders dependencies before dependents.
+fn chunk_round_robin<T>(units: Vec<T>, n: usize) -> Vec<Vec<T>> {
+    let mut chunks: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    for (idx, u) in units.into_iter().enumerate() {
+        chunks[idx % n].push(u);
+    }
+    chunks
+}
+
+/// Bootstrap-only unit-graph extraction.
+///
+/// Loads the workspace via cargo-as-library and extracts the `Vec<NixUnit>`
+/// plus target/host `cfg` env tables. No closure queries, no derivation
+/// registration, no `nix-store --realise`. Used both as the cache-miss
+/// fallback inside [`run_plan_nix`] and as the body of the
+/// `cargo-schnee compute-graph` subcommand that pre-computes a graph for
+/// `nix/buildPackage.nix` to feed back via `CARGO_SCHNEE_UNIT_GRAPH`.
+///
+/// Side effects: sets `CARGO_HOME` to a tempdir, briefly changes the
+/// process CWD to `src` for `create_bcx`, restores it on exit. Both are
+/// existing behaviours preserved verbatim from the previous inline code.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn fresh_unit_graph(
+    src: &Path,
+    vendor_dir: &Path,
+    profile: &ProfileConfig,
+    target: &TargetConfig,
+    user_intent: UserIntent,
+    packages: &[String],
+    exclude: &[String],
+    features: &[String],
+    no_default_features: bool,
+    all_targets: bool,
+) -> Result<(Vec<NixUnit>, Vec<(String, String)>, Vec<(String, String)>)> {
+    let manifest_path = src.join("Cargo.toml");
+    if !manifest_path.exists() {
+        anyhow::bail!("No Cargo.toml found at {}", manifest_path.display());
+    }
+
+    // Write cargo config for vendored sources (unique temp dirs for concurrent safety)
+    let cargo_home_tmp = tempfile::Builder::new()
+        .prefix("cargo-schnee-home-")
+        .tempdir()?;
+    let cargo_home = cargo_home_tmp.path().to_path_buf();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"{}\"\n",
+            vendor_dir.display()
+        ),
+    )?;
+    unsafe { std::env::set_var("CARGO_HOME", &cargo_home) };
+
+    // Change CWD to the nix store source so cargo's config discovery
+    // (which walks up from CWD) doesn't find .cargo/config.toml files
+    // left by build tools (e.g. cargoSetupPostUnpackHook in /build/).
+    let old_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(src).context("Failed to cd to source dir for create_bcx")?;
+
+    let target_tmp = tempfile::Builder::new()
+        .prefix("cargo-schnee-target-")
+        .tempdir()?;
+    let target_dir = target_tmp.path().to_path_buf();
+
+    let mut gctx = GlobalContext::default()?;
+    gctx.configure(
+        0,
+        false,
+        None,
+        // frozen: false — when building a workspace subset (e.g. -p foo), the
+        // Cargo.lock may contain entries for sibling crates that aren't part of
+        // this resolve.  frozen=true would reject the lock as "out of date".
+        // This is safe because: (1) the Nix sandbox prevents network access so
+        // no new crates can be fetched, and (2) deps are pre-vendored so the
+        // resolve is fully offline regardless.
+        false,
+        true,
+        true,
+        &Some(target_dir.to_string_lossy().to_string().into()),
+        &[],
+        &[],
+    )?;
+
+    let ws = Workspace::new(&manifest_path, &gctx)?;
+    let mut options = CompileOptions::new(&gctx, user_intent)?;
+    // Set profile if not dev
+    if profile.name != "dev" {
+        options.build_config.requested_profile =
+            cargo::util::interning::InternedString::new(&profile.name);
+    }
+    // Set cross-compilation target if specified
+    if target.is_cross() {
+        options.build_config.requested_kinds = vec![cargo::core::compiler::CompileKind::Target(
+            cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
+        )];
+    }
+    // Package selection: -p/--package narrows the build to specific crates,
+    // --exclude removes crates from the default workspace set.
+    if !packages.is_empty() {
+        options.spec = ops::Packages::Packages(packages.to_vec());
+    } else if !exclude.is_empty() {
+        options.spec = ops::Packages::OptOut(exclude.to_vec());
+    } else if ws.is_virtual() {
+        options.spec = ops::Packages::All(Vec::new());
+    }
+
+    // Feature flags
+    if !features.is_empty() || no_default_features {
+        options.cli_features = cargo::core::resolver::CliFeatures::from_command_line(
+            features,
+            false, // all_features
+            !no_default_features,
+        )?;
+    }
+
+    // --all-targets: extend cargo's default target set (lib + bins) to
+    // include tests, examples, and benches.  Mirrors `cargo --all-targets`.
+    if all_targets {
+        options.filter = ops::CompileFilter::new_all_targets();
+    }
+
+    // Extract unit graph and target cfg — NO compilation happens here
+    let interner = UnitInterner::new();
+    let bcx = ops::create_bcx(&ws, &options, &interner, None)?;
+    let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir, user_intent)?;
+    let bcx_cfg_envs = extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
+    let bcx_host_cfg_envs = if target.is_cross() {
+        extract_cfg_envs(
+            bcx.target_data
+                .cfg(cargo::core::compiler::CompileKind::Host),
+        )
+    } else {
+        bcx_cfg_envs.clone()
+    };
+    drop(bcx);
+    info!("Extracted {} units from unit graph", units.len());
+
+    // Restore CWD
+    if let Some(cwd) = old_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+
+    Ok((units, bcx_cfg_envs, bcx_host_cfg_envs))
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn run_plan_nix(
     src: &Path,
@@ -410,12 +657,38 @@ pub fn run_plan_nix(
     passthru_envs: &[(String, String)],
     project_dir: Option<&Path>,
     document_private_items: bool,
+    // Run clippy-driver instead of rustc on local (workspace) compile units.
+    // Dependency units are unchanged so per-unit derivations stay shared with
+    // regular check / build runs.
+    clippy: bool,
+    // Lint args forwarded to clippy-driver on every local clippy unit.
+    // Empty when `clippy` is false or when the caller did not pass any
+    // post-`--` driver flags.
+    clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules forwarded to every compile unit.  Each
+    // `(src_relative, replacement)` is resolved against `src_store` inside
+    // `build_compile_script`, so callers express remaps in terms of the
+    // project-src layout without knowing the content-addressed hash.
+    path_prefix_remaps: &[(String, String)],
+    // Number of parallel daemon connections to use for derivation
+    // registration. `None` defaults to the number of available CPU
+    // cores; `Some(1)` reproduces the pre-parallel behaviour. Capped
+    // per topo level by the level's width so registration of small
+    // levels does not over-allocate connections.
+    registration_jobs: Option<usize>,
+    // Mirror of `cargo --all-targets`: when true, plan tests, examples
+    // and benches alongside the default lib + bins.  Used by
+    // `cargo schnee clippy --all-targets` so lint coverage extends to
+    // test modules and example crates.
+    all_targets: bool,
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
     Vec<(String, String)>,
     Vec<(String, String)>,
 )> {
+    let _root_span = tracing::info_span!("plan_nix").entered();
+
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
         anyhow::bail!("No Cargo.toml found at {}", manifest_path.display());
@@ -427,137 +700,57 @@ pub fn run_plan_nix(
 
     let src_str = src.to_string_lossy().to_string();
 
-    let (mut nix_units, cfg_envs, host_cfg_envs) = if let Some((old_src_store, mut units)) =
-        cached_units
-    {
-        // Fix up source paths: replace old src_store prefix with current one
-        if old_src_store != src_str {
-            for unit in &mut units {
-                if unit.source_file.starts_with(&old_src_store) {
-                    unit.source_file =
-                        format!("{}{}", src_str, &unit.source_file[old_src_store.len()..]);
-                }
-                if unit.manifest_dir.starts_with(&old_src_store) {
-                    unit.manifest_dir =
-                        format!("{}{}", src_str, &unit.manifest_dir[old_src_store.len()..]);
+    let _extract_span = tracing::info_span!(
+        "extract_units",
+        cached = cached_units.is_some(),
+        crate_count = tracing::field::Empty,
+    )
+    .entered();
+    let (mut nix_units, cfg_envs, host_cfg_envs) =
+        if let Some((old_src_store, mut units)) = cached_units {
+            // Fix up source paths: replace old src_store prefix with current one
+            if old_src_store != src_str {
+                for unit in &mut units {
+                    if unit.source_file.starts_with(&old_src_store) {
+                        unit.source_file =
+                            format!("{}{}", src_str, &unit.source_file[old_src_store.len()..]);
+                    }
+                    if unit.manifest_dir.starts_with(&old_src_store) {
+                        unit.manifest_dir =
+                            format!("{}{}", src_str, &unit.manifest_dir[old_src_store.len()..]);
+                    }
                 }
             }
-        }
-        // Clear drv_path from cached units (will be recomputed)
-        for unit in &mut units {
-            unit.drv_path = None;
-        }
-        let cfg = cached_cfg_envs.unwrap_or_default();
-        let host_cfg = cached_host_cfg_envs.unwrap_or_default();
-        info!(
-            "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
-            units.len(),
-            cfg.len(),
-            old_src_store != src_str
-        );
-        (units, cfg, host_cfg)
-    } else {
-        // Write cargo config for vendored sources (unique temp dirs for concurrent safety)
-        let cargo_home_tmp = tempfile::Builder::new()
-            .prefix("cargo-schnee-home-")
-            .tempdir()?;
-        let cargo_home = cargo_home_tmp.path().to_path_buf();
-        std::fs::write(
-            cargo_home.join("config.toml"),
-            format!(
-                "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"{}\"\n",
-                vendor_dir.display()
-            ),
-        )?;
-        unsafe { std::env::set_var("CARGO_HOME", &cargo_home) };
-
-        // Change CWD to the nix store source so cargo's config discovery
-        // (which walks up from CWD) doesn't find .cargo/config.toml files
-        // left by build tools (e.g. cargoSetupPostUnpackHook in /build/).
-        let old_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(src).context("Failed to cd to source dir for create_bcx")?;
-
-        let target_tmp = tempfile::Builder::new()
-            .prefix("cargo-schnee-target-")
-            .tempdir()?;
-        let target_dir = target_tmp.path().to_path_buf();
-
-        let mut gctx = GlobalContext::default()?;
-        gctx.configure(
-            0,
-            false,
-            None,
-            // frozen: false — when building a workspace subset (e.g. -p foo), the
-            // Cargo.lock may contain entries for sibling crates that aren't part of
-            // this resolve.  frozen=true would reject the lock as "out of date".
-            // This is safe because: (1) the Nix sandbox prevents network access so
-            // no new crates can be fetched, and (2) deps are pre-vendored so the
-            // resolve is fully offline regardless.
-            false,
-            true,
-            true,
-            &Some(target_dir.to_string_lossy().to_string().into()),
-            &[],
-            &[],
-        )?;
-
-        let ws = Workspace::new(&manifest_path, &gctx)?;
-        let mut options = CompileOptions::new(&gctx, user_intent)?;
-        // Set profile if not dev
-        if profile.name != "dev" {
-            options.build_config.requested_profile =
-                cargo::util::interning::InternedString::new(&profile.name);
-        }
-        // Set cross-compilation target if specified
-        if target.is_cross() {
-            options.build_config.requested_kinds =
-                vec![cargo::core::compiler::CompileKind::Target(
-                    cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
-                )];
-        }
-        // Package selection: -p/--package narrows the build to specific crates,
-        // --exclude removes crates from the default workspace set.
-        if !packages.is_empty() {
-            options.spec = ops::Packages::Packages(packages.to_vec());
-        } else if !exclude.is_empty() {
-            options.spec = ops::Packages::OptOut(exclude.to_vec());
-        } else if ws.is_virtual() {
-            options.spec = ops::Packages::All(Vec::new());
-        }
-
-        // Feature flags
-        if !features.is_empty() || no_default_features {
-            options.cli_features = cargo::core::resolver::CliFeatures::from_command_line(
-                features,
-                false, // all_features
-                !no_default_features,
-            )?;
-        }
-
-        // Extract unit graph and target cfg — NO compilation happens here
-        let interner = UnitInterner::new();
-        let bcx = ops::create_bcx(&ws, &options, &interner, None)?;
-        let units = extract_units_from_bcx(&bcx, &bcx.roots, src, vendor_dir, user_intent)?;
-        let bcx_cfg_envs =
-            extract_cfg_envs(bcx.target_data.cfg(bcx.build_config.requested_kinds[0]));
-        let bcx_host_cfg_envs = if target.is_cross() {
-            extract_cfg_envs(
-                bcx.target_data
-                    .cfg(cargo::core::compiler::CompileKind::Host),
-            )
+            // Clear drv_path from cached units (will be recomputed)
+            for unit in &mut units {
+                unit.drv_path = None;
+            }
+            let cfg = cached_cfg_envs.unwrap_or_default();
+            let host_cfg = cached_host_cfg_envs.unwrap_or_default();
+            info!(
+                "Using cached unit graph ({} units, {} cfg envs, src fixup: {})",
+                units.len(),
+                cfg.len(),
+                old_src_store != src_str
+            );
+            (units, cfg, host_cfg)
         } else {
-            bcx_cfg_envs.clone()
+            fresh_unit_graph(
+                src,
+                vendor_dir,
+                profile,
+                target,
+                user_intent,
+                packages,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+            )?
         };
-        drop(bcx);
-        info!("Extracted {} units from unit graph", units.len());
-
-        // Restore CWD
-        if let Some(cwd) = old_cwd {
-            let _ = std::env::set_current_dir(cwd);
-        }
-
-        (units, bcx_cfg_envs, bcx_host_cfg_envs)
-    };
+    tracing::Span::current().record("crate_count", nix_units.len());
+    drop(_extract_span);
+    tracing::info!(units = nix_units.len(), "extract_units complete");
 
     // Populate original_manifest_dir for TestCompile units so that compile-time
     // env!("CARGO_MANIFEST_DIR") captures the writable project path instead of
@@ -577,6 +770,15 @@ pub fn run_plan_nix(
     let rustdoc_str = if user_intent.is_doc() {
         let rustdoc_path = which_rustdoc()?;
         rustdoc_path.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
+    // For clippy mode, resolve clippy-driver.  It is invoked as a rustc
+    // replacement for local (workspace) units; dep units keep using rustc
+    // so their per-unit derivations stay byte-identical to regular builds.
+    let clippy_str = if clippy {
+        let path = which_clippy_driver()?;
+        path.to_string_lossy().to_string()
     } else {
         String::new()
     };
@@ -736,6 +938,25 @@ pub fn run_plan_nix(
     let mut closure_store_paths: Vec<String> = Vec::new();
     closure_store_paths.push(rustc_store.clone());
     closure_store_paths.push(host_cc_store.clone());
+    // Capture clippy-driver's store closure when in clippy mode.  In typical
+    // rust-overlay setups it lives inside the same toolchain symlink farm as
+    // rustc and the closure is a no-op, but if clippy ships separately we
+    // need its libs available in the per-unit sandbox.
+    let clippy_store: Option<String> = if !clippy_str.is_empty() {
+        let canon =
+            std::fs::canonicalize(&clippy_str).unwrap_or_else(|_| PathBuf::from(&clippy_str));
+        canon
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    if let Some(ref store) = clippy_store
+        && !closure_store_paths.contains(store)
+    {
+        closure_store_paths.push(store.clone());
+    }
     if target.is_cross() && target_cc_store != host_cc_store {
         closure_store_paths.push(target_cc_store.clone());
     }
@@ -805,6 +1026,12 @@ pub fn run_plan_nix(
         .map(|p| p.as_str())
         .collect();
 
+    let _closure_span = tracing::info_span!(
+        "query_closures",
+        total = closure_store_paths.len(),
+        uncached = uncached.len(),
+    )
+    .entered();
     if !uncached.is_empty() {
         info!(
             "Querying {} tool closures ({} cached, {} to query)",
@@ -845,9 +1072,14 @@ pub fn run_plan_nix(
     } else {
         info!("All {} tool closures cached", closure_store_paths.len());
     }
+    drop(_closure_span);
 
     // Build closure vectors from cache
     let rustc_closure = closure_cache.get(&rustc_store).cloned().unwrap_or_default();
+    let clippy_closure: Vec<String> = clippy_store
+        .as_ref()
+        .and_then(|s| closure_cache.get(s).cloned())
+        .unwrap_or_default();
     let host_cc_closure = closure_cache
         .get(&host_cc_store)
         .cloned()
@@ -905,7 +1137,10 @@ pub fn run_plan_nix(
         .map(|(i, u)| (u.key.clone(), i))
         .collect();
 
-    let topo_levels = compute_topo_levels(&nix_units);
+    let topo_levels = {
+        let _s = tracing::info_span!("compute_topo_levels", units = nix_units.len()).entered();
+        compute_topo_levels(&nix_units)
+    };
 
     info!(
         "Derivation DAG: {} levels, widest has {} units",
@@ -936,7 +1171,29 @@ pub fn run_plan_nix(
         None // verify mode always uses nix derivation add
     };
 
-    for level in &topo_levels {
+    // Cap on how many daemon connections to use in parallel for cache-miss
+    // registration. Honoured per level (capped further by the level's
+    // miss count), so small levels do not over-allocate. `verify_drv_paths`
+    // forces serial execution because the verify path always re-adds via
+    // the CLI to compare paths.
+    let parallel_jobs = if verify_drv_paths {
+        1
+    } else {
+        let cpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        std::cmp::max(1, registration_jobs.unwrap_or(cpu))
+    };
+
+    let _register_span = tracing::info_span!(
+        "register_derivations",
+        levels = topo_levels.len(),
+        parallel_jobs = parallel_jobs,
+    )
+    .entered();
+    for (level_idx, level) in topo_levels.iter().enumerate() {
+        let _level_span =
+            tracing::info_span!("level", idx = level_idx, width = level.len(),).entered();
         // Construct derivation JSONs — all deps are resolved from previous levels
         let jsons: Vec<(usize, serde_json::Value)> = level
             .iter()
@@ -984,8 +1241,16 @@ pub fn run_plan_nix(
                     &src_str,
                     document_private_items,
                     &passthru_closure,
+                    if clippy_str.is_empty() {
+                        None
+                    } else {
+                        Some(&clippy_str)
+                    },
+                    &clippy_closure,
+                    clippy_lint_args,
+                    path_prefix_remaps,
                 )?;
-                log::debug!(
+                tracing::debug!(
                     "Adding derivation for {}: {}",
                     nix_units[i].key,
                     serde_json::to_string_pretty(&json)?
@@ -994,113 +1259,157 @@ pub fn run_plan_nix(
             })
             .collect::<Result<_>>()?;
 
-        for (i, json) in jsons {
-            let drv_file_name = format!("{}.drv", nix_units[i].drv_name);
-            let aterm = serialize_derivation_aterm(&json)?;
-            let refs = collect_drv_refs(&json);
-            let ref_strs: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
-            let drv_path = compute_drv_store_path(&drv_file_name, &aterm, &ref_strs);
+        // Pre-compute every unit's `.drv` path, ATerm bytes, and refs so
+        // the validity probe can run once for the whole level. Units of
+        // a level are dependency-disjoint by construction so all paths
+        // can be computed before any daemon round-trip.
+        let level_units: Vec<LevelUnit> = jsons
+            .into_iter()
+            .map(|(i, json)| -> Result<LevelUnit> {
+                let drv_file_name = format!("{}.drv", nix_units[i].drv_name);
+                let aterm = serialize_derivation_aterm(&json)?;
+                let refs = collect_drv_refs(&json);
+                let ref_strs: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
+                let drv_path = compute_drv_store_path(&drv_file_name, &aterm, &ref_strs);
+                Ok(LevelUnit {
+                    i,
+                    unit_key: nix_units[i].key.clone(),
+                    json,
+                    drv_file_name,
+                    aterm,
+                    refs,
+                    drv_path,
+                })
+            })
+            .collect::<Result<_>>()?;
 
-            if verify_drv_paths {
-                let nix_path = nix_derivation_add(&json).with_context(|| {
-                    format!("Failed to add derivation for {}", nix_units[i].key)
-                })?;
-                if nix_path != drv_path {
+        // Batch the validity probe into a single `wopQueryValidPaths`
+        // call. Replaces N per-unit `is_valid_path` round-trips with
+        // one. Skipped in `--verify-drv-paths` mode (which always re-
+        // adds via the CLI to compare paths) and when the daemon is
+        // unavailable (the per-unit path falls through to the CLI).
+        let valid_paths: std::collections::HashSet<String> = if verify_drv_paths {
+            std::collections::HashSet::new()
+        } else if let Some(ref mut conn) = daemon {
+            let _s =
+                tracing::info_span!("query_valid_paths_batched", n = level_units.len(),).entered();
+            let paths: Vec<&str> = level_units.iter().map(|u| u.drv_path.as_str()).collect();
+            match conn.query_valid_paths(&paths) {
+                Ok(set) => set,
+                Err(e) => {
+                    info!(
+                        "query_valid_paths failed: {}; treating all paths as cache misses",
+                        e
+                    );
+                    std::collections::HashSet::new()
+                }
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Verify mode short-circuits everything: every unit always re-adds
+        // via the CLI so the in-process .drv path can be cross-checked
+        // against Nix's. Always serial — `verify_drv_paths` is a debug
+        // option, performance does not matter.
+        if verify_drv_paths {
+            for unit in level_units {
+                let nix_path = nix_derivation_add(&unit.json)
+                    .with_context(|| format!("Failed to add derivation for {}", unit.unit_key))?;
+                if nix_path != unit.drv_path {
                     let drv_content = std::fs::read(&nix_path).unwrap_or_default();
-                    let aterm_matches = drv_content == aterm;
+                    let aterm_matches = drv_content == unit.aterm;
                     anyhow::bail!(
                         "Derivation path mismatch for {}:\n  computed: {}\n  nix:      {}\n  aterm matches .drv content: {}",
-                        nix_units[i].key,
-                        drv_path,
+                        unit.unit_key,
+                        unit.drv_path,
                         nix_path,
                         aterm_matches,
                     );
                 }
-                log::debug!("Verified: {} -> {}", nix_units[i].key, drv_path);
-            } else if daemon
-                .as_mut()
-                .and_then(|c| c.is_valid_path(&drv_path).ok())
-                .unwrap_or(false)
-            {
-                cache_hits += 1;
-            } else if let Some(ref mut conn) = daemon {
-                match conn.add_text_to_store(&drv_file_name, &aterm, &ref_strs) {
-                    Ok(result_path) => {
-                        if result_path != drv_path {
-                            anyhow::bail!(
-                                "Daemon path mismatch for {}:\n  computed: {}\n  daemon:   {}",
-                                nix_units[i].key,
-                                drv_path,
-                                result_path,
-                            );
-                        }
-                        cache_misses += 1;
-                        info!("Added {} -> {}", nix_units[i].key, drv_path);
-                    }
-                    Err(e) => {
-                        info!(
-                            "Daemon error for {}: {}, attempting reconnect",
-                            nix_units[i].key, e
-                        );
-                        match NixDaemonConn::connect() {
-                            Ok(mut new_conn) => {
-                                match new_conn.add_text_to_store(&drv_file_name, &aterm, &ref_strs)
-                                {
-                                    Ok(result_path) => {
-                                        if result_path != drv_path {
-                                            anyhow::bail!(
-                                                "Daemon path mismatch for {}:\n  computed: {}\n  daemon:   {}",
-                                                nix_units[i].key,
-                                                drv_path,
-                                                result_path,
-                                            );
-                                        }
-                                        daemon = Some(new_conn);
-                                        cache_misses += 1;
-                                        info!(
-                                            "Reconnected and added {} -> {}",
-                                            nix_units[i].key, drv_path
-                                        );
-                                    }
-                                    Err(e2) => {
-                                        info!(
-                                            "Reconnected daemon also failed for {}: {}, falling back to process",
-                                            nix_units[i].key, e2
-                                        );
-                                        daemon = None;
-                                        nix_derivation_add(&json).with_context(|| {
-                                            format!(
-                                                "Failed to add derivation for {}",
-                                                nix_units[i].key
-                                            )
-                                        })?;
-                                        cache_misses += 1;
-                                    }
-                                }
-                            }
-                            Err(e2) => {
-                                info!("Daemon reconnect failed ({}), falling back to process", e2);
-                                daemon = None;
-                                nix_derivation_add(&json).with_context(|| {
-                                    format!("Failed to add derivation for {}", nix_units[i].key)
-                                })?;
-                                cache_misses += 1;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Fallback: spawn nix derivation add process
-                nix_derivation_add(&json).with_context(|| {
-                    format!("Failed to add derivation for {}", nix_units[i].key)
-                })?;
+                tracing::debug!("Verified: {} -> {}", unit.unit_key, unit.drv_path);
                 cache_misses += 1;
+                dep_drv_map.insert(unit.unit_key.clone(), unit.drv_path.clone());
+                nix_units[unit.i].drv_path = Some(unit.drv_path);
             }
+            continue;
+        }
 
-            dep_drv_map.insert(nix_units[i].key.clone(), drv_path.clone());
+        // Partition the level into cache hits (already in the store) and
+        // misses (need registration). The hits go straight to the
+        // dep_drv_map; misses are dispatched serially or in parallel
+        // depending on `parallel_jobs` and the miss count.
+        let (hits, misses): (Vec<LevelUnit>, Vec<LevelUnit>) = level_units
+            .into_iter()
+            .partition(|u| valid_paths.contains(&u.drv_path));
+        cache_hits += hits.len();
+        for unit in hits {
+            dep_drv_map.insert(unit.unit_key.clone(), unit.drv_path.clone());
+            nix_units[unit.i].drv_path = Some(unit.drv_path);
+        }
+
+        if misses.is_empty() {
+            continue;
+        }
+
+        let n_workers = std::cmp::min(parallel_jobs, misses.len());
+        cache_misses += misses.len();
+
+        let registered: Vec<(usize, String)> = if n_workers <= 1 {
+            // Serial path: reuse the daemon connection across levels.
+            let mut out = Vec::with_capacity(misses.len());
+            for unit in misses {
+                let path = register_unit(&mut daemon, &unit)?;
+                info!("Added {} -> {}", unit.unit_key, path);
+                out.push((unit.i, path));
+            }
+            out
+        } else {
+            // Parallel path: round-robin distribute misses across workers,
+            // each spawning a fresh daemon connection inside its scope.
+            // Per-worker connections trade ~2 ms × n_workers of handshake
+            // for the win of overlapping daemon writes; on the Just bench
+            // that is roughly 8 ms vs ~3.6 s of serial registration.
+            let _s = tracing::info_span!(
+                "parallel_register",
+                workers = n_workers,
+                misses = misses.len(),
+            )
+            .entered();
+            let chunks = chunk_round_robin(misses, n_workers);
+            std::thread::scope(|s| -> Result<Vec<(usize, String)>> {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        s.spawn(move || -> Result<Vec<(usize, String)>> {
+                            let mut conn = NixDaemonConn::connect().ok();
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for unit in chunk {
+                                let path = register_unit(&mut conn, &unit)?;
+                                out.push((unit.i, path));
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                let mut all = Vec::new();
+                for h in handles {
+                    let chunk_results = h
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("registration worker panicked"))??;
+                    all.extend(chunk_results);
+                }
+                Ok(all)
+            })?
+        };
+
+        for (i, drv_path) in registered {
+            let key = nix_units[i].key.clone();
+            dep_drv_map.insert(key, drv_path.clone());
             nix_units[i].drv_path = Some(drv_path);
         }
     }
+    drop(_register_span);
 
     info!(
         "Derivation registration: {} cached (path exists), {} added",
@@ -1114,7 +1423,7 @@ pub fn run_plan_nix(
         .filter_map(|u| {
             u.drv_path
                 .clone()
-                .map(|p| (p, u.target_name.clone(), u.kind.clone()))
+                .map(|p| (p, u.target_name.clone(), u.kind))
         })
         .collect();
     if root_drvs.is_empty() {
@@ -1136,4 +1445,121 @@ pub fn run_plan_nix(
     }
 
     Ok((root_drvs, nix_units, cfg_envs, host_cfg_envs))
+}
+
+/// Build and register an aggregator derivation that depends on every
+/// element of `root_drvs` and produces an output containing one
+/// symlink per root pointing at that root's `out`.
+///
+/// The aggregator gives downstream Nix expressions a *single*
+/// derivation reference to `builtins.outputOf`, sidestepping the
+/// realisation conflict that hits per-root wrapper derivations
+/// whenever any plan-listed root is transitively depended on by
+/// another (every `cargo build/check/clippy --workspace` invocation
+/// in a multi-crate workspace).  The aggregator's transitive deps
+/// realise each root drv exactly once at its natural store path.
+///
+/// Returns the registered aggregator's `.drv` store path.
+pub(crate) fn construct_aggregator_drv(
+    pname: &str,
+    intent: &str,
+    root_drvs: &[(String, String, UnitKind)],
+    system: &str,
+) -> Result<String> {
+    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let bash_store = std::path::PathBuf::from(&bash_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path"))?
+        .to_string_lossy()
+        .to_string();
+    let mkdir_path = which_command_no_deref("mkdir")?
+        .to_string_lossy()
+        .to_string();
+    let coreutils_store = std::path::PathBuf::from(&mkdir_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive coreutils store path from mkdir"))?
+        .to_string_lossy()
+        .to_string();
+
+    let mut input_drvs = serde_json::Map::new();
+    let mut placeholders: Vec<String> = Vec::with_capacity(root_drvs.len());
+    for (drv_path, _, _) in root_drvs {
+        placeholders.push(downstream_placeholder(drv_path, "out")?);
+        input_drvs.insert(
+            drv_path.clone(),
+            serde_json::json!({"outputs": ["out"], "dynamicOutputs": {}}),
+        );
+    }
+
+    // Aggregator build script: each root drv's realised output path
+    // arrives via the `rootOuts` env var (space-separated).  Symlink
+    // each into `$out/root-N`.  Symlink rather than copy keeps the
+    // aggregator's NAR small and avoids file-mode quirks; consumers
+    // walk the symlinks transparently.
+    let script = format!(
+        "set -e\n\
+         {coreutils}/bin/mkdir -p $out\n\
+         i=0\n\
+         for src in $rootOuts; do\n\
+           {coreutils}/bin/ln -s \"$src\" \"$out/root-$i\"\n\
+           i=$((i+1))\n\
+         done\n",
+        coreutils = coreutils_store
+    );
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "out".into(),
+        serde_json::Value::String(self_placeholder("out")),
+    );
+    env.insert(
+        "rootOuts".into(),
+        serde_json::Value::String(placeholders.join(" ")),
+    );
+
+    let json = serde_json::json!({
+        "name": format!("{}-{}-aggregator", pname, intent),
+        "system": system,
+        "builder": bash_path,
+        "args": ["-c", script],
+        "outputs": {"out": {"hashAlgo": "sha256", "method": "nar"}},
+        "inputDrvs": input_drvs,
+        "inputSrcs": [coreutils_store, bash_store],
+        "env": env,
+    });
+
+    nix_derivation_add(&json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_round_robin_distributes_evenly() {
+        let chunks = chunk_round_robin(vec![0, 1, 2, 3, 4, 5, 6, 7], 4);
+        assert_eq!(chunks, vec![vec![0, 4], vec![1, 5], vec![2, 6], vec![3, 7]]);
+    }
+
+    #[test]
+    fn chunk_round_robin_handles_uneven_input() {
+        // 5 items into 3 chunks: round-robin gives 2/2/1.
+        let chunks = chunk_round_robin(vec!['a', 'b', 'c', 'd', 'e'], 3);
+        assert_eq!(chunks, vec![vec!['a', 'd'], vec!['b', 'e'], vec!['c']]);
+    }
+
+    #[test]
+    fn chunk_round_robin_handles_overprovisioned_workers() {
+        // More chunks than items: trailing chunks are empty.
+        let chunks = chunk_round_robin(vec![1, 2], 4);
+        assert_eq!(chunks, vec![vec![1], vec![2], vec![], vec![]]);
+    }
+
+    #[test]
+    fn chunk_round_robin_handles_empty_input() {
+        let chunks: Vec<Vec<i32>> = chunk_round_robin(vec![], 3);
+        assert_eq!(chunks, vec![Vec::<i32>::new(); 3]);
+    }
 }
