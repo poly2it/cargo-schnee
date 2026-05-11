@@ -485,8 +485,15 @@ let
   installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
     inherit meta;
     aggregator = aggregatorOutput;
-    nativeBuildInputs =
-      lib.optionals wrapBinaries [ pkgs.makeWrapper ];
+    # Forward the caller's `nativeBuildInputs` so their setup hooks
+    # (e.g. `makeWrapper`'s `wrapProgram`, `installShellFiles`) load in
+    # `postInstall`.  Without this, callers can't run nixpkgs idioms
+    # like `wrapProgram $out/bin/foo --prefix PATH : …` from
+    # `postInstall` even after declaring `pkgs.makeWrapper` in
+    # `nativeBuildInputs` — the build phase honours the declaration
+    # but the install step does not.
+    nativeBuildInputs = nativeBuildInputs
+      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ];
     passthru = { inherit planner aggregatorWrapper aggregatorOutput; };
   } ''
     set -euo pipefail
