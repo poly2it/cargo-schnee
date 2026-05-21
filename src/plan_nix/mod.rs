@@ -21,8 +21,8 @@ use derivation::{
 };
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
-    find_cross_linker, find_sysroot_rlib, which_clippy_driver, which_command,
-    which_command_no_deref, which_rustc, which_rustdoc,
+    find_cross_linker, find_sysroot_rlib, which_bash, which_clippy_driver, which_command_no_deref,
+    which_rustc, which_rustdoc,
 };
 
 use anyhow::{Context, Result};
@@ -833,7 +833,7 @@ pub fn run_plan_nix(
             );
         }
     }
-    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let (bash_path, bash_store) = which_bash()?;
     let mkdir_path = which_command_no_deref("mkdir")?
         .to_string_lossy()
         .to_string();
@@ -1216,6 +1216,7 @@ pub fn run_plan_nix(
                     &key_to_idx,
                     &dep_drv_map,
                     &bash_path,
+                    &bash_store,
                     &rustc_str,
                     &rustdoc_str,
                     &proc_macro_rlib,
@@ -1466,13 +1467,7 @@ pub(crate) fn construct_aggregator_drv(
     root_drvs: &[(String, String, UnitKind)],
     system: &str,
 ) -> Result<String> {
-    let bash_path = which_command("bash")?.to_string_lossy().to_string();
-    let bash_store = std::path::PathBuf::from(&bash_path)
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path"))?
-        .to_string_lossy()
-        .to_string();
+    let (bash_path, bash_store) = which_bash()?;
     let mkdir_path = which_command_no_deref("mkdir")?
         .to_string_lossy()
         .to_string();

@@ -40,6 +40,22 @@ pub(super) fn which_clippy_driver() -> Result<PathBuf> {
     which_command("clippy-driver")
 }
 
+/// Resolve `bash` on PATH and return the canonical binary path together
+/// with the containing store root.  Derivations that name `bash` as
+/// `"builder"` must list the store root in `inputSrcs`; otherwise the
+/// sandbox does not bind-mount it and the build fails with
+/// `executing '/nix/store/.../bin/bash': No such file or directory`.
+pub(super) fn which_bash() -> Result<(String, String)> {
+    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let bash_store = PathBuf::from(&bash_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path from {}", bash_path))?
+        .to_string_lossy()
+        .to_string();
+    Ok((bash_path, bash_store))
+}
+
 pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {

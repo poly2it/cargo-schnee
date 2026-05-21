@@ -29,6 +29,9 @@ pub(super) fn construct_derivation(
     key_to_idx: &HashMap<String, usize>,
     dep_drv_map: &HashMap<String, String>,
     bash_path: &str,
+    // Store root containing `bash_path`'s binary.  Must be in `inputSrcs`
+    // so the sandbox bind-mounts the builder; see `util::which_bash`.
+    bash_store: &str,
     rustc_path: &str,
     rustdoc_path: &str,
     proc_macro_rlib: &str,
@@ -220,6 +223,10 @@ pub(super) fn construct_derivation(
         }
     }
     input_srcs.insert(coreutils_store.to_string());
+    // The builder shells out via `bash_path`; its containing store root
+    // must be bind-mounted into the sandbox or the build fails before any
+    // user code runs.
+    input_srcs.insert(bash_store.to_string());
 
     if unit.needs_linker || unit.kind == UnitKind::BuildScriptRun {
         for path in cc_closure {
