@@ -2221,16 +2221,31 @@ fn run_build_pipeline(
     // already parse for the inline "Compiling foo v1.2" status output —
     // unchanged DX, plus one trailing build line for the aggregator
     // itself (a near-instant symlink farm).
+    //
+    // Use `nix build <drv>^out --print-out-paths` rather than
+    // `nix-store --realise <drv>`. Since the build-trace rework
+    // (Nix master post-2.34), `nix-store --realise` no longer follows
+    // the resolve-and-build chain for placeholder dynamic-derivation
+    // outputs and exits with "cannot operate on output 'out' of the
+    // unbuilt derivation". `nix build` is the only invocation that
+    // realises the chain end-to-end on both pre- and post-rework Nix,
+    // and `--print-out-paths` writes the realised store path to stdout
+    // so we can keep the same stdout-parsing shape downstream.
     let project_pkg_name = read_bin_target_name(&manifest_path).ok();
-    let mut cmd = Command::new("nix-store");
-    cmd.arg("--realise");
-    cmd.arg(&aggregator_drv);
+    let mut cmd = Command::new("nix");
+    cmd.arg("build");
+    cmd.arg(format!("{}^out", aggregator_drv));
+    cmd.arg("--print-out-paths");
+    cmd.arg("--no-link");
     let mut child = cmd
-        .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+        .env(
+            "NIX_CONFIG",
+            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn nix-store --realise")?;
+        .context("Failed to spawn nix build")?;
 
     let stdout = child.stdout.take().context("stdout not piped")?;
     let stdout_thread = std::thread::spawn(move || {
@@ -2422,7 +2437,7 @@ fn run_build_pipeline(
         .lines()
         .map(|l| l.trim())
         .find(|l| !l.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("nix-store --realise emitted no output paths"))?
+        .ok_or_else(|| anyhow::anyhow!("nix build emitted no output paths"))?
         .to_string();
     let out_paths: Vec<String> = (0..root_drvs.len())
         .map(|idx| format!("{}/root-{}", aggregator_out_path, idx))
