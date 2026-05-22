@@ -360,10 +360,18 @@ let
       mkdir -p "$out"
       cp "$TMPDIR/plan-out.txt" "$out/plan.txt"
       cp "$TMPDIR/aggregator.txt" "$out/aggregator.txt"
-      # Copy the aggregator drv file so the wrapper-cp pattern below
-      # can produce a byte-identical text-output for `outputOf`.
+      # Copy the aggregator drv file under a FIXED filename so the
+      # wrapper-cp pattern below does not have to learn the name
+      # via `builtins.readFile`. Reading the file at eval time is an
+      # IFD that forces realising this planner derivation before the
+      # rest of the package can be evaluated; under Nix master's
+      # stricter handling of floating-output derivations this fails
+      # with "cannot operate on output 'out' of the unbuilt
+      # derivation". The bytes the wrapper copies are unchanged, so
+      # the content-addressed text-output hash (and therefore the
+      # `outputOf` chain) is identical.
       AGG=$(${pkgs.coreutils}/bin/head -1 "$TMPDIR/aggregator.txt")
-      cp "$AGG" "$out/$(basename "$AGG")"
+      cp "$AGG" "$out/aggregator.drv"
     '' ];
 
     cargoDeps = effectiveCargoDeps;
@@ -377,31 +385,25 @@ let
     outputHashAlgo = "sha256";
   };
 
-  # IFD: realise the planner at eval time and read the aggregator drv
-  # path it emitted.  cargo-schnee's `--plan-aggregator-out` flag
-  # registers a single drv that depends on every root and produces a
-  # `$out` directory of symlinks to each root's realised output.
-  # Going through the aggregator gives us one `outputOf` chain for
-  # the whole package — the per-root wrapper-cp pattern caused
-  # content-addressed realisation conflicts in workspaces with
-  # cross-crate sharing.
-  aggregatorDrvPath = lib.removeSuffix "\n"
-    (builtins.readFile "${planner}/aggregator.txt");
-
-  aggregatorOrigName = baseNameOf
-    (builtins.unsafeDiscardStringContext aggregatorDrvPath);
-
   # Wrap the aggregator drv in a tiny text-output drv whose `$out` is
   # a byte-identical copy of the registered aggregator file.  Then
   # `builtins.outputOf wrapper.outPath "out"` resolves to the
   # aggregator's realisation, which the outer daemon builds — and
   # transitively builds every root.
+  #
+  # The planner emits the aggregator drv at a fixed `$out/aggregator.drv`
+  # so we can reference it via a plain string interpolation. The
+  # earlier design read `aggregator.txt` via `builtins.readFile`,
+  # which is IFD: it forces the planner to be realised at eval time.
+  # Nix master's stricter handling of floating-output derivations
+  # rejects that with "cannot operate on output 'out' of the unbuilt
+  # derivation", so every downstream `nix build .#<pkg>` failed.
   aggregatorWrapper = derivation {
     name = "${finalPname}-${finalVersion}-aggregator.drv";
     system = pkgs.stdenv.hostPlatform.system;
     builder = "${pkgs.bash}/bin/bash";
     args = [ "-c" ''
-      ${pkgs.coreutils}/bin/cp ${planner}/${aggregatorOrigName} $out
+      ${pkgs.coreutils}/bin/cp ${planner}/aggregator.drv $out
     '' ];
     __contentAddressed = true;
     outputHashMode = "text";
