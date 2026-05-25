@@ -1480,25 +1480,41 @@ pub(crate) fn construct_aggregator_drv(
 
     let mut input_drvs = serde_json::Map::new();
     let mut placeholders: Vec<String> = Vec::with_capacity(root_drvs.len());
-    for (drv_path, _, _) in root_drvs {
+    let mut target_names: Vec<String> = Vec::with_capacity(root_drvs.len());
+    for (drv_path, target_name, _) in root_drvs {
         placeholders.push(downstream_placeholder(drv_path, "out")?);
         input_drvs.insert(
             drv_path.clone(),
             serde_json::json!({"outputs": ["out"], "dynamicOutputs": {}}),
         );
+        target_names.push(target_name.clone());
     }
 
     // Aggregator build script: each root drv's realised output path
-    // arrives via the `rootOuts` env var (space-separated).  Symlink
-    // each into `$out/root-N`.  Symlink rather than copy keeps the
-    // aggregator's NAR small and avoids file-mode quirks; consumers
-    // walk the symlinks transparently.
+    // arrives via `rootOuts` (space-separated).  Symlink each into
+    // `$out/root-N`.  Symlink rather than copy keeps the aggregator's
+    // NAR small and avoids file-mode quirks; consumers walk the
+    // symlinks transparently.
+    //
+    // Alongside each symlink, write `$out/root-N.target_name` text
+    // files carrying cargo's canonical target name as reported by
+    // `unit.target.name()`.  These are the single source of truth for
+    // the `buildPackage` install step's renaming logic: it no longer
+    // has to guess the canonical filename from the per-unit hash-
+    // suffixed output, eliminating the `_→-` translation flaw that
+    // corrupts bins with genuinely underscored target names.
+    // `rootNames` is newline-separated so each entry can hold any
+    // character a target name can; target names never contain
+    // newlines.
     let script = format!(
         "set -e\n\
          {coreutils}/bin/mkdir -p $out\n\
+         read -r -a __outs <<< \"$rootOuts\"\n\
+         mapfile -t __names <<< \"$rootNames\"\n\
          i=0\n\
-         for src in $rootOuts; do\n\
-           {coreutils}/bin/ln -s \"$src\" \"$out/root-$i\"\n\
+         while [ \"$i\" -lt \"${{#__outs[@]}}\" ]; do\n\
+           {coreutils}/bin/ln -s \"${{__outs[$i]}}\" \"$out/root-$i\"\n\
+           printf '%s' \"${{__names[$i]}}\" > \"$out/root-$i.target_name\"\n\
            i=$((i+1))\n\
          done\n",
         coreutils = coreutils_store
@@ -1512,6 +1528,10 @@ pub(crate) fn construct_aggregator_drv(
     env.insert(
         "rootOuts".into(),
         serde_json::Value::String(placeholders.join(" ")),
+    );
+    env.insert(
+        "rootNames".into(),
+        serde_json::Value::String(target_names.join("\n")),
     );
 
     let json = serde_json::json!({

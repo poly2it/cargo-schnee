@@ -418,8 +418,13 @@ let
 
   # Per-root layout copy.  Doc emits a `doc/` subtree of HTML; other
   # intents emit linker output (a hash-suffixed binary plus .d /
-  # .rmeta sidecars).  Each root's loop runs against `$ROOT` injected
-  # at install time.
+  # .rmeta sidecars).  Each root's loop runs against `$ROOT` and
+  # `$TARGET_NAME` injected at install time.  `$TARGET_NAME` is the
+  # canonical name cargo reports via `unit.target.name()`, propagated
+  # through the aggregator's `root-N.target_name` metadata file.
+  # Using it directly is the single source of truth for naming and
+  # avoids the brittle `_→-` filename heuristic that corrupts bins
+  # with genuinely underscored target names.
   installRoot =
     if intent == "doc" then ''
       if [ -d "$ROOT/doc" ]; then
@@ -431,7 +436,10 @@ let
     '' else if isWindows then ''
       for f in "$ROOT"/*.exe "$ROOT"/*.dll "$ROOT"/*.pdb; do
         [ -f "$f" ] || continue
-        install -m755 "$f" "$out/bin/"
+        ext="''${f##*.}"
+        mode=755
+        [ "$ext" = "pdb" ] && mode=644
+        install -m"$mode" "$f" "$out/bin/''${TARGET_NAME}.''${ext}"
       done
     '' else ''
       for f in "$ROOT"/*; do
@@ -440,26 +448,17 @@ let
         case "$name" in
           *.d|*.rmeta|build-script-*|*-build-script|diagnostics) continue ;;
         esac
-        # Strip the 16-hex content-hash suffix cargo appends to per-unit
-        # compile outputs.
-        clean="$(echo "$name" | sed -E 's/-[0-9a-f]{16}$//')"
         case "$name" in
           *.so|*.so.*|*.a|*.dylib)
+            # Native libs: keep cargo's `lib<crate>.<ext>` convention.
+            # Strip the per-unit hash; the underscored crate name is
+            # the canonical form for libs, so no further translation.
+            clean="$(echo "$name" | sed -E 's/-[0-9a-f]{16}//')"
             install -m644 "$f" "$out/lib/$clean"
             ;;
           *)
             if [ -x "$f" ]; then
-              # Cargo compiles bins whose [[bin]] name contains dashes
-              # to underscore-named files (Rust identifiers can't have
-              # dashes); the user-facing dashed name is normally
-              # provided as a sibling copy in target/release/, but
-              # per-unit outputs only contain the compiled file.
-              # Translate to the dashed form so consumers' meta-
-              # .mainProgram references and `nix run` work.  Bins with
-              # genuinely underscored names will lose the underscore;
-              # workaround is to set [[bin]] name explicitly.
-              dashed="$(echo "$clean" | tr _ -)"
-              install -m755 "$f" "$out/bin/$dashed"
+              install -m755 "$f" "$out/bin/''${TARGET_NAME}"
             fi
             ;;
         esac
@@ -502,9 +501,16 @@ let
     ${installInit}
     # Walk each root-N symlink in the aggregator output.  Each
     # symlink target is a single cargo-schnee root drv's $out
-    # (binary, lib, doc subtree, etc.).
+    # (binary, lib, doc subtree, etc.).  The sibling `root-N.target_name`
+    # text file (a regular file, filtered out by the `-d` guard) carries
+    # cargo's canonical target name for use in the rename below.
     for ROOT in $aggregator/root-*; do
       [ -d "$ROOT" ] || continue
+      TARGET_NAME="$(cat "''${ROOT}.target_name" 2>/dev/null || true)"
+      if [ -z "$TARGET_NAME" ] && [ "${intent}" != "doc" ]; then
+        echo "cargo-schnee: aggregator emitted no target_name for $ROOT" >&2
+        exit 1
+      fi
       ${installRoot}
     done
     ${installFinish}
