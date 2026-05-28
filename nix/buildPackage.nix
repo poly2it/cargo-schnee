@@ -115,7 +115,31 @@ let
   effectiveCargoDeps =
     if cargoDeps != null then cargoDeps
     else if cargoLock != null then
-      pkgs.rustPlatform.importCargoLock { lockFile = cargoLock; }
+      # crates.io's API endpoint (`crates.io/api/v1/crates`) 403s any
+      # User-Agent containing `curl/...` (and `python-requests/...`) as
+      # an anti-abuse measure since April 2026 — see rust-lang/crates.io#13482.
+      # `pkgs.rustPlatform.importCargoLock` fetches through stock
+      # `fetchurl`, whose builder sends `curl/<ver> Nixpkgs/<ver>`, so
+      # every crate fetch fails with 403 until either nixpkgs ships the
+      # matching UA fix (NixOS/nixpkgs#512735 covers fetchCargoVendor
+      # only; fetchurl is still pending on the nixpkgs revision pinned
+      # downstream of this) or the crate's output path is already in
+      # the local store from a previous run.
+      #
+      # Override the registry download URL via `extraRegistries` (right-
+      # biased merge over the default mapping) so requests go to
+      # `static.crates.io`, which serves the same tarballs and does not
+      # apply the UA filter. URL template is `<download>/<name>/<ver>/
+      # download`, identical between the two hosts, so the recorded
+      # `outputHash`es in downstream `Cargo.lock`s remain valid and
+      # already-cached output paths are reused.
+      pkgs.rustPlatform.importCargoLock {
+        lockFile = cargoLock;
+        extraRegistries = {
+          "https://github.com/rust-lang/crates.io-index" =
+            "https://static.crates.io/crates";
+        };
+      }
     else throw "cargo-schnee buildPackage: cargoLock or cargoDeps required";
 
   # -- pname / version auto-detection ------------------------------------
