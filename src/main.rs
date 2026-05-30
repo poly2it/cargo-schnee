@@ -568,7 +568,7 @@ fn read_bin_target_name(manifest_path: &Path) -> Result<String> {
 }
 
 /// Add a file or directory to the Nix store, returning the store path.
-fn add_to_nix_store(path: &str) -> Result<String> {
+pub(crate) fn add_to_nix_store(path: &str) -> Result<String> {
     let output = Command::new("nix-store")
         .arg("--add")
         .arg(path)

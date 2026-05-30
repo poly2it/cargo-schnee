@@ -1129,6 +1129,7 @@ mod tests {
             target_name: name.to_string(),
             for_host: false,
             compile_test: false,
+            self_contained_build_script: false,
             drv_path: None,
         }
     }

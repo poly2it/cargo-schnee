@@ -423,6 +423,7 @@ pub(super) fn extract_units_from_bcx(
             target_name,
             for_host,
             compile_test,
+            self_contained_build_script: package_self_contained_build_script(&unit.pkg),
             drv_path: None,
         });
     }
@@ -608,6 +609,26 @@ pub(super) fn target_kind_to_crate_types(unit: &Unit) -> Vec<String> {
 }
 
 /// Map a filesystem path to a nix store path reference.
+/// Read `[package.metadata.schnee] self-contained-build-script` from a
+/// package's manifest. Defaults to false. When true, the crate's build script
+/// reads only its own directory and env-provided inputs, so its BuildScriptRun
+/// unit may be sliced to per-crate source (Change 3).
+fn package_self_contained_build_script(pkg: &cargo::core::Package) -> bool {
+    let Ok(content) = std::fs::read_to_string(pkg.manifest_path()) else {
+        return false;
+    };
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return false;
+    };
+    value
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("self-contained-build-script"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 pub(super) fn map_to_store_path(
     path: &str,
     src_str: &str,
@@ -628,6 +649,29 @@ pub(super) fn map_to_store_path(
         return path.to_string();
     }
     path.to_string()
+}
+
+/// A vendored crate's stable identity: name + version + source checksum.
+/// Referencing each unit's dependency by this per-crate identity — one
+/// content-addressed FOD per crate — decouples the lock axis: a `Cargo.lock`
+/// bump that changes one crate leaves every other crate's identity, and thus
+/// every non-dependent unit's input, untouched.
+pub(super) fn per_crate_vendor_id(name: &str, version: &str, checksum: &str) -> String {
+    format!("{name}-{version}-{checksum}")
+}
+
+/// The aggregate vendor identity cargo-schnee references today: a hash over the
+/// whole lock. Any single entry change moves it, so every dependency unit's
+/// input moves — the coupling the per-crate identity replaces.
+pub(super) fn aggregate_vendor_id(entries: &[(String, String, String)]) -> String {
+    let mut h = Sha256::new();
+    for (name, version, checksum) in entries {
+        for field in [name, version, checksum] {
+            h.update(field.as_bytes());
+            h.update(b"\0");
+        }
+    }
+    format!("{:x}", h.finalize())
 }
 
 /// Compute deterministic extra-filename hash for a unit.
@@ -1175,6 +1219,37 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
 mod tests {
     use super::*;
 
+    /// Change 2 (lock axis): a vendored crate's per-crate identity is a function
+    /// of only its own (name, version, checksum), so a `Cargo.lock` bump that
+    /// touches one crate leaves the others' identities — and any unit that does
+    /// not depend on the changed crate — untouched. The aggregate identity
+    /// cargo-schnee references today moves on any entry change, coupling all.
+    #[test]
+    fn vendor_identity_decouples_per_crate() {
+        let lock_v1 = vec![
+            ("serde".to_string(), "1.0.0".to_string(), "aaa".to_string()),
+            ("tokio".to_string(), "1.0.0".to_string(), "bbb".to_string()),
+        ];
+        // Bump only tokio.
+        let lock_v2 = vec![
+            ("serde".to_string(), "1.0.0".to_string(), "aaa".to_string()),
+            ("tokio".to_string(), "1.1.0".to_string(), "ccc".to_string()),
+        ];
+
+        let serde_before = per_crate_vendor_id("serde", "1.0.0", "aaa");
+        let serde_after = per_crate_vendor_id("serde", "1.0.0", "aaa");
+        let tokio_before = per_crate_vendor_id("tokio", "1.0.0", "bbb");
+        let tokio_after = per_crate_vendor_id("tokio", "1.1.0", "ccc");
+
+        assert_eq!(serde_before, serde_after, "serde's vendor identity is unchanged by a tokio bump");
+        assert_ne!(tokio_before, tokio_after, "tokio's own identity changes");
+        assert_ne!(
+            aggregate_vendor_id(&lock_v1),
+            aggregate_vendor_id(&lock_v2),
+            "the aggregate vendor id couples every crate to any lock change (the bug being fixed)"
+        );
+    }
+
     /// Build a minimal NixUnit for testing.  Only the fields relevant to
     /// feature-unification and dependency tracking are populated.
     fn make_unit(name: &str, version: &str, features: &[&str], deps: &[(&str, &str)]) -> NixUnit {
@@ -1228,6 +1303,7 @@ mod tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
+            self_contained_build_script: false,
             drv_path: None,
         }
     }

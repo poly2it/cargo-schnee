@@ -226,6 +226,15 @@ pub struct NixUnit {
     /// time with E0601 (`main function not found in crate ...`).
     #[serde(default)]
     pub(crate) compile_test: bool,
+    /// Whether this local crate's build script is self-contained — it reads
+    /// only its own crate directory and inputs provided via the environment,
+    /// never sibling directories like `../spec/`. Opt in via
+    /// `[package.metadata.schnee] self-contained-build-script = true`. When set,
+    /// the BuildScriptRun unit is sliced to its own per-crate source (Change 3)
+    /// instead of carrying the whole workspace tree, so it stops re-keying on
+    /// unrelated edits.
+    #[serde(default)]
+    pub(crate) self_contained_build_script: bool,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
 }
@@ -639,6 +648,255 @@ pub fn fresh_unit_graph(
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// Assign each unit its source store path. Local compile/test/doc units are
+/// sliced to a per-crate NAR — decoupled from sibling crates — via `add`, which
+/// adds a crate subtree to the store and returns its content-addressed path;
+/// the unit's `source_file`/`manifest_dir` are rewritten onto that store.
+/// BuildScriptRun units keep the whole-tree `src_str`, because they copy the
+/// workspace into their workdir so sibling reads like `../spec/` resolve (see
+/// `build_run_script`); slicing them needs the spec-via-env change first. `add`
+/// is injected so the slicing logic is testable without a Nix daemon.
+fn assign_per_crate_src_stores(
+    units: &mut [NixUnit],
+    src_str: &str,
+    vendor_str: &str,
+    mut add: impl FnMut(&str) -> Result<String>,
+) -> Result<Vec<String>> {
+    let mut unit_src_store: Vec<String> = vec![src_str.to_string(); units.len()];
+    let mut per_crate: HashMap<String, String> = HashMap::new();
+    for i in 0 .. units.len() {
+        // Pick the root this unit's source lives under and whether to slice it.
+        //
+        // Change 1 (local crates): slice compile/test/doc units. A local
+        // BuildScriptRun normally copies the whole workspace into its workdir so
+        // sibling reads like `../spec/` resolve (see build_run_script), so it is
+        // NOT sliced — UNLESS the crate opts in via
+        // `[package.metadata.schnee] self-contained-build-script` (Change 3),
+        // declaring its build script reads only its own dir and env inputs.
+        //
+        // Change 2 (vendored deps): slice every unit off the aggregate vendor
+        // dir. A vendored crate is self-contained — its build script reads only
+        // its own files — so per-crate slicing is always safe, and it decouples
+        // the lock axis: a `Cargo.lock` bump that changes one dep no longer
+        // re-keys the units of unrelated deps (which kept the same per-crate
+        // store) the way the shared aggregate did.
+        let (is_local, is_bsr, self_contained_bs) = {
+            let u = &units[i];
+            (u.is_local, matches!(u.kind, UnitKind::BuildScriptRun), u.self_contained_build_script)
+        };
+        let (root, sliceable) = if is_local {
+            (src_str, !is_bsr || self_contained_bs)
+        } else {
+            (vendor_str, !vendor_str.is_empty())
+        };
+        if !sliceable {
+            continue;
+        }
+        let (crate_rel, source_file, manifest_dir) = {
+            let u = &units[i];
+            let crate_rel = u
+                .manifest_dir
+                .strip_prefix(root)
+                .map(|s| s.trim_start_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            (crate_rel, u.source_file.clone(), u.manifest_dir.clone())
+        };
+        let Some(crate_rel) = crate_rel else { continue };
+        // Key the cache on (root, crate_rel) so a local and a vendored crate
+        // sharing a name never collide.
+        let cache_key = format!("{root}\u{0}{crate_rel}");
+        let crate_store = match per_crate.get(&cache_key) {
+            Some(p) => p.clone(),
+            None => {
+                let full = format!("{}/{}", root, crate_rel);
+                // Local crates: add the subtree to the store. Vendored crates
+                // are already content-addressed per-crate store paths behind the
+                // cargo-vendor-dir symlink farm, so follow the symlink to its
+                // target rather than re-adding — re-adding would capture the
+                // symlink itself, whose target is not mounted in the compile
+                // sandbox. If the vendor entry is a real copy rather than a
+                // symlink, canonicalize returns it unchanged (correct, but not
+                // decoupled).
+                let p = if is_local {
+                    add(&full)?
+                } else {
+                    std::fs::canonicalize(&full)
+                        .with_context(|| format!("resolving vendored crate at {full}"))?
+                        .to_string_lossy()
+                        .to_string()
+                };
+                per_crate.insert(cache_key, p.clone());
+                p
+            },
+        };
+        // Rewrite the unit's source paths from `{root}/{crate_rel}` onto the
+        // crate-rooted store, and reference it as this unit's src_store.
+        let old_prefix = format!("{}/{}", root, crate_rel);
+        let u = &mut units[i];
+        if let Some(rest) = source_file.strip_prefix(&old_prefix) {
+            u.source_file = format!("{}{}", crate_store, rest);
+        }
+        if manifest_dir == old_prefix {
+            u.manifest_dir = crate_store.clone();
+        } else if let Some(rest) = manifest_dir.strip_prefix(&old_prefix) {
+            u.manifest_dir = format!("{}{}", crate_store, rest);
+        }
+        unit_src_store[i] = crate_store;
+    }
+    Ok(unit_src_store)
+}
+
+#[cfg(test)]
+mod slice_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn unit(is_local: bool, kind: UnitKind, crate_rel: &str, root: &str) -> NixUnit {
+        NixUnit {
+            key: "k".to_string(),
+            drv_name: format!("{crate_rel}-drv"),
+            kind,
+            source_file: format!("{root}/{crate_rel}/src/lib.rs"),
+            crate_name: crate_rel.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".to_string(),
+            features: vec![],
+            dep_extern: vec![],
+            all_dep_keys: vec![],
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("{root}/{crate_rel}"),
+            original_manifest_dir: String::new(),
+            cargo_envs: vec![],
+            extra_filename: String::new(),
+            needs_linker: false,
+            is_local,
+            links: None,
+            links_dep_keys: vec![],
+            is_root: false,
+            target_name: String::new(),
+            for_host: false,
+            compile_test: false,
+            self_contained_build_script: false,
+            drv_path: None,
+        }
+    }
+
+    /// The real per-crate content-addressed add, minus the store insertion:
+    /// NAR-hash the crate subtree. Used so the test exercises actual addressing.
+    fn ca_add(p: &str) -> Result<String> {
+        let nar = crate::nar::serialize_nar(Path::new(p), None)?;
+        let name = Path::new(p).file_name().unwrap().to_string_lossy();
+        Ok(crate::nar::compute_nar_store_path(&format!("{name}-src"), &nar))
+    }
+
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    }
+
+    /// Model the cargo-vendor-dir symlink farm: `{vendor}/{name}` is a symlink
+    /// to a content-addressed store-like directory `{store}/{hash}-{name}`, so
+    /// canonicalize resolves to the per-crate target and a content change moves
+    /// the target the way a real CA store path moves.
+    fn vendor_symlink(vendor: &str, store: &str, name: &str, body: &str) {
+        let target = Path::new(store).join(format!("{:x}-{name}", md5_like(body))).join(name);
+        write(&target.join("Cargo.toml"), &format!("[package]\nname = \"{name}\"\n"));
+        write(&target.join("src/lib.rs"), body);
+        let link = Path::new(vendor).join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+    }
+
+    /// Tiny content discriminator for the test's fake CA store names.
+    fn md5_like(s: &str) -> u64 {
+        let mut h = 1469598103934665603u64;
+        for b in s.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        h
+    }
+
+    /// Changes 1 and 2 wiring end-to-end with real per-crate NAR addressing.
+    ///
+    /// Change 1: editing local crate-b leaves crate-a's compile unit's assigned
+    /// store byte-identical; the local build-script-run unit keeps the whole
+    /// tree.
+    ///
+    /// Change 2: a vendored dep's units are sliced off the aggregate vendor dir
+    /// onto a per-crate store, and bumping an unrelated vendored crate leaves it
+    /// byte-identical — the lock-axis decoupling.
+    #[test]
+    fn assign_decouples_local_and_vendored_crates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src").to_string_lossy().to_string();
+        let vendor = tmp.path().join("vendor").to_string_lossy().to_string();
+        let store = tmp.path().join("store").to_string_lossy().to_string();
+        write(&Path::new(&src).join("crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n");
+        write(&Path::new(&src).join("crate-a/src/lib.rs"), "pub fn a() {}\n");
+        write(&Path::new(&src).join("crate-b/Cargo.toml"), "[package]\nname = \"crate-b\"\n");
+        write(&Path::new(&src).join("crate-b/src/lib.rs"), "pub fn b() {}\n");
+        vendor_symlink(&vendor, &store, "serde", "pub fn s() {}\n");
+        vendor_symlink(&vendor, &store, "once_cell", "pub fn o() {}\n");
+
+        let mk = || {
+            let mut self_contained = unit(true, UnitKind::BuildScriptRun, "crate-b", &src);
+            self_contained.self_contained_build_script = true;
+            vec![
+                unit(true, UnitKind::Compile, "crate-a", &src),
+                unit(true, UnitKind::Compile, "crate-b", &src),
+                unit(true, UnitKind::BuildScriptRun, "crate-a", &src),
+                unit(false, UnitKind::Compile, "serde", &vendor),
+                unit(false, UnitKind::BuildScriptRun, "once_cell", &vendor),
+                self_contained, // index 5: Change 3 — local self-contained build-script-run.
+            ]
+        };
+
+        let mut units = mk();
+        let s1 = assign_per_crate_src_stores(&mut units, &src, &vendor, ca_add).unwrap();
+
+        // Local compile unit: sliced off the whole tree, paths rewritten onto it.
+        assert_ne!(s1[0], src, "crate-a compile unit must be sliced off the whole tree");
+        assert!(units[0].source_file.starts_with(&s1[0]), "source_file rewritten onto per-crate store");
+        assert_eq!(units[0].manifest_dir, s1[0], "manifest_dir rewritten onto per-crate store");
+        // Local build-script-run unit keeps the whole tree (sibling reads).
+        assert_eq!(s1[2], src, "local build-script-run unit keeps the whole-tree src_store");
+        assert_eq!(units[2].source_file, format!("{src}/crate-a/src/lib.rs"), "local build-script unit not rewritten");
+        // Change 3: a local build-script-run that opts into self-contained IS
+        // sliced to its own per-crate source, so it stops re-keying on unrelated
+        // workspace edits.
+        assert_ne!(s1[5], src, "self-contained local build-script-run unit must be sliced off the whole tree");
+        assert_eq!(units[5].manifest_dir, s1[5], "self-contained build-script unit manifest_dir rewritten onto per-crate store");
+        // Vendored units: resolved through the symlink farm onto their per-crate
+        // store target, including the vendored build-script-run unit (a vendored
+        // crate is self-contained). The assigned store is the symlink TARGET, so
+        // the unit's paths point at real content, not the unmounted symlink.
+        assert!(s1[3].starts_with(&store), "vendored serde resolves to its per-crate store target");
+        assert_eq!(units[3].manifest_dir, s1[3], "vendored serde manifest_dir rewritten onto per-crate target");
+        assert!(units[3].source_file.starts_with(&s1[3]), "vendored serde source_file rewritten onto its target");
+        assert!(s1[4].starts_with(&store), "vendored once_cell build-script-run unit resolves to its target");
+        assert_eq!(units[4].manifest_dir, s1[4], "vendored once_cell manifest_dir rewritten onto per-crate target");
+
+        let a_store_before = s1[0].clone();
+        let b_store_before = s1[1].clone();
+        let serde_store_before = s1[3].clone();
+        let once_cell_before = s1[4].clone();
+
+        // Edit ONLY local crate-b and vendored once_cell; re-run on fresh units.
+        write(&Path::new(&src).join("crate-b/src/lib.rs"), "pub fn b() { let _ = 1; }\n");
+        vendor_symlink(&vendor, &store, "once_cell", "pub fn o() { let _ = 1; }\n");
+        let mut units2 = mk();
+        let s2 = assign_per_crate_src_stores(&mut units2, &src, &vendor, ca_add).unwrap();
+
+        assert_eq!(s2[0], a_store_before, "editing crate-b must NOT change crate-a's assigned source store");
+        assert_ne!(s2[1], b_store_before, "crate-b's own assigned source store changes");
+        assert_eq!(s2[3], serde_store_before, "bumping once_cell must NOT change serde's per-crate vendor target");
+        assert_ne!(s2[4], once_cell_before, "once_cell's own per-crate vendor target changes");
+    }
+}
+
 pub fn run_plan_nix(
     src: &Path,
     vendor_dir: &Path,
@@ -1191,6 +1449,18 @@ pub fn run_plan_nix(
         parallel_jobs = parallel_jobs,
     )
     .entered();
+
+    // Changes 1 and 2: slice each local compile/test/doc unit's source — and each
+    // vendored dep's units — to their own per-crate NAR (see
+    // assign_per_crate_src_stores), decoupling local units from sibling-crate
+    // edits and vendored units from unrelated `Cargo.lock` bumps. In host mode
+    // this runs against the live daemon; in the planner derivation it uses
+    // recursive-nix.
+    let vendor_str = vendor_dir.to_string_lossy().to_string();
+    let unit_src_store = assign_per_crate_src_stores(&mut nix_units, &src_str, &vendor_str, |p| {
+        crate::add_to_nix_store(p)
+    })?;
+
     for (level_idx, level) in topo_levels.iter().enumerate() {
         let _level_span =
             tracing::info_span!("level", idx = level_idx, width = level.len(),).entered();
@@ -1239,7 +1509,7 @@ pub fn run_plan_nix(
                     &vendor_dir.to_string_lossy(),
                     &win_sdk_lib_dirs,
                     &win_sdk_closure,
-                    &src_str,
+                    &unit_src_store[i],
                     document_private_items,
                     &passthru_closure,
                     if clippy_str.is_empty() {

@@ -61,7 +61,6 @@
   env ? {},
   passthruEnv ? [],
   sourceRootPrefix ? null,
-  wrapBinaries ? false,
   doCheck ? false,
   preCheck ? "",
   postCheck ? "",
@@ -497,28 +496,18 @@ let
     if intent == "doc" then ""
     else ''rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true'';
 
-  wrapBinariesScript = lib.optionalString (wrapBinaries && !isWindows) ''
-    if [ -d "$out/bin" ]; then
-      for bin in $out/bin/*; do
-        [ -f "$bin" ] || continue
-        wrapProgram "$bin" \
-          --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath buildInputs}"
-      done
-    fi
-  '';
-
   installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
     inherit meta;
     aggregator = aggregatorOutput;
     # Forward the caller's `nativeBuildInputs` so their setup hooks
     # (e.g. `makeWrapper`'s `wrapProgram`, `installShellFiles`) load in
-    # `postInstall`.  Without this, callers can't run nixpkgs idioms
-    # like `wrapProgram $out/bin/foo --prefix PATH : …` from
-    # `postInstall` even after declaring `pkgs.makeWrapper` in
-    # `nativeBuildInputs` — the build phase honours the declaration
-    # but the install step does not.
+    # `postInstall`.  autoPatchelfHook rewrites each installed ELF's RUNPATH
+    # from its actual DT_NEEDED against `buildInputs`, so dynamically-linked
+    # binaries find their libraries without an LD_LIBRARY_PATH wrapper; static
+    # binaries and Windows PE outputs have nothing to patch and are untouched.
     nativeBuildInputs = nativeBuildInputs
-      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ];
+      ++ lib.optionals (!isWindows) [ pkgs.autoPatchelfHook ];
+    inherit buildInputs;
     passthru = { inherit planner aggregatorWrapper aggregatorOutput; };
   } ''
     set -euo pipefail
@@ -539,7 +528,6 @@ let
     done
     ${installFinish}
     ${postInstall}
-    ${wrapBinariesScript}
   '';
 
 in
