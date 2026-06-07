@@ -120,6 +120,8 @@ pub(super) fn construct_derivation(
             resolved_sysroot,
             &coreutils_bin_dir,
             document_private_items,
+            path_prefix_remaps,
+            src_store,
         )?,
         _ => build_compile_script(
             unit,
@@ -277,6 +279,49 @@ pub(super) fn construct_derivation(
         "inputSrcs": input_srcs_vec,
         "outputs": { "out": { "hashAlgo": "sha256", "method": "nar" } }
     }))
+}
+
+/// Build the `--remap-path-prefix` argument tokens for a unit.
+///
+/// `path_prefix_remaps` are `(src_relative, replacement)` pairs expressed
+/// relative to the *project-src* root, so callers need not know the build's
+/// content-addressed hash. `src_store` is the unit's actual source store: the
+/// project-src store for non-sliced units, or a flat per-crate
+/// `<hash>-<member>` store for sliced ones (`assign_per_crate_src_stores`).
+///
+/// rustc resolves overlapping remaps "last matching wins", so emit shortest
+/// `src_relative` first and let longer (more specific) entries override.
+///
+/// `sliced_crate_rel` re-roots the project-src-root remap for a sliced local
+/// crate. Without it, `--remap-path-prefix <crate_store>=<replacement>`
+/// collapses `<crate_store>/src/x` to `<replacement>/src/x`, dropping the
+/// `<member>/` directory and colliding every crate's `src/lib.rs`. With it the
+/// root remap targets `<replacement>/<crate_rel>` so the crate keeps its real
+/// workspace path. Only the root remap (`src_relative == ""`) is adjusted; a
+/// non-root remap names a subpath that, for a sliced crate, refers to an
+/// external source not under this crate store and simply will not match.
+fn remap_args(
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
+    sliced_crate_rel: Option<&str>,
+) -> Vec<String> {
+    let mut sorted: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
+    sorted.sort_by_key(|(src_relative, _)| src_relative.len());
+    let mut out = Vec::new();
+    for (src_relative, replacement) in sorted {
+        let from = if src_relative.is_empty() {
+            src_store.to_string()
+        } else {
+            format!("{}/{}", src_store, src_relative)
+        };
+        let to = match sliced_crate_rel {
+            Some(rel) if src_relative.is_empty() => format!("{}/{}", replacement, rel),
+            _ => replacement.clone(),
+        };
+        out.push("--remap-path-prefix".into());
+        out.push(shell_quote(&format!("{}={}", from, to)));
+    }
+    out
 }
 
 /// Build the shell script for a regular compilation or build-script compilation.
@@ -460,17 +505,11 @@ fn build_compile_script(
     // project-src root itself.  rustc resolves multiple remaps with
     // "last matching wins" — sort shortest-first so longer (more specific)
     // entries override shorter ones for paths that match both.
-    let mut sorted_remaps: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
-    sorted_remaps.sort_by_key(|(src_relative, _)| src_relative.len());
-    for (src_relative, replacement) in sorted_remaps {
-        let from = if src_relative.is_empty() {
-            src_store.to_string()
-        } else {
-            format!("{}/{}", src_store, src_relative)
-        };
-        parts.push("--remap-path-prefix".into());
-        parts.push(shell_quote(&format!("{}={}", from, replacement)));
-    }
+    parts.extend(remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    ));
 
     // Caller-supplied flags forwarded to clippy-driver (or rustc).  For
     // clippy units this is e.g. `["--deny", "warnings"]` from
@@ -593,6 +632,8 @@ fn build_doc_script(
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
     document_private_items: bool,
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -642,6 +683,15 @@ fn build_doc_script(
     // -C metadata (rustdoc uses this for cross-crate link stability)
     parts.push("-C".into());
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
+
+    // `--remap-path-prefix`: rewrite source paths in rustdoc diagnostics so
+    // they match the repo, same as the compile path. Without this, doc lints
+    // surface raw `<store>/...` paths no downstream mapper can resolve.
+    parts.extend(remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    ));
 
     // --extern deps — point to .rmeta/.rlib from dependency compile outputs
     for (extern_name, dep_key) in &unit.dep_extern {
@@ -1055,6 +1105,90 @@ pub(super) fn self_placeholder(output_name: &str) -> String {
 mod tests {
     use super::*;
 
+    // The project-src root remap that the consumer expresses via
+    // `sourceRootPrefix = "crates"`: rewrite the project-src store root to
+    // `crates`.
+    fn root_remap() -> Vec<(String, String)> {
+        vec![(String::new(), "crates".to_string())]
+    }
+
+    #[test]
+    fn remap_non_sliced_root_maps_store_to_replacement() {
+        let args = remap_args(&root_remap(), "/nix/store/h-project-src", None);
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-project-src=crates"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_root_preserves_member_dir() {
+        // A per-crate-sliced unit's src_store is the flat `<hash>-<member>`
+        // store. The root remap must target `crates/<member>`, not bare
+        // `crates`, or the member directory is dropped and every crate's
+        // `src/lib.rs` collapses to `crates/src/lib.rs`.
+        let args = remap_args(
+            &root_remap(),
+            "/nix/store/h-skeptiva-ai-common",
+            Some("skeptiva-ai-common"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-skeptiva-ai-common=crates/skeptiva-ai-common"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_member_under_subdir() {
+        // crate_rel carries the full project-src-relative path, including any
+        // parent dirs (a non-flat `crates/<member>` workspace layout).
+        let args = remap_args(
+            &root_remap(),
+            "/nix/store/h-msedge-shim",
+            Some("crates/skeptiva-ai-msedge-shim"),
+        );
+        assert_eq!(
+            args[1],
+            shell_quote("/nix/store/h-msedge-shim=crates/crates/skeptiva-ai-msedge-shim"),
+        );
+    }
+
+    #[test]
+    fn remap_non_root_entry_not_crate_rel_adjusted() {
+        // Non-root remaps (e.g. extraSources identity remaps) target a
+        // specific subpath; for a sliced crate they reference an external
+        // source not under this crate store, so they keep `replacement`
+        // verbatim and simply will not match this crate's paths.
+        let remaps = vec![("sub/dir".to_string(), "X".to_string())];
+        let args = remap_args(&remaps, "/nix/store/h-crate", Some("member"));
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-crate/sub/dir=X"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sorts_shortest_src_relative_first() {
+        // rustc resolves overlapping remaps "last matching wins", so the
+        // most specific (longest src_relative) must be emitted last.
+        let remaps = vec![
+            ("aa/bb".to_string(), "deep".to_string()),
+            (String::new(), "root".to_string()),
+        ];
+        let args = remap_args(&remaps, "/nix/store/h-src", None);
+        assert_eq!(args[1], shell_quote("/nix/store/h-src=root"));
+        assert_eq!(args[3], shell_quote("/nix/store/h-src/aa/bb=deep"));
+    }
+
     #[test]
     fn self_placeholder_format() {
         let ph = self_placeholder("out");
@@ -1130,6 +1264,7 @@ mod tests {
             for_host: false,
             compile_test: false,
             self_contained_build_script: false,
+            sliced_crate_rel: None,
             drv_path: None,
         }
     }
@@ -1150,6 +1285,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 
@@ -1195,6 +1332,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 
@@ -1217,6 +1356,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 
@@ -1240,6 +1381,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 
@@ -1263,6 +1406,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 
@@ -1285,6 +1430,8 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
         )
         .unwrap();
 

@@ -235,6 +235,17 @@ pub struct NixUnit {
     /// unrelated edits.
     #[serde(default)]
     pub(crate) self_contained_build_script: bool,
+    /// Set when this local unit was per-crate sliced off the project-src tree
+    /// (see `assign_per_crate_src_stores`): the crate's directory relative to
+    /// the project-src root, e.g. `skeptiva-ai-common`. Slicing rewrites the
+    /// unit's source onto a flat `<hash>-<member>` store, which severs the
+    /// crate's position in the workspace; `--remap-path-prefix` rules that are
+    /// expressed relative to the project-src root must re-append this so
+    /// diagnostics show `<replacement>/<crate_rel>/...` rather than collapsing
+    /// to `<replacement>/...` and dropping the member directory. `None` for
+    /// non-sliced units and vendored crates.
+    #[serde(default)]
+    pub(crate) sliced_crate_rel: Option<String>,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
 }
@@ -741,6 +752,13 @@ fn assign_per_crate_src_stores(
         } else if let Some(rest) = manifest_dir.strip_prefix(&old_prefix) {
             u.manifest_dir = format!("{}{}", crate_store, rest);
         }
+        // Record the crate's project-src-relative directory for local crates
+        // so the remap builder can keep their diagnostics rooted at the real
+        // workspace path. Vendored crates slice off the vendor dir, not the
+        // project-src root the path_prefix_remaps describe, so they keep None.
+        if is_local {
+            u.sliced_crate_rel = Some(crate_rel.clone());
+        }
         unit_src_store[i] = crate_store;
     }
     Ok(unit_src_store)
@@ -778,6 +796,7 @@ mod slice_tests {
             for_host: false,
             compile_test: false,
             self_contained_build_script: false,
+            sliced_crate_rel: None,
             drv_path: None,
         }
     }
@@ -861,8 +880,26 @@ mod slice_tests {
         assert_ne!(s1[0], src, "crate-a compile unit must be sliced off the whole tree");
         assert!(units[0].source_file.starts_with(&s1[0]), "source_file rewritten onto per-crate store");
         assert_eq!(units[0].manifest_dir, s1[0], "manifest_dir rewritten onto per-crate store");
+        // A sliced local unit records its project-src-relative dir so the
+        // remap builder can keep diagnostics rooted at the real workspace path.
+        assert_eq!(
+            units[0].sliced_crate_rel.as_deref(),
+            Some("crate-a"),
+            "sliced local unit must record its crate_rel"
+        );
         // Local build-script-run unit keeps the whole tree (sibling reads).
         assert_eq!(s1[2], src, "local build-script-run unit keeps the whole-tree src_store");
+        assert_eq!(
+            units[2].sliced_crate_rel, None,
+            "non-sliced local unit must not record a crate_rel"
+        );
+        // Vendored units slice off the vendor dir, not the project-src root the
+        // path_prefix_remaps describe, so they keep None (their remap, if any,
+        // must not be crate_rel-adjusted against the project-src replacement).
+        assert_eq!(
+            units[3].sliced_crate_rel, None,
+            "vendored sliced unit must not record a crate_rel"
+        );
         assert_eq!(units[2].source_file, format!("{src}/crate-a/src/lib.rs"), "local build-script unit not rewritten");
         // Change 3: a local build-script-run that opts into self-contained IS
         // sliced to its own per-crate source, so it stops re-keying on unrelated
