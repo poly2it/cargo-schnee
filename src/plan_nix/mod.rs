@@ -522,6 +522,48 @@ fn chunk_round_robin<T>(units: Vec<T>, n: usize) -> Vec<Vec<T>> {
     chunks
 }
 
+/// Source-replacement entries that redirect every git dependency found in
+/// `lock_text` (a `Cargo.lock`) to the vendored copy, mirroring what
+/// `cargo vendor` emits. Without these the offline planner has only the
+/// crates.io redirect, so cargo falls back to a (sandbox-forbidden) network
+/// fetch for any git dependency.
+fn git_source_overrides(lock_text: &str) -> String {
+    use std::collections::BTreeSet;
+    let mut seen = BTreeSet::new();
+    let mut out = String::new();
+    for line in lock_text.lines() {
+        let Some(rest) = line.trim().strip_prefix("source = \"git+") else {
+            continue;
+        };
+        let Some(src) = rest.strip_suffix('"') else {
+            continue;
+        };
+        // The replacement key is the source id without the resolved `#<commit>`.
+        let no_frag = src.split('#').next().unwrap_or(src);
+        let key = format!("git+{no_frag}");
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let (url, query) = match no_frag.split_once('?') {
+            Some((u, q)) => (u, Some(q)),
+            None => (no_frag, None),
+        };
+        out.push_str(&format!("\n[source.\"{key}\"]\ngit = \"{url}\"\n"));
+        // Carry a `?rev=` / `?branch=` / `?tag=` ref over verbatim.
+        if let Some(q) = query {
+            for kv in q.split('&') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if matches!(k, "rev" | "branch" | "tag") {
+                        out.push_str(&format!("{k} = \"{v}\"\n"));
+                    }
+                }
+            }
+        }
+        out.push_str("replace-with = \"vendored-sources\"\n");
+    }
+    out
+}
+
 /// Bootstrap-only unit-graph extraction.
 ///
 /// Loads the workspace via cargo-as-library and extracts the `Vec<NixUnit>`
@@ -557,13 +599,17 @@ pub fn fresh_unit_graph(
         .prefix("cargo-schnee-home-")
         .tempdir()?;
     let cargo_home = cargo_home_tmp.path().to_path_buf();
-    std::fs::write(
-        cargo_home.join("config.toml"),
-        format!(
-            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"{}\"\n",
-            vendor_dir.display()
-        ),
-    )?;
+    let mut cargo_config = format!(
+        "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"{}\"\n",
+        vendor_dir.display()
+    );
+    // crates.io is redirected above; git dependencies each need their own
+    // `[source."git+…"]` redirect, derived from the lockfile, or cargo tries to
+    // fetch them from the network.
+    if let Ok(lock_text) = std::fs::read_to_string(src.join("Cargo.lock")) {
+        cargo_config.push_str(&git_source_overrides(&lock_text));
+    }
+    std::fs::write(cargo_home.join("config.toml"), cargo_config)?;
     unsafe { std::env::set_var("CARGO_HOME", &cargo_home) };
 
     // Change CWD to the nix store source so cargo's config discovery
@@ -1883,5 +1929,44 @@ mod tests {
     fn chunk_round_robin_handles_empty_input() {
         let chunks: Vec<Vec<i32>> = chunk_round_robin(vec![], 3);
         assert_eq!(chunks, vec![Vec::<i32>::new(); 3]);
+    }
+
+    #[test]
+    fn git_sources_get_vendored_source_overrides() {
+        // A lock with a default-branch git dep, a crates.io dep, and a
+        // branch-pinned git dep. The offline planner needs a `[source."git+…"]`
+        // redirect for each git source, or cargo tries to fetch it over the
+        // (sandbox-forbidden) network.
+        let lock = "\
+[[package]]
+name = \"euc\"
+version = \"0.6.0\"
+source = \"git+https://github.com/zesterer/euc#e8f7aeece8f7aeece8f7aeece8f7aeece8f7aeec\"
+
+[[package]]
+name = \"clipline\"
+version = \"0.2.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"deadbeefdeadbeef\"
+
+[[package]]
+name = \"pinned\"
+version = \"2.0.0\"
+source = \"git+https://example.com/pinned?branch=main#abc123abc123abc123abc123abc123abc123abcd\"
+";
+        let cfg = git_source_overrides(lock);
+
+        // Default-branch git dep: keyed by its url, no ref line.
+        assert!(cfg.contains("[source.\"git+https://github.com/zesterer/euc\"]"));
+        assert!(cfg.contains("git = \"https://github.com/zesterer/euc\""));
+
+        // Branch-pinned git dep: the `?branch=` ref is carried over.
+        assert!(cfg.contains("[source.\"git+https://example.com/pinned?branch=main\"]"));
+        assert!(cfg.contains("branch = \"main\""));
+
+        // Both git sources redirect to vendored copies …
+        assert_eq!(cfg.matches("replace-with = \"vendored-sources\"").count(), 2);
+        // … and the crates.io registry dep is left to the existing crates-io redirect.
+        assert!(!cfg.contains("crates.io-index"));
     }
 }
