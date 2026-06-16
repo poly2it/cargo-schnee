@@ -45,6 +45,13 @@
   cargoLock ? null,
   cargoHash ? null,
   cargoDeps ? null,
+  # Optional per-git-dependency NAR hashes (keyed `"<name>-<version>"`).
+  # Git deps are vendored automatically via `builtins.fetchGit` (see the
+  # `allowBuiltinFetchGit` note below), so this is normally unnecessary —
+  # supply it only to pin a dep to a fixed-output (binary-cache-substitutable)
+  # fetch instead.  Forwarded verbatim to `importCargoLock`; only used with
+  # `cargoLock`.
+  outputHashes ? {},
   pname ? null,
   version ? null,
   package ? null,
@@ -134,6 +141,16 @@ let
       # already-cached output paths are reused.
       pkgs.rustPlatform.importCargoLock {
         lockFile = cargoLock;
+        inherit outputHashes;
+        # A git dependency carries no content checksum in `Cargo.lock` (only
+        # its commit, in the source `#fragment`), so `importCargoLock` would
+        # otherwise demand a hand-written `outputHashes` entry per git dep.
+        # `allowBuiltinFetchGit` makes it vendor each git source with
+        # `builtins.fetchGit`, which pins purely on that commit (`allRefs` so
+        # a non-tip rev is still reachable) and needs no hash — git deps then
+        # resolve straight from the lockfile, like registry crates. A caller
+        # can still override any dep via `outputHashes` above.
+        allowBuiltinFetchGit = true;
         extraRegistries = {
           "https://github.com/rust-lang/crates.io-index" =
             "https://static.crates.io/crates";
