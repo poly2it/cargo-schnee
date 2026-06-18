@@ -687,11 +687,22 @@ fn build_doc_script(
     // `--remap-path-prefix`: rewrite source paths in rustdoc diagnostics so
     // they match the repo, same as the compile path. Without this, doc lints
     // surface raw `<store>/...` paths no downstream mapper can resolve.
-    parts.extend(remap_args(
+    //
+    // Unlike rustc, where `--remap-path-prefix` is stable, rustdoc gates the
+    // flag behind `-Z unstable-options`. The pinned toolchain reports as
+    // stable, so `RUSTC_BOOTSTRAP` is exported below to let rustdoc accept the
+    // unstable flag. Only emit the gate when there are remaps to apply.
+    let remap = remap_args(
         path_prefix_remaps,
         src_store,
         unit.sliced_crate_rel.as_deref(),
-    ));
+    );
+    let needs_unstable_options = !remap.is_empty();
+    if needs_unstable_options {
+        parts.push("-Z".into());
+        parts.push("unstable-options".into());
+    }
+    parts.extend(remap);
 
     // --extern deps — point to .rmeta/.rlib from dependency compile outputs
     for (extern_name, dep_key) in &unit.dep_extern {
@@ -718,6 +729,12 @@ fn build_doc_script(
 
     // Initialize EXTRA_ARGS for build script directives
     script.push_str(r#"EXTRA_ARGS="" && "#);
+
+    // Let the stable-reporting toolchain accept the `-Z unstable-options`
+    // gate that rustdoc requires for `--remap-path-prefix`.
+    if needs_unstable_options {
+        script.push_str("export RUSTC_BOOTSTRAP=1 && ");
+    }
 
     // Parse build script output if we depend on one
     if let Some(ref bs_key) = unit.build_script_dep
@@ -1314,6 +1331,38 @@ mod tests {
         assert!(script.contains("diagnostics"));
         // Must NOT have --document-private-items
         assert!(!script.contains("--document-private-items"));
+        // With no remaps there is nothing to gate, so no unstable opt-in.
+        assert!(!script.contains("-Z unstable-options"));
+        assert!(!script.contains("RUSTC_BOOTSTRAP"));
+    }
+
+    #[test]
+    fn build_doc_script_remap_opts_into_unstable_options() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &root_remap(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+        )
+        .unwrap();
+
+        // rustdoc gates `--remap-path-prefix` behind `-Z unstable-options`,
+        // which the stable-reporting toolchain only accepts with
+        // `RUSTC_BOOTSTRAP` set.
+        assert!(script.contains("--remap-path-prefix"));
+        assert!(script.contains("-Z unstable-options"));
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 &&"));
     }
 
     #[test]
