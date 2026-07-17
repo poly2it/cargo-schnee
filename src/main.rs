@@ -1398,8 +1398,65 @@ fn format_intent_fields(user_intent: &UserIntent) -> String {
     }
 }
 
+/// Short, drv-name-safe label for a `UserIntent` variant.  Used in drv
+/// names (aggregator) and as the intent component of the unit-graph
+/// cache key.
+fn intent_label(user_intent: &UserIntent) -> &'static str {
+    match user_intent {
+        UserIntent::Build => "build",
+        UserIntent::Check { .. } => "check",
+        UserIntent::Test => "test",
+        UserIntent::Bench => "bench",
+        UserIntent::Doc { .. } => "doc",
+        _ => "build",
+    }
+}
+
+/// Compose the unit-graph cache key.  Single point of truth shared by
+/// `run_build_pipeline` and `compute-graph`, so the graph files written
+/// by the latter validate against the exact key the former expects via
+/// the `CARGO_SCHNEE_UNIT_GRAPH` hand-off.
+///
+/// `targets_hash` (from `hash_discovered_targets`) covers the
+/// filesystem-driven part of cargo's target auto-discovery: the manifest
+/// hash alone misses added/removed `tests/*.rs` etc., which change the
+/// unit-graph shape without touching any manifest.  `intent_fields`
+/// covers the bool fields of `Check { test }` / `Doc { deps, json }` —
+/// different fields, different unit set (see `format_intent_fields`).
+#[allow(clippy::too_many_arguments)]
+fn compose_unit_graph_key(
+    lockfile_hash: &str,
+    manifest_hash: &str,
+    targets_hash: &str,
+    profile_name: &str,
+    target_triple: &str,
+    user_intent: &UserIntent,
+    packages: &[String],
+    exclude: &[String],
+    features: &[String],
+    no_default_features: bool,
+    all_targets: bool,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
+        lockfile_hash,
+        manifest_hash,
+        targets_hash,
+        profile_name,
+        target_triple,
+        intent_label(user_intent),
+        format_intent_fields(user_intent),
+        packages.join(","),
+        exclude.join(","),
+        features.join(","),
+        no_default_features,
+        all_targets,
+    )
+}
+
 /// A single unit-graph cache entry, keyed by
-/// `hash(Cargo.lock + Cargo.toml + profile + target + intent + packages + features)`.
+/// `hash(Cargo.lock + Cargo.toml + discovered targets + profile + target
+/// + intent + packages + features)` — see `compose_unit_graph_key`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct UnitGraphCacheEntry {
     src_store: String,
@@ -1548,27 +1605,22 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&content)))
 }
 
-/// Hash all workspace Cargo.toml files (root + members) for cache keying.
-/// For non-workspace projects, falls back to hashing just the root Cargo.toml.
-fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+/// Resolve the Cargo.toml paths of all `[workspace] members` declared in
+/// the root manifest, sorted for deterministic iteration.  Non-workspace
+/// projects yield an empty list.  Invalid glob patterns are warned about
+/// and skipped.
+fn workspace_member_manifests(manifest_path: &Path, project_dir: &Path) -> Result<Vec<PathBuf>> {
     let content = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let doc: toml::Value = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
 
-    // Check for [workspace] members
-    let members = doc
+    let mut member_manifests: Vec<PathBuf> = Vec::new();
+    if let Some(members) = doc
         .get("workspace")
         .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array());
-
-    let mut hasher = Sha256::new();
-    // Always include root manifest
-    hasher.update(std::fs::read(manifest_path)?);
-
-    if let Some(members) = members {
-        // Resolve member paths and hash each member's Cargo.toml.
-        let mut member_manifests: Vec<PathBuf> = Vec::new();
+        .and_then(|m| m.as_array())
+    {
         for member in members {
             if let Some(pattern) = member.as_str() {
                 let full_pattern = project_dir
@@ -1592,15 +1644,83 @@ fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<
                 }
             }
         }
-        // Sort for deterministic hashing
-        member_manifests.sort();
-        for manifest in &member_manifests {
-            if let Ok(content) = std::fs::read(manifest) {
-                hasher.update(&content);
+    }
+    member_manifests.sort();
+    Ok(member_manifests)
+}
+
+/// Hash all workspace Cargo.toml files (root + members) for cache keying.
+/// For non-workspace projects, falls back to hashing just the root Cargo.toml.
+fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    // Always include root manifest
+    hasher.update(std::fs::read(manifest_path)?);
+    for manifest in workspace_member_manifests(manifest_path, project_dir)? {
+        if let Ok(content) = std::fs::read(&manifest) {
+            hasher.update(&content);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hash the set of target-defining files cargo auto-discovers from the
+/// filesystem for every workspace package: `src/lib.rs`, `src/main.rs`,
+/// `build.rs`, plus the scan directories `src/bin/` / `tests/` /
+/// `examples/` / `benches/` (each `*.rs` file and each `*/main.rs`
+/// subdirectory).  Cargo's planner derives the unit-graph *shape* from
+/// the presence of these paths, not from manifest contents, so they must
+/// participate in the unit-graph cache key: without them, adding e.g.
+/// `tests/foo.rs` gets a stale cached graph and the new test is silently
+/// never compiled.  Only the sorted path list is hashed — file contents
+/// don't affect graph shape, and content edits are already covered by the
+/// content-addressed src store.  Paths are hashed relative to
+/// `project_dir` so the key agrees between a local checkout and the store
+/// copy that `compute-graph` plans against.
+fn hash_discovered_targets(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+    let mut package_dirs: Vec<PathBuf> = vec![manifest_path
+        .parent()
+        .unwrap_or(project_dir)
+        .to_path_buf()];
+    for manifest in workspace_member_manifests(manifest_path, project_dir)? {
+        if let Some(dir) = manifest.parent() {
+            package_dirs.push(dir.to_path_buf());
+        }
+    }
+
+    let mut discovered: Vec<String> = Vec::new();
+    let mut record = |path: &Path| {
+        let rel = path.strip_prefix(project_dir).unwrap_or(path);
+        discovered.push(rel.to_string_lossy().into_owned());
+    };
+    for dir in &package_dirs {
+        for fixed in ["src/lib.rs", "src/main.rs", "build.rs"] {
+            let path = dir.join(fixed);
+            if path.is_file() {
+                record(&path);
+            }
+        }
+        for scan in ["src/bin", "tests", "examples", "benches"] {
+            let Ok(entries) = std::fs::read_dir(dir.join(scan)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+                    record(&path);
+                } else if path.is_dir() && path.join("main.rs").is_file() {
+                    record(&path.join("main.rs"));
+                }
             }
         }
     }
 
+    discovered.sort();
+    discovered.dedup();
+    let mut hasher = Sha256::new();
+    for path in &discovered {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -2022,36 +2142,23 @@ fn run_build_pipeline(
     // unit graph because the cargo plan is identical — only the rustc binary
     // swapped out per-unit at construction time.
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
-    let intent_str = match user_intent {
-        UserIntent::Build => "build",
-        UserIntent::Check { .. } => "check",
-        UserIntent::Test => "test",
-        UserIntent::Bench => "bench",
-        UserIntent::Doc { .. } => "doc",
-        _ => "build",
-    };
-    let packages_str = packages.join(",");
-    let exclude_str = exclude.join(",");
-    let features_str = features.join(",");
-    // Cache-key composition: `intent_str` covers the variant name only.
-    // Cargo's resolver also branches on the bool fields of `Check { test }`
-    // and `Doc { deps, json }` — different fields, different unit set — so
-    // `format_intent_fields` appends them.  Without that, toggling
-    // `--no-deps` or the `test` flag silently feeds the wrong cached graph
-    // to subsequent builds (same class of bug as the missing
-    // `--all-targets` discriminator).
-    let intent_fields = format_intent_fields(&user_intent);
-    let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
-        lockfile_hash,
-        manifest_hash,
-        profile.name,
-        target_config.target_triple,
-        intent_str,
-        intent_fields,
-        packages_str,
-        exclude_str,
-        features_str,
+    // Filesystem-driven target discovery (tests/, benches/, examples/,
+    // src/bin/, src/lib.rs, src/main.rs, build.rs) changes the unit-graph
+    // shape without touching any manifest, so it gets its own key
+    // component — otherwise adding `tests/foo.rs` serves a stale cached
+    // graph and the new test silently never runs.
+    let targets_hash = hash_discovered_targets(&manifest_path, project_dir)?;
+    let intent_str = intent_label(&user_intent);
+    let unit_graph_key = compose_unit_graph_key(
+        &lockfile_hash,
+        &manifest_hash,
+        &targets_hash,
+        &profile.name,
+        &target_config.target_triple,
+        &user_intent,
+        packages,
+        exclude,
+        features,
         no_default_features,
         all_targets,
     );
@@ -3395,31 +3502,22 @@ fn main() -> Result<()> {
                     other,
                 ),
             };
-            let intent_key = match user_intent {
-                UserIntent::Build => "build",
-                UserIntent::Check { .. } => "check",
-                UserIntent::Test => "test",
-                UserIntent::Bench => "bench",
-                UserIntent::Doc { .. } => "doc",
-                _ => "build",
-            };
-            let intent_fields = format_intent_fields(&user_intent);
+            let targets_hash = hash_discovered_targets(&manifest_path, project_dir)?;
             // `compute-graph` always plans the default target set (no
             // `--all-targets`); embed that in the key so the cache check
             // in `run_build_pipeline` correctly rejects this entry on a
             // `--all-targets` build (where the unit set differs).
             let all_targets = false;
-            let unit_graph_key = format!(
-                "{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
-                lockfile_hash,
-                manifest_hash,
-                profile_cfg.name,
-                target_config.target_triple,
-                intent_key,
-                intent_fields,
-                package.join(","),
-                exclude.join(","),
-                features.join(","),
+            let unit_graph_key = compose_unit_graph_key(
+                &lockfile_hash,
+                &manifest_hash,
+                &targets_hash,
+                &profile_cfg.name,
+                &target_config.target_triple,
+                &user_intent,
+                package,
+                exclude,
+                features,
                 no_default_features,
                 all_targets,
             );
@@ -3474,6 +3572,113 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the
+    /// manifest path.
+    fn scaffold_package(root: &Path) -> PathBuf {
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        manifest
+    }
+
+    #[test]
+    fn discovered_targets_change_on_test_file_add_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+
+        // Adding a tests/*.rs file changes the unit-graph shape, so it
+        // must change the hash (this is the false-green `cargo test` bug).
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/must_fail.rs"), "#[test]\nfn t() {}\n").unwrap();
+        let with_test = hash_discovered_targets(&manifest, root).unwrap();
+        assert_ne!(base, with_test);
+
+        // Removing it restores the original hash.
+        std::fs::remove_file(root.join("tests/must_fail.rs")).unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_ignore_content_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/a.rs"), "#[test]\nfn t() {}\n").unwrap();
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+        // Contents don't affect graph shape — rebuild-on-edit is handled
+        // by the content-addressed src store, not the unit-graph key.
+        std::fs::write(root.join("tests/a.rs"), "#[test]\nfn t2() { panic!() }\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { println!(\"hi\") }\n").unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_subdir_main_and_helper_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+
+        // A tests/ subdirectory without main.rs is not a target.
+        std::fs::create_dir_all(root.join("tests/common")).unwrap();
+        std::fs::write(root.join("tests/common/util.rs"), "pub fn u() {}\n").unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+
+        // tests/<dir>/main.rs is one.
+        std::fs::create_dir_all(root.join("tests/suite")).unwrap();
+        std::fs::write(root.join("tests/suite/main.rs"), "fn main() {}\n").unwrap();
+        assert_ne!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_cover_workspace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "").unwrap();
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+        std::fs::create_dir_all(root.join("crates/a/tests")).unwrap();
+        std::fs::write(root.join("crates/a/tests/x.rs"), "#[test]\nfn t() {}\n").unwrap();
+        assert_ne!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_hash_is_location_independent() {
+        // The hash must agree between a local checkout and the store copy
+        // `compute-graph` plans against — paths are hashed relative to
+        // project_dir.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let ma = scaffold_package(a.path());
+        let mb = scaffold_package(b.path());
+        std::fs::create_dir_all(a.path().join("tests")).unwrap();
+        std::fs::write(a.path().join("tests/t.rs"), "").unwrap();
+        std::fs::create_dir_all(b.path().join("tests")).unwrap();
+        std::fs::write(b.path().join("tests/t.rs"), "").unwrap();
+        assert_eq!(
+            hash_discovered_targets(&ma, a.path()).unwrap(),
+            hash_discovered_targets(&mb, b.path()).unwrap(),
+        );
+    }
 
     #[test]
     fn read_bin_target_name_from_package() {

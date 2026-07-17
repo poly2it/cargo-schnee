@@ -44,7 +44,10 @@ let
             ${forwardCases}
             --) args+=("--" "$@"); shift $#; break ;;
             --release) args+=("--release"); shift ;;
-            *) shift ;;
+            # cargo-schnee does not support this argument; dropping it
+            # silently turns e.g. `cargo test some_filter` into a
+            # full-suite run, so at least say what got discarded.
+            *) echo "warning: cargo wrapper: cargo-schnee ${subcmd} does not support '$1' — argument dropped" >&2; shift ;;
           esac
         done
         ${command} "''${args[@]}"
