@@ -77,7 +77,7 @@ each `NixUnit` are `{src_store}/{crate_rel}/…` (`unit_graph.rs:192,197`).
 3. Adjust the remap. `--remap-path-prefix` (`derivation.rs:456-471`) currently
    maps the `project-src` root to `"crates"` (or the configured
    `sourceRootPrefix`). With a per-crate store, map `{crate_store}` →
-   `{crate_rel}` (e.g. `crates/swerve-backend`) so diagnostics and debuginfo
+   `{crate_rel}` (e.g. `crates/app-backend`) so diagnostics and debuginfo
    stay repo-relative. The `path_prefix_remaps` `(src_relative, replacement)`
    mechanism already supports this; only the replacement string changes.
 
@@ -182,7 +182,7 @@ whose dependency closure excludes that crate are unchanged.
 ## Change 3 — generated artefacts as env-delivered derivations (consumer-side)
 
 This one needs **no cargo-schnee change** — it uses the mechanism cargo-schnee
-already has and the consumer already proves: `swerve-backend-schema` is a
+already has and the consumer already proves: `app-backend-schema` is a
 standalone derivation handed to its consumer via `KYSELY_SCHEMA_PATH` +
 `passthruEnv`, and that closure is injected **only into build-script-run
 sandboxes** (`derivation.rs:258-263`, `passthru_closure`), never the source NAR.
@@ -317,7 +317,7 @@ farm whose entries are per-crate content-addressed store paths, so the slicer
 sandbox → `couldn't read .../src/lib.rs`). Proven by the deterministic
 `assign_decouples_local_and_vendored_crates` test (a symlink-farm model where
 bumping one vendored crate leaves a sibling's target byte-identical) and by
-nix-mode builds of ci-robot and swerve-backend (the latter with a large
+nix-mode builds of ci-robot and app-backend (the latter with a large
 vendored closure including ring, rustls, wasmtime), exit 0.
 
 **Change 3 — wired and build-proven (cargo-schnee + consumer).** cargo-schnee
@@ -329,10 +329,10 @@ to per-crate source instead of carrying the whole tree (deterministic test:
 `OPENRPC_SPEC_DIR_<CRATE>` env (keyed on `CARGO_PKG_NAME` — a bare name would
 redirect *other* crates' build scripts, since cargo-schnee forwards passthru env
 into every build-script-run; this was caught when the telemetry rpc client
-regenerated from the swerve spec). swerve-backend supplies
-`OPENRPC_SPEC_DIR_SWERVE_BACKEND = "${specSrc}/swerve"` via `passthruEnv` and is
-marked self-contained. Proven end-to-end: `build-swerve-backend` exits 0 and its
-build-script-run's `CARGO_MANIFEST_DIR` is a per-crate `…-swerve-backend` store
+regenerated from the app spec). app-backend supplies
+`OPENRPC_SPEC_DIR_APP_BACKEND = "${specSrc}/app"` via `passthruEnv` and is
+marked self-contained. Proven end-to-end: `build-app-backend` exits 0 and its
+build-script-run's `CARGO_MANIFEST_DIR` is a per-crate `…-app-backend` store
 (only build.rs/Cargo.toml/migrations/src — no sibling crates); the only other
 source input is the spec tree, not the `crates/` workspace. So the unit no
 longer re-keys on unrelated crate edits.
@@ -341,7 +341,7 @@ Net: all three coordinated changes are wired into the live pipeline and proven
 by deterministic tests plus real nix builds; Change 4 is dropped. Remaining
 polish (not required for the collapse): `OPENRPC_SPEC_DIR` points at the whole
 `specSrc`, so a *spec* edit in an unrelated crate's spec still re-keys
-swerve-backend's build-script-run — scope it to `spec/swerve` to remove that
+app-backend's build-script-run — scope it to `spec/app` to remove that
 minor over-inclusion. The build-script-run output is content-addressed, so even
 then the expensive compile units cache-hit via CA early-cutoff.
 
@@ -356,10 +356,10 @@ reproduces the coupling today and must pass after wiring:
 DRV() { nix eval --raw ".#checks.x86_64-linux.$1.drvPath"; }
 
 before_a=$(DRV build-skeptiva-formatter)   # unrelated leaf crate
-# edit an unrelated crate's source body, e.g. swerve-backend:
-echo "// touch" >> crates/swerve-backend/src/main.rs
+# edit an unrelated crate's source body, e.g. app-backend:
+echo "// touch" >> crates/app-backend/src/main.rs
 after_a=$(DRV build-skeptiva-formatter)
-git checkout -- crates/swerve-backend/src/main.rs
+git checkout -- crates/app-backend/src/main.rs
 
 test "$before_a" = "$after_a"  # FAILS today (coupling); MUST hold after wiring
 ```
