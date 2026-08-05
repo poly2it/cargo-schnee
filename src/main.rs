@@ -2222,6 +2222,16 @@ fn run_build_pipeline(
             _ => Vec::new(),
         };
 
+    // Caller-supplied unit setup rules. CARGO_SCHNEE_UNIT_SETUP is
+    // JSON-encoded — a list of rule objects (see `nix/buildPackage.nix`'s
+    // `unitSetup`) whose scripts are sourced inside matching units'
+    // sandboxes immediately before the driver invocation runs.
+    let unit_setup: Vec<plan_nix::UnitSetupRule> = match std::env::var("CARGO_SCHNEE_UNIT_SETUP") {
+        Ok(s) if !s.is_empty() => serde_json::from_str(&s)
+            .with_context(|| format!("parse CARGO_SCHNEE_UNIT_SETUP as JSON: {}", s))?,
+        _ => Vec::new(),
+    };
+
     let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
@@ -2243,6 +2253,7 @@ fn run_build_pipeline(
         clippy,
         clippy_lint_args,
         &path_prefix_remaps,
+        &unit_setup,
         registration_jobs,
         all_targets,
     )?;
@@ -3250,6 +3261,7 @@ fn main() -> Result<()> {
                 false,
                 &[],
                 &[],
+                &[],
                 registration_jobs,
                 false,
             )?;
@@ -3435,6 +3447,7 @@ fn main() -> Result<()> {
                 None,
                 false,
                 false,
+                &[],
                 &[],
                 &[],
                 registration_jobs,

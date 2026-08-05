@@ -167,6 +167,112 @@ pub enum UnitKind {
     BuildScriptRun,
 }
 
+/// A caller-supplied unit setup rule, deserialised from the JSON in
+/// `CARGO_SCHNEE_UNIT_SETUP` (see `nix/buildPackage.nix`'s `unitSetup`).
+/// Every rule matching a unit contributes its `script`, sourced inside
+/// the unit's sandbox — in list order — immediately before the compiler,
+/// rustdoc, clippy-driver, or build-script invocation runs.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitSetupRule {
+    /// Cargo package name, or "*" to match every package. Matches
+    /// vendored dependencies as well as workspace members.
+    pub package: String,
+    /// Unit kinds the rule applies to, kebab-case. Defaults to the four
+    /// macro-expansion kinds — compile, check, test-compile, doc; the
+    /// build-script kinds must be named explicitly.
+    #[serde(
+        default = "default_unit_setup_kinds",
+        deserialize_with = "de_unit_setup_kinds"
+    )]
+    pub kinds: Vec<UnitKind>,
+    /// Optional filter on cargo target names. `None` matches all targets.
+    #[serde(default)]
+    pub targets: Option<Vec<String>>,
+    /// Store path of the shell script sourced into matching units.
+    pub script: String,
+}
+
+fn default_unit_setup_kinds() -> Vec<UnitKind> {
+    vec![
+        UnitKind::Compile,
+        UnitKind::Check,
+        UnitKind::TestCompile,
+        UnitKind::Doc,
+    ]
+}
+
+fn de_unit_setup_kinds<'de, D>(d: D) -> std::result::Result<Vec<UnitKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Vec::<String>::deserialize(d)?
+        .iter()
+        .map(|s| match s.as_str() {
+            "compile" => Ok(UnitKind::Compile),
+            "check" => Ok(UnitKind::Check),
+            "doc" => Ok(UnitKind::Doc),
+            "test-compile" => Ok(UnitKind::TestCompile),
+            "build-script-compile" => Ok(UnitKind::BuildScriptCompile),
+            "build-script-run" => Ok(UnitKind::BuildScriptRun),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown unit kind {other:?}; expected one of compile, check, \
+                 test-compile, doc, build-script-compile, build-script-run"
+            ))),
+        })
+        .collect()
+}
+
+/// Whether `rule` matches `unit`: its `package` equals the unit's cargo
+/// package name (or is "*"), its `kinds` contain the unit's kind, and its
+/// `targets` filter — when present — names the unit's cargo target.
+/// Target names are compared with `-` collapsed to `_`, mirroring how the
+/// unit's `crate_name` derives from `unit.target.name()`; clippy needs no
+/// special casing because clippy units are Check units with a swapped
+/// driver, so kind matching covers them by construction.
+fn unit_setup_rule_matches(rule: &UnitSetupRule, unit: &NixUnit) -> bool {
+    let pkg_name = unit
+        .cargo_envs
+        .iter()
+        .find(|(k, _)| k == "CARGO_PKG_NAME")
+        .map(|(_, v)| v.as_str());
+    (rule.package == "*" || pkg_name == Some(rule.package.as_str()))
+        && rule.kinds.contains(&unit.kind)
+        && rule.targets.as_ref().is_none_or(|targets| {
+            targets
+                .iter()
+                .any(|t| t.replace('-', "_") == unit.crate_name)
+        })
+}
+
+/// Collect the setup scripts matching `unit`, in rule order.
+pub(crate) fn unit_setup_scripts(unit: &NixUnit, rules: &[UnitSetupRule]) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|rule| unit_setup_rule_matches(rule, unit))
+        .map(|rule| rule.script.clone())
+        .collect()
+}
+
+/// Indices of rules matching no unit in the plan. A no-match rule is
+/// usually a typo'd package or target name and would otherwise no-op
+/// silently, so callers surface each returned index as a warning. It is
+/// only a warning because the same rule list is legitimately shared
+/// between build, test, and clippy packages, and e.g. a `test-compile`
+/// rule matches nothing in a plain build plan.
+pub(crate) fn unmatched_unit_setup_rules(
+    units: &[NixUnit],
+    rules: &[UnitSetupRule],
+) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| !units.iter().any(|unit| unit_setup_rule_matches(rule, unit)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// A unit in the generated Nix DAG.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NixUnit {
@@ -980,6 +1086,214 @@ mod slice_tests {
     }
 }
 
+#[cfg(test)]
+mod unit_setup_tests {
+    use super::*;
+
+    fn unit(pkg: &str, target: &str, kind: UnitKind, is_local: bool) -> NixUnit {
+        NixUnit {
+            key: format!("{pkg}-{target}-{kind:?}"),
+            drv_name: format!("{pkg}-{target}"),
+            kind,
+            source_file: String::new(),
+            crate_name: target.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".to_string(),
+            features: vec![],
+            dep_extern: vec![],
+            all_dep_keys: vec![],
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: String::new(),
+            original_manifest_dir: String::new(),
+            cargo_envs: vec![("CARGO_PKG_NAME".into(), pkg.into())],
+            extra_filename: String::new(),
+            needs_linker: false,
+            is_local,
+            links: None,
+            links_dep_keys: vec![],
+            is_root: false,
+            target_name: String::new(),
+            for_host: false,
+            compile_test: false,
+            self_contained_build_script: false,
+            sliced_crate_rel: None,
+            drv_path: None,
+        }
+    }
+
+    fn rule(package: &str, kinds: &str, targets: &str, script: &str) -> UnitSetupRule {
+        // Build via the JSON path so the tests exercise the same
+        // deserialisation `CARGO_SCHNEE_UNIT_SETUP` goes through.
+        let mut json = format!(r#"{{"package": "{package}", "script": "{script}""#);
+        if !kinds.is_empty() {
+            json.push_str(&format!(r#", "kinds": {kinds}"#));
+        }
+        if !targets.is_empty() {
+            json.push_str(&format!(r#", "targets": {targets}"#));
+        }
+        json.push('}');
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn default_kinds_cover_macro_expansion_kinds_only() {
+        // The default kind set covers compile, check, test-compile and
+        // doc — but neither build-script kind.
+        let rules = [rule("my-backend", "", "", "/nix/store/s")];
+        for kind in [
+            UnitKind::Compile,
+            UnitKind::Check,
+            UnitKind::TestCompile,
+            UnitKind::Doc,
+        ] {
+            let u = unit("my-backend", "my-backend", kind, true);
+            assert_eq!(unit_setup_scripts(&u, &rules), ["/nix/store/s"]);
+        }
+        for kind in [UnitKind::BuildScriptCompile, UnitKind::BuildScriptRun] {
+            let u = unit("my-backend", "build-script-build", kind, true);
+            assert!(unit_setup_scripts(&u, &rules).is_empty());
+        }
+    }
+
+    #[test]
+    fn kind_filter_leaves_other_kinds_untouched() {
+        // kinds = ["check"]: the same package's doc and build-script
+        // units get no scripts.
+        let rules = [rule("pkg", r#"["check"]"#, "", "/nix/store/s")];
+        let hit = unit("pkg", "pkg", UnitKind::Check, true);
+        assert_eq!(unit_setup_scripts(&hit, &rules), ["/nix/store/s"]);
+        for kind in [
+            UnitKind::Compile,
+            UnitKind::Doc,
+            UnitKind::TestCompile,
+            UnitKind::BuildScriptCompile,
+            UnitKind::BuildScriptRun,
+        ] {
+            let miss = unit("pkg", "pkg", kind, true);
+            assert!(unit_setup_scripts(&miss, &rules).is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn build_script_kinds_matchable_when_named_explicitly() {
+        let rules = [rule(
+            "pkg",
+            r#"["build-script-compile", "build-script-run"]"#,
+            "",
+            "/nix/store/s",
+        )];
+        for kind in [UnitKind::BuildScriptCompile, UnitKind::BuildScriptRun] {
+            let u = unit("pkg", "build-script-build", kind, true);
+            assert_eq!(unit_setup_scripts(&u, &rules), ["/nix/store/s"]);
+        }
+    }
+
+    #[test]
+    fn target_filter_matches_named_targets_only() {
+        // A package with a lib target and a bin target: restricting to
+        // the lib leaves the bin unit without scripts.  Target names
+        // compare with `-` collapsed to `_` because `crate_name` derives
+        // from `unit.target.name()` that way.
+        let rules = [rule(
+            "my-backend",
+            r#"["check"]"#,
+            r#"["my-backend"]"#,
+            "/nix/store/s",
+        )];
+        let lib = unit("my-backend", "my-backend", UnitKind::Check, true);
+        let bin = unit("my-backend", "my-ctl", UnitKind::Check, true);
+        assert_eq!(unit_setup_scripts(&lib, &rules), ["/nix/store/s"]);
+        assert!(unit_setup_scripts(&bin, &rules).is_empty());
+    }
+
+    #[test]
+    fn package_filter_matches_vendored_packages() {
+        // A rule naming a vendored package injects into that package's
+        // units and no others — forking its unit caches is the intended
+        // meaning.
+        let rules = [rule("serde", "", "", "/nix/store/s")];
+        let vendored = unit("serde", "serde", UnitKind::Compile, false);
+        let sibling = unit("serde_json", "serde_json", UnitKind::Compile, false);
+        let local = unit("my-backend", "my-backend", UnitKind::Compile, true);
+        assert_eq!(unit_setup_scripts(&vendored, &rules), ["/nix/store/s"]);
+        assert!(unit_setup_scripts(&sibling, &rules).is_empty());
+        assert!(unit_setup_scripts(&local, &rules).is_empty());
+    }
+
+    #[test]
+    fn star_matches_every_package() {
+        let rules = [rule("*", "", "", "/nix/store/s")];
+        let vendored = unit("serde", "serde", UnitKind::Compile, false);
+        let local = unit("my-backend", "my-backend", UnitKind::Compile, true);
+        assert_eq!(unit_setup_scripts(&vendored, &rules), ["/nix/store/s"]);
+        assert_eq!(unit_setup_scripts(&local, &rules), ["/nix/store/s"]);
+    }
+
+    #[test]
+    fn matching_rules_contribute_in_list_order() {
+        let rules = [
+            rule("*", "", "", "/nix/store/first"),
+            rule("pkg", "", "", "/nix/store/second"),
+        ];
+        let u = unit("pkg", "pkg", UnitKind::Check, true);
+        assert_eq!(
+            unit_setup_scripts(&u, &rules),
+            ["/nix/store/first", "/nix/store/second"]
+        );
+    }
+
+    #[test]
+    fn empty_rule_list_matches_nothing() {
+        let u = unit("pkg", "pkg", UnitKind::Check, true);
+        assert!(unit_setup_scripts(&u, &[]).is_empty());
+    }
+
+    #[test]
+    fn unmatched_rules_reported_by_index() {
+        // A typo'd package name and a kind absent from the plan are both
+        // flagged; the rule that matches is not.
+        let rules = [
+            rule("my-bakend", "", "", "/nix/store/typo"),
+            rule("my-backend", "", "", "/nix/store/hit"),
+            rule("my-backend", r#"["test-compile"]"#, "", "/nix/store/wrong-kind"),
+        ];
+        let units = [unit(
+            "my-backend",
+            "my-backend",
+            UnitKind::Check,
+            true,
+        )];
+        assert_eq!(unmatched_unit_setup_rules(&units, &rules), [0, 2]);
+    }
+
+    #[test]
+    fn all_matching_rules_report_nothing() {
+        let rules = [rule("*", "", "", "/nix/store/s")];
+        let units = [unit("pkg", "pkg", UnitKind::Compile, true)];
+        assert!(unmatched_unit_setup_rules(&units, &rules).is_empty());
+    }
+
+    #[test]
+    fn unknown_kind_is_rejected_at_parse_time() {
+        let err = serde_json::from_str::<Vec<UnitSetupRule>>(
+            r#"[{"package": "p", "script": "/nix/store/s", "kinds": ["chekc"]}]"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown unit kind"));
+    }
+
+    #[test]
+    fn unknown_rule_field_is_rejected_at_parse_time() {
+        assert!(
+            serde_json::from_str::<Vec<UnitSetupRule>>(
+                r#"[{"package": "p", "script": "/nix/store/s", "target": ["oops"]}]"#,
+            )
+            .is_err()
+        );
+    }
+}
+
 pub fn run_plan_nix(
     src: &Path,
     vendor_dir: &Path,
@@ -1011,6 +1325,11 @@ pub fn run_plan_nix(
     // `build_compile_script`, so callers express remaps in terms of the
     // project-src layout without knowing the content-addressed hash.
     path_prefix_remaps: &[(String, String)],
+    // Ordered unit setup rules from `CARGO_SCHNEE_UNIT_SETUP`.  Each
+    // matching rule's script is sourced inside the unit's sandbox right
+    // before the driver invocation; non-matching units are byte-identical
+    // to a run without rules.
+    unit_setup: &[UnitSetupRule],
     // Number of parallel daemon connections to use for derivation
     // registration. `None` defaults to the number of available CPU
     // cores; `Some(1)` reproduces the pre-parallel behaviour. Capped
@@ -1471,6 +1790,21 @@ pub fn run_plan_nix(
     // Pre-flight: warn about system libraries that pkg-config can't find.
     check_system_libraries(&nix_units, &pkg_config_bin, &pkg_config_path_env);
 
+    // Pre-flight: a unitSetup rule matching no unit is usually a typo'd
+    // package or target name and would otherwise no-op silently.
+    for i in unmatched_unit_setup_rules(&nix_units, unit_setup) {
+        let rule = &unit_setup[i];
+        tracing::warn!(
+            "unitSetup rule for package {:?} (script {}) matched no units in \
+             this plan. Check the package and target names — targets compare \
+             with `-` collapsed to `_`. A rule list shared between build, \
+             test, and clippy packages can legitimately match nothing in one \
+             of them.",
+            rule.package,
+            rule.script,
+        );
+    }
+
     // Build key→index map for looking up dep info
     let key_to_idx: HashMap<String, usize> = nix_units
         .iter()
@@ -1563,6 +1897,7 @@ pub fn run_plan_nix(
                     } else {
                         (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
                     };
+                let setup_scripts = unit_setup_scripts(&nix_units[i], unit_setup);
                 let json = construct_derivation(
                     &nix_units,
                     i,
@@ -1603,6 +1938,7 @@ pub fn run_plan_nix(
                     &clippy_closure,
                     clippy_lint_args,
                     path_prefix_remaps,
+                    &setup_scripts,
                 )?;
                 tracing::debug!(
                     "Adding derivation for {}: {}",

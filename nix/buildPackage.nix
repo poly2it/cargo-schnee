@@ -67,6 +67,18 @@
   extraSources ? {},
   env ? {},
   passthruEnv ? [],
+  # Ordered unit setup rules.  Each rule names a cargo package (or "*"),
+  # optionally restricts unit kinds (default: compile, check,
+  # test-compile, doc) and cargo target names, and supplies a shell
+  # script (store path) sourced inside every matching unit's sandbox
+  # immediately before the compiler / rustdoc / clippy-driver /
+  # build-script invocation.  Scripts may export env vars, start helper
+  # processes with a defined EXIT-trap shutdown point, and write
+  # auxiliary output to $SCHNEE_AUX_DIR ($out/schnee-aux), which the
+  # install step surfaces at $out/schnee-aux/<target-name>/.  An empty
+  # list leaves every generated derivation byte-identical to a run
+  # without rules; with rules present only matching units change.
+  unitSetup ? [],
   sourceRootPrefix ? null,
   doCheck ? false,
   preCheck ? "",
@@ -303,6 +315,55 @@ let
       (lib.mapAttrsToList (f: t: [f t]) effectivePathPrefixRemaps)
     else null;
 
+  # -- unitSetup serialisation -------------------------------------------
+  # Same pattern as CARGO_SCHNEE_PATH_PREFIX_REMAPS: JSON through the
+  # planner environment.  `"${rule.script}"` coerces a path literal to
+  # its store path (importing it if needed) and carries string context,
+  # so the script and its closure are mounted in the planner sandbox.
+  unitSetupRuleAttrs = [ "package" "kinds" "targets" "script" ];
+  # A script must resolve to a store path the planner can mount: a path
+  # literal (imported on coercion), a derivation, or a string that either
+  # carries context or already names a store path.  Anything else — e.g.
+  # a relative-path string like "./setup.sh" — would only fail much later
+  # with a daemon-level error that never mentions unitSetup.
+  unitSetupScriptOk = script:
+    builtins.isPath script
+    || lib.isDerivation script
+    || (builtins.isString script
+        && (builtins.hasContext script
+            || lib.hasPrefix builtins.storeDir script));
+  isStringList = xs: builtins.isList xs && lib.all builtins.isString xs;
+  validateUnitSetupRule = rule:
+    if !(builtins.isAttrs rule) then
+      throw "cargo-schnee buildPackage: unitSetup rules must be attrsets"
+    else if !(rule ? package) || !(rule ? script) then
+      throw "cargo-schnee buildPackage: unitSetup rules require `package` and `script`"
+    else if removeAttrs rule unitSetupRuleAttrs != {} then
+      throw ''
+        cargo-schnee buildPackage: unknown unitSetup rule attribute(s): ${
+          lib.concatStringsSep ", "
+            (lib.attrNames (removeAttrs rule unitSetupRuleAttrs))
+        }''
+    else if !(builtins.isString rule.package) then
+      throw "cargo-schnee buildPackage: unitSetup rule `package` must be a string"
+    else if !(unitSetupScriptOk rule.script) then
+      throw ("cargo-schnee buildPackage: unitSetup rule `script` must be a "
+        + "path literal, a derivation, or a store-path string; got "
+        + (if builtins.isString rule.script
+           then "the context-free string \"${rule.script}\""
+           else "a ${builtins.typeOf rule.script}"))
+    else if rule ? kinds && !(isStringList rule.kinds) then
+      throw "cargo-schnee buildPackage: unitSetup rule `kinds` must be a list of strings"
+    else if rule ? targets && !(isStringList rule.targets) then
+      throw "cargo-schnee buildPackage: unitSetup rule `targets` must be a list of strings"
+    else
+      { inherit (rule) package; script = "${rule.script}"; }
+      // lib.optionalAttrs (rule ? kinds) { inherit (rule) kinds; }
+      // lib.optionalAttrs (rule ? targets) { inherit (rule) targets; };
+  unitSetupJson =
+    if unitSetup == [] then null
+    else builtins.toJSON (map validateUnitSetupRule unitSetup);
+
   # -- planner env --------------------------------------------------------
   plannerEnv = env
     // lib.optionalAttrs (passthruEnv != []) {
@@ -310,6 +371,9 @@ let
     }
     // lib.optionalAttrs (pathPrefixRemapsJson != null) {
       CARGO_SCHNEE_PATH_PREFIX_REMAPS = pathPrefixRemapsJson;
+    }
+    // lib.optionalAttrs (unitSetupJson != null) {
+      CARGO_SCHNEE_UNIT_SETUP = unitSetupJson;
     };
 
   envExportLines = lib.concatMapStrings
@@ -542,6 +606,22 @@ let
         exit 1
       fi
       ${installRoot}
+      # Auxiliary output written by unitSetup scripts (SCHNEE_AUX_DIR)
+      # surfaces at a documented per-target location instead of leaving
+      # consumers to walk aggregator internals.  Roots without aux
+      # output contribute nothing; the directory is absent when no
+      # script wrote to it.  Doc roots carry no target name, so their
+      # aux output has no destination — warn instead of dropping it
+      # silently.
+      if [ -d "$ROOT/schnee-aux" ]; then
+        if [ -n "$TARGET_NAME" ]; then
+          mkdir -p "$out/schnee-aux/$TARGET_NAME"
+          cp -r --no-preserve=mode "$ROOT/schnee-aux/." \
+            "$out/schnee-aux/$TARGET_NAME/"
+        else
+          echo "cargo-schnee: discarding unitSetup auxiliary output of $ROOT: this root has no target name (doc roots do not); it remains readable inside the root's own store output" >&2
+        fi
+      fi
     done
     ${installFinish}
     ${postInstall}

@@ -19,6 +19,13 @@
   # Args passed to each test binary at run time.  Use for
   # `--test-threads=1`, `--nocapture`, filtering, etc.
   testRunnerArgs ? [],
+  # Store path of a shell script sourced in the runner before the first
+  # test binary executes, under the unit setup script contract: its
+  # exports persist into every test binary, an EXIT trap it sets fires
+  # after the last binary exits (a defined shutdown point for
+  # daemonised helpers), and SCHNEE_AUX_DIR names $out/schnee-aux for
+  # auxiliary output.  A nonzero exit fails the run with that code.
+  testRunnerSetup ? null,
   ...
 }@args:
 
@@ -39,7 +46,7 @@ let
       [] xs;
 
   forwarded = removeAttrs args [
-    "testScope" "cargoTestExtraArgs" "testRunnerArgs"
+    "testScope" "cargoTestExtraArgs" "testRunnerArgs" "testRunnerSetup"
   ];
 
   built = self.lib.buildPackage (forwarded // {
@@ -62,6 +69,14 @@ in
     set -euo pipefail
     mkdir -p $out
 
+    ${lib.optionalString (testRunnerSetup != null) ''
+      # Runner setup hook: sourced (not executed) so exports persist
+      # into the test binaries and an EXIT trap fires after the last
+      # binary exits.  $out exists; SCHNEE_AUX_DIR is the runner's
+      # auxiliary output channel.
+      export SCHNEE_AUX_DIR=$out/schnee-aux
+      . ${testRunnerSetup}
+    ''}
     # cargo-schnee bakes `/tmp/_schnee_md_<hash>` into each test
     # binary as `CARGO_MANIFEST_DIR`.  At compile time the symlink
     # points at the project-src store path so proc macros can read

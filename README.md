@@ -667,9 +667,9 @@ path.
 
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
-`wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`, `postInstall`,
-`postFixup`, and `meta`. Unrecognised attributes are passed through to
-`buildRustPackage`.
+`unitSetup`, `wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`,
+`postInstall`, `postFixup`, and `meta`. Unrecognised attributes are passed
+through to `buildRustPackage`.
 
 #### `env`
 
@@ -725,6 +725,84 @@ devShells.default = pkgs.mkShell {
   BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
 };
 ```
+
+#### `unitSetup`
+
+`unitSetup` is an ordered list of rules that source caller-supplied shell
+scripts inside selected per-unit sandboxes, immediately before the compiler,
+rustdoc, clippy-driver, or build-script invocation runs. Use it when a
+compilation depends on external state at execution time — the driving case is
+sqlx's `query!` macro family, which expands against a live `DATABASE_URL` and
+writes query metadata into `SQLX_OFFLINE_DIR` as a side effect of compilation.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  unitSetup = [
+    {
+      # Cargo package name, or "*" to match every package. Matches
+      # vendored dependencies as well as workspace members.
+      package = "my-backend";
+      # Unit kinds the rule applies to. Default: the four macro-expansion
+      # kinds — compile, check, test-compile, doc. The build-script kinds
+      # build-script-compile and build-script-run may be named explicitly.
+      kinds = [ "check" ];
+      # Optional filter on cargo target names, e.g. restrict to the lib
+      # target of a package that also has bins. Default: all targets.
+      targets = [ "my-backend" ];
+      # Store path of a shell script.
+      script = ./setup.sh;
+    }
+  ];
+}
+```
+
+Every rule matching a unit contributes its script, sourced in list order.
+The script contract:
+
+- The script is *sourced*, not executed: its exports persist into the
+  subsequent compiler or build-script invocation, and an `EXIT` trap it sets
+  fires when the surrounding script exits — after the work completes — giving
+  daemonised helpers (e.g. an embedded PostgreSQL on a Unix socket) a defined
+  shutdown point.
+- It runs after all cargo environment exports, so `CARGO_MANIFEST_DIR`,
+  `CARGO_PKG_NAME`, and friends are readable, and `$out` already exists.
+- `SCHNEE_AUX_DIR` is exported, naming a directory the script may create and
+  populate with auxiliary output. The install step merges each *root* unit's
+  aux directory into `$out/schnee-aux/<target-name>/` in the package output.
+  Only root units surface this way: aux output written in a non-root unit
+  (e.g. a dependency's compile unit) stays inside that unit's own store
+  output and is not installed. Doc roots have no target name; the install
+  step warns when it discards their aux output for that reason.
+- A nonzero exit fails the unit with that exit code; stderr passes through.
+- The script runs mid-chain in the unit's build shell: it must not `cd` or
+  change shell options (`set -e`, `set -u`, …), which would perturb the
+  driver invocation that follows it.
+- The sandbox has no network and no default `PATH`; scripts must reference
+  tools by absolute store path. The script and its reference closure are
+  mounted automatically.
+
+With `unitSetup` absent or empty, every generated derivation is byte-identical
+to a run without the feature; with rules present, only matching units change
+and all other units keep sharing caches with ordinary builds. A rule matching
+a vendored package forks that package's unit caches — the intended meaning,
+not an error. `lib.testPackage` and `lib.clippyPackage` forward `unitSetup`
+like any shared argument; clippy units are check units with a swapped driver,
+so `kinds = [ "check" ]` covers them.
+
+Matching limitations: `package` compares by name only, so when the dependency
+graph carries a crate at several versions a rule matches all of them; and
+`targets` compares names with `-` collapsed to `_`, so it cannot distinguish a
+lib target from a same-named bin target. The planner warns about any rule that
+matched no unit in the plan — usually a typo'd package or target name, though
+a rule list shared between build, test, and clippy packages can legitimately
+match nothing in one of them.
+
+`lib.testPackage` additionally accepts `testRunnerSetup`, a single script
+store path sourced in the test runner before the first test binary executes,
+under the same contract (`SCHNEE_AUX_DIR` is `$out/schnee-aux` in the runner's
+output; the `EXIT` trap runs after the last binary exits).
 
 For Windows targets, `buildPackage` automatically sets `dontFixup = true`
 because patchelf and strip do not work on PE binaries. When `doCheck` is
