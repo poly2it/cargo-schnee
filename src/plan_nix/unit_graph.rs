@@ -281,47 +281,78 @@ pub(super) fn extract_units_from_bcx(
                         .find(|d| d.name_in_toml() == dep_toml_name);
                     let pkg_name = dep_spec.map(|d| d.package_name()).unwrap_or(dep_toml_name);
                     let is_platform_gated = dep_spec.is_some_and(|d| d.platform().is_some());
-                    // Find the matching lib Unit in the full graph.
-                    if let Some(candidate) = all_units.iter().find(|c| {
-                        c.pkg.name() == pkg_name
-                            && c.target.is_lib()
-                            && !c.target.is_custom_build()
-                            && c.mode != CompileMode::RunCustomBuild
-                    }) {
-                        let dep_key = key_map[candidate].clone();
-                        let already_present = dep_extern_map.contains_key(&extern_name);
-                        tracing::debug!(
-                            "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
-                             already_in_dep_extern={}",
-                            dep_toml_name,
-                            key,
-                            extern_name,
-                            pkg_name,
-                            dep_key,
-                            already_present,
-                        );
-                        feature_dep_activations
-                            .entry(feat.to_string())
-                            .or_default()
-                            .push((extern_name, dep_key));
-                    } else if is_platform_gated {
-                        // Dep is behind a target-specific gate (e.g.
-                        // cfg(windows)) and absent from the unit graph on
-                        // this platform — expected, not actionable.
-                        tracing::debug!(
-                            "Feature-activated dep {} (dep:{}) not in unit graph for {} \
-                             (platform-gated, expected)",
-                            extern_name,
-                            dep_toml_name,
-                            key,
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
-                            extern_name,
-                            dep_toml_name,
-                            key,
-                        );
+                    // Find the matching lib Unit in the full graph, honouring
+                    // the consumer's compile kind.
+                    match find_linkable_lib_unit(&all_units, pkg_name.as_str(), unit) {
+                        LibUnitLookup::Found(candidate) => {
+                            let dep_key = key_map[candidate].clone();
+                            let already_present = dep_extern_map.contains_key(&extern_name);
+                            tracing::debug!(
+                                "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
+                                 already_in_dep_extern={}",
+                                dep_toml_name,
+                                key,
+                                extern_name,
+                                pkg_name,
+                                dep_key,
+                                already_present,
+                            );
+                            feature_dep_activations
+                                .entry(feat.to_string())
+                                .or_default()
+                                .push((extern_name, dep_key));
+                        }
+                        LibUnitLookup::WrongKind => {
+                            // The crate is in the graph, but only compiled for
+                            // a compile kind this unit cannot link.  Usually a
+                            // build-script compile, which runs on the host and
+                            // draws its externs from `[build-dependencies]`,
+                            // looking at its package's regular deps that exist
+                            // only as target units.  That case is routine and
+                            // stays quiet.  A target consumer reaching this arm
+                            // is not routine: the unit compiles with no
+                            // `--extern` for a dep its features activated, and
+                            // the only symptom is E0463 inside the unit's own
+                            // derivation, where this planner's reasoning is no
+                            // longer visible.
+                            if matches!(unit.kind, CompileKind::Target(_)) {
+                                tracing::warn!(
+                                    "Feature-activated dep {} (dep:{}) exists only as a host \
+                                     unit, so {} gets no --extern for it",
+                                    extern_name,
+                                    dep_toml_name,
+                                    key,
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Feature-activated dep {} (dep:{}) is only built for another \
+                                     compile kind, not linkable into {}",
+                                    extern_name,
+                                    dep_toml_name,
+                                    key,
+                                );
+                            }
+                        }
+                        LibUnitLookup::Absent if is_platform_gated => {
+                            // Dep is behind a target-specific gate (e.g.
+                            // cfg(windows)) and absent from the unit graph on
+                            // this platform — expected, not actionable.
+                            tracing::debug!(
+                                "Feature-activated dep {} (dep:{}) not in unit graph for {} \
+                                 (platform-gated, expected)",
+                                extern_name,
+                                dep_toml_name,
+                                key,
+                            );
+                        }
+                        LibUnitLookup::Absent => {
+                            tracing::warn!(
+                                "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
+                                extern_name,
+                                dep_toml_name,
+                                key,
+                            );
+                        }
                     }
                 }
             }
@@ -850,6 +881,61 @@ pub(super) fn toposort(
     }
 
     Ok(result)
+}
+
+/// Outcome of looking up the lib unit a feature-activated optional dependency
+/// resolves to.
+enum LibUnitLookup<'a> {
+    /// A lib unit exists that the consumer may legitimately link.
+    Found(&'a Unit),
+    /// A lib unit exists, but only for a compile kind the consumer cannot
+    /// link.
+    WrongKind,
+    /// No lib unit for that package is in the graph at all.
+    Absent,
+}
+
+/// Find the lib unit of `pkg_name` that `consumer` is allowed to link.
+///
+/// Cargo's unit graphs contain no host-to-target edges.  A unit compiled for
+/// the host links host artefacts only, and a unit compiled for a target links
+/// target artefacts plus host-built proc macros — the one direction in which
+/// the kinds legitimately mix.  Matching `consumer.kind` exactly, with that
+/// single exception, reproduces cargo's own rule.  There is deliberately no
+/// fallback to the other kind: rustc cannot open an rlib built for a
+/// different target, so an inexact match is never better than no match.
+///
+/// The proc-macro exception matters because callers reach here for both
+/// `Host` build-script compiles and `Target` lib compiles, and the latter
+/// must still be able to pick up a proc macro, which cargo always builds for
+/// the host.
+///
+/// Without the kind filter, sort order decides instead.  `all_units` is
+/// sorted by [`compilation_identity`], whose `-host` infix sorts *after* the
+/// target form, so a plain `find` returns the target unit on every cross
+/// build and hands host build-script compiles rlibs rustc cannot load.
+fn find_linkable_lib_unit<'a>(
+    all_units: &'a [Unit],
+    pkg_name: &str,
+    consumer: &Unit,
+) -> LibUnitLookup<'a> {
+    let is_lib_of_pkg = |c: &Unit| {
+        c.pkg.name().as_str() == pkg_name
+            && c.target.is_lib()
+            && !c.target.is_custom_build()
+            && c.mode != CompileMode::RunCustomBuild
+    };
+    let linkable_by =
+        |c: &Unit| c.kind == consumer.kind || (c.target.for_host() && c.kind == CompileKind::Host);
+
+    let mut candidates = all_units.iter().filter(|c| is_lib_of_pkg(c)).peekable();
+    if candidates.peek().is_none() {
+        return LibUnitLookup::Absent;
+    }
+    match candidates.find(|c| linkable_by(c)) {
+        Some(candidate) => LibUnitLookup::Found(candidate),
+        None => LibUnitLookup::WrongKind,
+    }
 }
 
 /// Return `(extern_name, dep_key)` pairs for optional deps that are activated
