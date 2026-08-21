@@ -10,10 +10,18 @@ const STDERR_ERROR: u64 = 0x63787470;
 // Worker protocol opcodes used in this module. Extracted from the upstream
 // `nix/src/libstore/worker-protocol.hh` enum.
 const WOP_ADD_TEXT_TO_STORE: u64 = 8;
+const WOP_QUERY_PATH_INFO: u64 = 26;
 const WOP_QUERY_VALID_PATHS: u64 = 31;
 
 pub(super) struct NixDaemonConn {
-    stream: std::os::unix::net::UnixStream,
+    /// Buffered halves of one `UnixStream` (`try_clone`d fd). The worker
+    /// protocol frames everything as 8-byte words; without buffering each
+    /// word is its own sendto/recvfrom syscall, which multiplies into
+    /// hundreds of syscalls per registered derivation (~3 per reference
+    /// string). Requests are staged in the writer and flushed once per
+    /// message, right before reading the reply.
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    writer: std::io::BufWriter<std::os::unix::net::UnixStream>,
     /// Worker protocol version negotiated during the handshake, encoded
     /// as `(major << 8) | minor`. Several opcodes (`wopQueryValidPaths`,
     /// for one) take an extra argument from a particular protocol
@@ -53,19 +61,25 @@ impl NixDaemonConn {
         let timeout = Some(std::time::Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
+        let read_half = stream.try_clone()?;
         let mut conn = Self {
-            stream,
+            reader: std::io::BufReader::new(read_half),
+            writer: std::io::BufWriter::new(stream),
             negotiated_protocol: 0,
         };
         conn.handshake()?;
         Ok(conn)
     }
 
-    fn handshake(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         use std::io::Write;
+        self.writer.flush()?;
+        Ok(())
+    }
 
+    fn handshake(&mut self) -> Result<()> {
         self.write_u64(WORKER_MAGIC_1)?;
-        self.stream.flush()?;
+        self.flush()?;
 
         let magic = self.read_u64()?;
         if magic != WORKER_MAGIC_2 {
@@ -99,7 +113,7 @@ impl NixDaemonConn {
             self.write_u64(0)?;
         }
 
-        self.stream.flush()?;
+        self.flush()?;
 
         // Protocol >= 1.33: daemon sends its version string. Read and
         // log it for diagnostics; the value is intentionally not used
@@ -136,14 +150,12 @@ impl NixDaemonConn {
         &mut self,
         paths: &[&str],
     ) -> Result<std::collections::HashSet<String>> {
-        use std::io::Write;
-
         self.write_u64(WOP_QUERY_VALID_PATHS)?;
         self.write_string_list(paths)?;
         if self.negotiated_protocol >= ((1 << 8) | 27) {
             self.write_u64(0)?; // substitute = false
         }
-        self.stream.flush()?;
+        self.flush()?;
 
         self.process_stderr()?;
         let valid = self.read_string_list()?;
@@ -158,28 +170,95 @@ impl NixDaemonConn {
         content: &[u8],
         refs: &[&str],
     ) -> Result<String> {
-        use std::io::Write;
-
         self.write_u64(WOP_ADD_TEXT_TO_STORE)?;
         self.write_string(name)?;
         self.write_bytes(content)?;
         self.write_string_list(refs)?;
-        self.stream.flush()?;
+        self.flush()?;
 
         self.process_stderr()?;
         self.read_string()
     }
 
+    /// Direct references of a single valid store path, via
+    /// `wopQueryPathInfo`. One round trip; the reply's other fields
+    /// (deriver, NAR hash, signatures, …) are read to keep the stream
+    /// in sync and discarded. Errors if the path is not valid.
+    pub(super) fn query_path_references(&mut self, path: &str) -> Result<Vec<String>> {
+        self.write_u64(WOP_QUERY_PATH_INFO)?;
+        self.write_string(path)?;
+        self.flush()?;
+
+        self.process_stderr()?;
+        // Protocol >= 1.17: explicit validity flag instead of an error.
+        if self.negotiated_protocol >= ((1 << 8) | 17) {
+            let valid = self.read_u64()?;
+            if valid == 0 {
+                anyhow::bail!("path is not valid: {}", path);
+            }
+        }
+        let _deriver = self.read_string()?;
+        let _nar_hash = self.read_string()?;
+        let references = self.read_string_list()?;
+        let _registration_time = self.read_u64()?;
+        let _nar_size = self.read_u64()?;
+        if self.negotiated_protocol >= ((1 << 8) | 16) {
+            let _ultimate = self.read_u64()?;
+            let _sigs = self.read_string_list()?;
+            let _ca = self.read_string()?;
+        }
+        Ok(references)
+    }
+
+    /// Transitive closure of `root` (root included), computed by BFS
+    /// over `query_path_references`. `refs_memo` caches per-path
+    /// references across calls so shared subclosures of successive
+    /// roots are each queried once. Returns the closure sorted, which
+    /// is deterministic; consumers feed closures into sorted sets, so
+    /// ordering does not influence derivation contents.
+    pub(super) fn query_closure(
+        &mut self,
+        root: &str,
+        refs_memo: &mut std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Vec<String>> {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack = vec![root.to_string()];
+        while let Some(path) = stack.pop() {
+            if visited.contains(&path) {
+                continue;
+            }
+            let refs = match refs_memo.get(&path) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = self.query_path_references(&path)?;
+                    refs_memo.insert(path.clone(), r.clone());
+                    r
+                }
+            };
+            for r in refs {
+                // Self-references are common (paths may reference
+                // themselves) and must not re-enter the queue.
+                if r != path && !visited.contains(&r) {
+                    stack.push(r);
+                }
+            }
+            visited.insert(path);
+        }
+        let mut closure: Vec<String> = visited.into_iter().collect();
+        closure.sort();
+        Ok(closure)
+    }
+
     fn write_u64(&mut self, val: u64) -> Result<()> {
         use std::io::Write;
-        self.stream.write_all(&val.to_le_bytes())?;
+        self.writer.write_all(&val.to_le_bytes())?;
         Ok(())
     }
 
     fn read_u64(&mut self) -> Result<u64> {
         use std::io::Read;
         let mut buf = [0u8; 8];
-        self.stream.read_exact(&mut buf)?;
+        self.reader.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }
 
@@ -190,10 +269,10 @@ impl NixDaemonConn {
     fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
         use std::io::Write;
         self.write_u64(data.len() as u64)?;
-        self.stream.write_all(data)?;
+        self.writer.write_all(data)?;
         let padding = (8 - (data.len() % 8)) % 8;
         if padding > 0 {
-            self.stream.write_all(&[0u8; 8][..padding])?;
+            self.writer.write_all(&[0u8; 8][..padding])?;
         }
         Ok(())
     }
@@ -208,11 +287,11 @@ impl NixDaemonConn {
             );
         }
         let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf)?;
+        self.reader.read_exact(&mut buf)?;
         let padding = (8 - (len % 8)) % 8;
         if padding > 0 {
             let mut pad = [0u8; 8];
-            self.stream.read_exact(&mut pad[..padding])?;
+            self.reader.read_exact(&mut pad[..padding])?;
         }
         Ok(String::from_utf8(buf)?)
     }

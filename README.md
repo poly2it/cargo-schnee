@@ -399,17 +399,23 @@ from the hash, the sorted references, and the store prefix. That fingerprint
 is hashed again, XOR-folded from 32 bytes to 20, and encoded in nix-base32
 to produce the final `/nix/store/<hash>-<name>.drv` path.
 
-If the `.drv` path already exists in the store, registration is skipped.
-Otherwise, the derivation is registered via the Nix daemon Unix socket at
-`/nix/var/nix/daemon-socket/socket` using the `wopAddTextToStore` operation,
-opcode 8. The daemon protocol uses u64 little-endian integers and
-length-prefixed strings padded to 8-byte boundaries. If the daemon connection
-fails, cargo-schnee falls back to spawning `nix derivation add` as a
-subprocess.
-
-Units are registered level-by-level in topological order. All units at the
-same depth can be registered in a single batch since their dependencies are
-already resolved.
+Because paths are computed client-side, construction never waits on the
+daemon: derivations are constructed level-by-level in topological order
+(in parallel within each level), each level's computed paths feeding the
+next level's `inputDrvs`. A single batched `wopQueryValidPaths` round
+trip then partitions the whole DAG into cache hits and misses — on a
+warm store, registration is that one round trip. Misses are registered
+via the Nix daemon Unix socket (resolved from `NIX_REMOTE`, then
+`NIX_DAEMON_SOCKET_PATH`, then the system socket) using the
+`wopAddTextToStore` operation, opcode 8, level-by-level so a drv's
+references are always valid before its dependents are added. The daemon
+protocol uses u64 little-endian integers and length-prefixed strings
+padded to 8-byte boundaries; the socket is buffered so a message costs
+one syscall, not one per protocol word. Tool closures (`rustc`, `cc`,
+system libraries) are resolved over the same connection via
+`wopQueryPathInfo` BFS instead of spawning `nix-store -qR` per root. If
+the daemon connection fails, cargo-schnee falls back to the nix CLI for
+both registration and closure queries.
 
 When cargo-schnee itself runs inside a Nix derivation, as is the case with
 `buildRustPackage` integration, the outer build must have
@@ -1006,10 +1012,18 @@ cargo schnee build --no-graph-cache \
 
 ### Pre-computed unit graphs
 
-For consumers of `lib.buildPackage` who hit the planner's ~7 s cargo
-bootstrap on every clean derivation build, `lib.unitGraph` produces a
-content-addressed derivation containing the workspace's unit graph.
-Wire it through the buildPackage `env`:
+The planner's cargo bootstrap (resolve + unit extraction) is the
+largest phase of a warm replan. `lib.unitGraph` moves it into its own
+derivation containing the workspace's unit graph. The graph takes `src`
+as an input, so any source edit rebuilds it; the reuse it buys is
+across consumers of one source, not across edits to it.
+
+`lib.buildPackage` wires this automatically whenever the
+resolver-relevant selection is fully expressed in structured args
+(`package`, `features`, `noDefaultFeatures`, `buildType`, `target`,
+`intent`); any `cargoExtraArgs` entry disables it, since those flags
+could affect resolution invisibly. Pass `autoUnitGraph = false` to opt
+out, or wire a graph manually through the buildPackage `env`:
 
 ```nix
 let

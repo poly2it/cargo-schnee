@@ -13,9 +13,11 @@
 # feature set. Any change invalidates the derivation; identical inputs
 # share the same store path across builds, branches, and machines.
 #
-# This helper is exposed as `self.lib.unitGraph`. Wire it into a
-# downstream `buildPackage` invocation by passing the realised path as
-# `CARGO_SCHNEE_UNIT_GRAPH`:
+# This helper is exposed as `self.lib.unitGraph`. `buildPackage` wires
+# it in automatically whenever the resolver-relevant selection is fully
+# expressed in structured args (see `autoUnitGraph` there); manual
+# wiring stays available for consumers that need resolver flags inside
+# `cargoExtraArgs`:
 #
 #   buildPackage = self.lib.buildPackage;
 #   unitGraph    = self.lib.unitGraph;
@@ -25,12 +27,6 @@
 #     inherit pkgs src cargoDeps rustToolchain;
 #     env = { CARGO_SCHNEE_UNIT_GRAPH = "${gp}"; };
 #   };
-#
-# `buildPackage` does not call `unitGraph` automatically because the
-# resolver-input declaration belongs to the consumer — features and
-# package selection that today live inside `cargoExtraArgs` would have
-# to be lifted out, and we want callers to make the trade-off
-# explicitly until the wider integration is settled.
 { self }:
 
 {

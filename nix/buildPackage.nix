@@ -97,6 +97,18 @@
   # `lib.testPackage` and `lib.clippyPackage` override to `test` /
   # `clippy`.  Internal-ish — most callers use the `lib.*` wrappers.
   intent ? "build",
+  # Pre-compute the cargo unit graph as a separate derivation
+  # (`lib.unitGraph`) and hand it to the planner via
+  # `CARGO_SCHNEE_UNIT_GRAPH`, so warm replans skip the full cargo
+  # resolve + bcx bootstrap — the single largest planner phase.  Only
+  # takes effect when every resolver-relevant flag is expressed in
+  # structured args: anything in `cargoExtraArgs` could affect
+  # resolution invisibly, so its presence disables the graph and the
+  # planner bootstraps as before.  cargo-schnee validates the embedded
+  # cache key on load and silently falls back on mismatch, so a stale
+  # or mismatched graph can never produce a wrong plan — only a slower
+  # one.
+  autoUnitGraph ? true,
   # Key into `[workspace.metadata.schnee.resolution]` in the workspace
   # manifest, keyed by target triple with a `default` fallback — so the
   # natural value is the target triple.  Declaring it makes cargo resolve
@@ -375,8 +387,36 @@ let
     if unitSetup == [] then null
     else builtins.toJSON (map validateUnitSetupRule unitSetup);
 
+  # -- unit-graph auto-wiring --------------------------------------------
+  # clippy plans with the same unit set as check (local units swap rustc
+  # for clippy-driver at execution, not planning, time — see
+  # `SchneeCommand::Clippy` in src/main.rs), and `compute-graph` only
+  # accepts the planner-level intents.
+  graphIntent = if intent == "clippy" then "check" else intent;
+  autoUnitGraphOn =
+    autoUnitGraph
+    && cargoExtraArgs == []
+    && builtins.elem graphIntent [ "build" "check" "test" "bench" "doc" ]
+    && !(env ? CARGO_SCHNEE_UNIT_GRAPH);
+  # `resolutionScope` has to reach the graph too.  cargo-schnee keys the
+  # cached graph on the scope, so a graph computed without it fails the
+  # key check on load, and `parse_unit_graph_file` answers a mismatch by
+  # warning and bootstrapping afresh.  A derivation that succeeds discards
+  # its stderr, so the symptom would be a correct build that shares
+  # nothing, with no diagnostic anywhere.
+  unitGraphDrv = self.lib.unitGraph {
+    inherit pkgs src rustToolchain buildType target features
+      noDefaultFeatures resolutionScope;
+    cargoDeps = effectiveCargoDeps;
+    packages = lib.optionals (package != null) [ package ];
+    intent = graphIntent;
+  };
+
   # -- planner env --------------------------------------------------------
   plannerEnv = env
+    // lib.optionalAttrs autoUnitGraphOn {
+      CARGO_SCHNEE_UNIT_GRAPH = "${unitGraphDrv}";
+    }
     // lib.optionalAttrs (passthruEnv != []) {
       CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
     }

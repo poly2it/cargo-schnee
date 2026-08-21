@@ -2119,6 +2119,28 @@ pub fn run_plan_nix(
     closure_store_paths.sort();
     closure_store_paths.dedup();
 
+    // The daemon connection serves both the closure queries below and
+    // derivation registration later; connect once, up front. Verify
+    // mode skips it: that path always re-adds via the CLI to compare
+    // paths.
+    let mut daemon: Option<NixDaemonConn> = if !verify_drv_paths {
+        match NixDaemonConn::connect() {
+            Ok(conn) => {
+                info!("Connected to Nix daemon");
+                Some(conn)
+            }
+            Err(e) => {
+                info!(
+                    "Cannot connect to Nix daemon ({}), falling back to the nix CLI",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None // verify mode always uses nix derivation add
+    };
+
     // Separate cached vs uncached store paths
     let uncached: Vec<&str> = closure_store_paths
         .iter()
@@ -2140,9 +2162,35 @@ pub fn run_plan_nix(
             uncached.len()
         );
 
-        // Query all uncached closures in parallel
+        // Preferred path: BFS over the daemon connection. Exec-ing the
+        // nix CLI once per root costs more in dynamic-linker relocation
+        // than the actual store work (~40% of all planner CPU samples
+        // in profiles); the same information is one wopQueryPathInfo
+        // round trip per closure path, memoized across roots.
+        let mut remaining: Vec<&str> = Vec::new();
+        if let Some(conn) = daemon.as_mut() {
+            let mut refs_memo: HashMap<String, Vec<String>> = HashMap::new();
+            for store_path in &uncached {
+                match conn.query_closure(store_path, &mut refs_memo) {
+                    Ok(closure) => {
+                        closure_cache.insert(store_path.to_string(), closure);
+                    }
+                    Err(e) => {
+                        info!(
+                            "Daemon closure query failed for {}: {}; falling back to nix-store -qR",
+                            store_path, e
+                        );
+                        remaining.push(store_path);
+                    }
+                }
+            }
+        } else {
+            remaining = uncached.clone();
+        }
+
+        // Fallback: query the leftover closures via CLI spawns, in parallel.
         let results: Vec<(String, Result<Vec<String>>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = uncached
+            let handles: Vec<_> = remaining
                 .iter()
                 .map(|store_path| {
                     let sp = store_path.to_string();
@@ -2268,24 +2316,6 @@ pub fn run_plan_nix(
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
 
-    let mut daemon: Option<NixDaemonConn> = if !verify_drv_paths {
-        match NixDaemonConn::connect() {
-            Ok(conn) => {
-                info!("Connected to Nix daemon");
-                Some(conn)
-            }
-            Err(e) => {
-                info!(
-                    "Cannot connect to Nix daemon ({}), falling back to nix derivation add",
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None // verify mode always uses nix derivation add
-    };
-
     // Cap on how many daemon connections to use in parallel for cache-miss
     // registration. Honoured per level (capped further by the level's
     // miss count), so small levels do not over-allocate. `verify_drv_paths`
@@ -2318,125 +2348,170 @@ pub fn run_plan_nix(
         crate::add_to_nix_store(p)
     })?;
 
+    // Phase 1: construct every unit's derivation JSON, ATerm bytes, and
+    // `.drv` store path, level by level. Paths are computed client-side,
+    // so construction never touches the daemon: each level's computed
+    // paths seed `dep_drv_map` for the next level's inputDrvs (a
+    // registration mismatch aborts the run before the plan is used, so
+    // seeding ahead of registration is safe). Units within a level are
+    // independent and are constructed in parallel.
+    let mut levels_units: Vec<Vec<LevelUnit>> = Vec::with_capacity(topo_levels.len());
     for (level_idx, level) in topo_levels.iter().enumerate() {
         let _level_span =
-            tracing::info_span!("level", idx = level_idx, width = level.len(),).entered();
-        // Construct derivation JSONs — all deps are resolved from previous levels
-        let jsons: Vec<(usize, serde_json::Value)> = level
-            .iter()
-            .map(|&i| {
-                // Select host or target linker based on unit classification.
-                // system is always host — derivations run on the build machine,
-                // rustc's --target flag handles cross-compilation.
-                // BuildScriptRun always executes on the host and needs the host
-                // cc (even though for_host is false — that flag describes what
-                // the output targets, not the execution environment).
-                let (unit_cc_bin_dir, unit_cc_closure) =
-                    if nix_units[i].for_host || nix_units[i].kind == UnitKind::BuildScriptRun {
-                        (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
-                    } else {
-                        (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
-                    };
-                let setup_scripts = unit_setup_scripts(&nix_units[i], unit_setup);
-                let json = construct_derivation(
-                    &nix_units,
-                    i,
-                    &key_to_idx,
-                    &dep_drv_map,
-                    &bash_path,
-                    &bash_store,
-                    &rustc_str,
-                    &rustdoc_str,
-                    &proc_macro_rlib,
-                    &rustc_store,
-                    &mkdir_path,
-                    &coreutils_store,
-                    unit_cc_bin_dir,
-                    unit_cc_closure,
-                    &target.nix_system,
-                    &rustc_closure,
-                    &pkg_config_bin,
-                    &pkg_config_path_env,
-                    &sys_build_closure,
-                    profile,
-                    target,
-                    &cfg_envs,
-                    &host_cfg_envs,
-                    &custom_sys_env,
-                    passthru_envs,
-                    &vendor_dir.to_string_lossy(),
-                    &win_sdk_lib_dirs,
-                    &win_sdk_closure,
-                    &unit_src_store[i],
-                    document_private_items,
-                    &passthru_closure,
-                    if clippy_str.is_empty() {
-                        None
-                    } else {
-                        Some(&clippy_str)
-                    },
-                    &clippy_closure,
-                    clippy_lint_args,
-                    path_prefix_remaps,
-                    &setup_scripts,
-                )?;
-                tracing::debug!(
-                    "Adding derivation for {}: {}",
-                    nix_units[i].key,
-                    serde_json::to_string_pretty(&json)?
-                );
-                Ok((i, json))
+            tracing::info_span!("construct_level", idx = level_idx, width = level.len(),).entered();
+        // All deps are resolved from previous levels' computed paths.
+        let construct_one = |i: usize| -> Result<LevelUnit> {
+            // Select host or target linker based on unit classification.
+            // system is always host — derivations run on the build machine,
+            // rustc's --target flag handles cross-compilation.
+            // BuildScriptRun always executes on the host and needs the host
+            // cc (even though for_host is false — that flag describes what
+            // the output targets, not the execution environment).
+            let (unit_cc_bin_dir, unit_cc_closure) =
+                if nix_units[i].for_host || nix_units[i].kind == UnitKind::BuildScriptRun {
+                    (host_cc_bin_dir.as_str(), host_cc_closure.as_slice())
+                } else {
+                    (target_cc_bin_dir.as_str(), target_cc_closure.as_slice())
+                };
+            let setup_scripts = unit_setup_scripts(&nix_units[i], unit_setup);
+            let json = construct_derivation(
+                &nix_units,
+                i,
+                &key_to_idx,
+                &dep_drv_map,
+                &bash_path,
+                &bash_store,
+                &rustc_str,
+                &rustdoc_str,
+                &proc_macro_rlib,
+                &rustc_store,
+                &mkdir_path,
+                &coreutils_store,
+                unit_cc_bin_dir,
+                unit_cc_closure,
+                &target.nix_system,
+                &rustc_closure,
+                &pkg_config_bin,
+                &pkg_config_path_env,
+                &sys_build_closure,
+                profile,
+                target,
+                &cfg_envs,
+                &host_cfg_envs,
+                &custom_sys_env,
+                passthru_envs,
+                &vendor_dir.to_string_lossy(),
+                &win_sdk_lib_dirs,
+                &win_sdk_closure,
+                &unit_src_store[i],
+                document_private_items,
+                &passthru_closure,
+                if clippy_str.is_empty() {
+                    None
+                } else {
+                    Some(&clippy_str)
+                },
+                &clippy_closure,
+                clippy_lint_args,
+                path_prefix_remaps,
+                &setup_scripts,
+            )?;
+            tracing::debug!(
+                "Adding derivation for {}: {}",
+                nix_units[i].key,
+                serde_json::to_string_pretty(&json)?
+            );
+            let drv_file_name = format!("{}.drv", nix_units[i].drv_name);
+            let aterm = serialize_derivation_aterm(&json)?;
+            let refs = collect_drv_refs(&json);
+            let ref_strs: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
+            let drv_path = compute_drv_store_path(&drv_file_name, &aterm, &ref_strs);
+            Ok(LevelUnit {
+                i,
+                unit_key: nix_units[i].key.clone(),
+                json,
+                drv_file_name,
+                aterm,
+                refs,
+                drv_path,
             })
-            .collect::<Result<_>>()?;
-
-        // Pre-compute every unit's `.drv` path, ATerm bytes, and refs so
-        // the validity probe can run once for the whole level. Units of
-        // a level are dependency-disjoint by construction so all paths
-        // can be computed before any daemon round-trip.
-        let level_units: Vec<LevelUnit> = jsons
-            .into_iter()
-            .map(|(i, json)| -> Result<LevelUnit> {
-                let drv_file_name = format!("{}.drv", nix_units[i].drv_name);
-                let aterm = serialize_derivation_aterm(&json)?;
-                let refs = collect_drv_refs(&json);
-                let ref_strs: Vec<&str> = refs.iter().map(|s| s.as_str()).collect();
-                let drv_path = compute_drv_store_path(&drv_file_name, &aterm, &ref_strs);
-                Ok(LevelUnit {
-                    i,
-                    unit_key: nix_units[i].key.clone(),
-                    json,
-                    drv_file_name,
-                    aterm,
-                    refs,
-                    drv_path,
-                })
-            })
-            .collect::<Result<_>>()?;
-
-        // Batch the validity probe into a single `wopQueryValidPaths`
-        // call. Replaces N per-unit `is_valid_path` round-trips with
-        // one. Skipped in `--verify-drv-paths` mode (which always re-
-        // adds via the CLI to compare paths) and when the daemon is
-        // unavailable (the per-unit path falls through to the CLI).
-        let valid_paths: std::collections::HashSet<String> = if verify_drv_paths {
-            std::collections::HashSet::new()
-        } else if let Some(ref mut conn) = daemon {
-            let _s =
-                tracing::info_span!("query_valid_paths_batched", n = level_units.len(),).entered();
-            let paths: Vec<&str> = level_units.iter().map(|u| u.drv_path.as_str()).collect();
-            match conn.query_valid_paths(&paths) {
-                Ok(set) => set,
-                Err(e) => {
-                    info!(
-                        "query_valid_paths failed: {}; treating all paths as cache misses",
-                        e
-                    );
-                    std::collections::HashSet::new()
-                }
-            }
-        } else {
-            std::collections::HashSet::new()
         };
+
+        let level_units: Vec<LevelUnit> = if parallel_jobs > 1 && level.len() > 1 {
+            let n_workers = std::cmp::min(parallel_jobs, level.len());
+            let chunks = chunk_round_robin(level.clone(), n_workers);
+            std::thread::scope(|s| -> Result<Vec<LevelUnit>> {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let f = &construct_one;
+                        s.spawn(move || {
+                            chunk.into_iter().map(f).collect::<Result<Vec<LevelUnit>>>()
+                        })
+                    })
+                    .collect();
+                let mut all = Vec::with_capacity(level.len());
+                for h in handles {
+                    let chunk_units = h
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("construction worker panicked"))??;
+                    all.extend(chunk_units);
+                }
+                Ok(all)
+            })?
+        } else {
+            level
+                .iter()
+                .map(|&i| construct_one(i))
+                .collect::<Result<_>>()?
+        };
+
+        for u in &level_units {
+            dep_drv_map.insert(u.unit_key.clone(), u.drv_path.clone());
+            nix_units[u.i].drv_path = Some(u.drv_path.clone());
+        }
+        levels_units.push(level_units);
+    }
+
+    // Phase 2: one validity probe for the entire DAG. Client-side path
+    // computation needs no daemon confirmation between levels, so every
+    // unit can be checked in a single `wopQueryValidPaths` round trip
+    // instead of one per level. Skipped in `--verify-drv-paths` mode
+    // (which always re-adds via the CLI to compare paths) and when the
+    // daemon is unavailable (the per-unit path falls through to the CLI).
+    let valid_paths: std::collections::HashSet<String> = if verify_drv_paths {
+        std::collections::HashSet::new()
+    } else if let Some(ref mut conn) = daemon {
+        let paths: Vec<&str> = levels_units
+            .iter()
+            .flatten()
+            .map(|u| u.drv_path.as_str())
+            .collect();
+        let _s = tracing::info_span!("query_valid_paths_batched", n = paths.len(),).entered();
+        match conn.query_valid_paths(&paths) {
+            Ok(set) => set,
+            Err(e) => {
+                info!(
+                    "query_valid_paths failed: {}; treating all paths as cache misses",
+                    e
+                );
+                std::collections::HashSet::new()
+            }
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Phase 3: register cache misses, still level by level — a drv's
+    // referenced input drvs must be valid in the store before a drv
+    // depending on them can be added. `dep_drv_map` and
+    // `nix_units[.].drv_path` were already seeded with the computed
+    // paths in phase 1, and `register_unit` verifies the daemon returns
+    // exactly those paths, so registration is pure side effect here.
+    for (level_idx, level_units) in levels_units.into_iter().enumerate() {
+        let width = level_units.len();
+        let _level_span =
+            tracing::info_span!("register_level", idx = level_idx, width = width,).entered();
 
         // Verify mode short-circuits everything: every unit always re-adds
         // via the CLI so the in-process .drv path can be cross-checked
@@ -2459,24 +2534,15 @@ pub fn run_plan_nix(
                 }
                 tracing::debug!("Verified: {} -> {}", unit.unit_key, unit.drv_path);
                 cache_misses += 1;
-                dep_drv_map.insert(unit.unit_key.clone(), unit.drv_path.clone());
-                nix_units[unit.i].drv_path = Some(unit.drv_path);
             }
             continue;
         }
 
-        // Partition the level into cache hits (already in the store) and
-        // misses (need registration). The hits go straight to the
-        // dep_drv_map; misses are dispatched serially or in parallel
-        // depending on `parallel_jobs` and the miss count.
-        let (hits, misses): (Vec<LevelUnit>, Vec<LevelUnit>) = level_units
+        let misses: Vec<LevelUnit> = level_units
             .into_iter()
-            .partition(|u| valid_paths.contains(&u.drv_path));
-        cache_hits += hits.len();
-        for unit in hits {
-            dep_drv_map.insert(unit.unit_key.clone(), unit.drv_path.clone());
-            nix_units[unit.i].drv_path = Some(unit.drv_path);
-        }
+            .filter(|u| !valid_paths.contains(&u.drv_path))
+            .collect();
+        cache_hits += width - misses.len();
 
         if misses.is_empty() {
             continue;
@@ -2485,15 +2551,12 @@ pub fn run_plan_nix(
         let n_workers = std::cmp::min(parallel_jobs, misses.len());
         cache_misses += misses.len();
 
-        let registered: Vec<(usize, String)> = if n_workers <= 1 {
+        if n_workers <= 1 {
             // Serial path: reuse the daemon connection across levels.
-            let mut out = Vec::with_capacity(misses.len());
             for unit in misses {
                 let path = register_unit(&mut daemon, &unit)?;
                 info!("Added {} -> {}", unit.unit_key, path);
-                out.push((unit.i, path));
             }
-            out
         } else {
             // Parallel path: round-robin distribute misses across workers,
             // each spawning a fresh daemon connection inside its scope.
@@ -2507,36 +2570,26 @@ pub fn run_plan_nix(
             )
             .entered();
             let chunks = chunk_round_robin(misses, n_workers);
-            std::thread::scope(|s| -> Result<Vec<(usize, String)>> {
+            std::thread::scope(|s| -> Result<()> {
                 let handles: Vec<_> = chunks
                     .into_iter()
                     .map(|chunk| {
-                        s.spawn(move || -> Result<Vec<(usize, String)>> {
+                        s.spawn(move || -> Result<()> {
                             let mut conn = NixDaemonConn::connect().ok();
-                            let mut out = Vec::with_capacity(chunk.len());
                             for unit in chunk {
                                 let path = register_unit(&mut conn, &unit)?;
-                                out.push((unit.i, path));
+                                info!("Added {} -> {}", unit.unit_key, path);
                             }
-                            Ok(out)
+                            Ok(())
                         })
                     })
                     .collect();
-                let mut all = Vec::new();
                 for h in handles {
-                    let chunk_results = h
-                        .join()
+                    h.join()
                         .map_err(|_| anyhow::anyhow!("registration worker panicked"))??;
-                    all.extend(chunk_results);
                 }
-                Ok(all)
-            })?
-        };
-
-        for (i, drv_path) in registered {
-            let key = nix_units[i].key.clone();
-            dep_drv_map.insert(key, drv_path.clone());
-            nix_units[i].drv_path = Some(drv_path);
+                Ok(())
+            })?;
         }
     }
     drop(_register_span);
