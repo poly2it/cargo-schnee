@@ -97,6 +97,15 @@
   # `lib.testPackage` and `lib.clippyPackage` override to `test` /
   # `clippy`.  Internal-ish — most callers use the `lib.*` wrappers.
   intent ? "build",
+  # Key into `[workspace.metadata.schnee.resolution]` in the workspace
+  # manifest, keyed by target triple with a `default` fallback — so the
+  # natural value is the target triple.  Declaring it makes cargo resolve
+  # features over the scope rather than over this call's `package`
+  # selection, and demotes `package` to a post-resolution root filter.
+  # Several `buildPackage` calls naming the same scope therefore share
+  # every unit derivation they have in common, instead of each getting
+  # its own feature-unified graph.  `null` keeps the old behaviour.
+  resolutionScope ? null,
   ...
 }@args:
 
@@ -265,10 +274,12 @@ let
   targetFlags = lib.optionals (target != null) [ "--target" target ];
   featureFlags = lib.concatMap (f: [ "--features" f ]) features;
   noDefaultFlag = lib.optionals noDefaultFeatures [ "--no-default-features" ];
+  resolutionScopeFlags =
+    lib.optionals (resolutionScope != null) [ "--resolution-scope" resolutionScope ];
 
   schneeArgs =
     profileFlag ++ targetFlags ++ packageFlags ++ featureFlags
-    ++ noDefaultFlag ++ cargoExtraArgs;
+    ++ noDefaultFlag ++ resolutionScopeFlags ++ cargoExtraArgs;
   schneeArgsStr = lib.escapeShellArgs schneeArgs;
   postDashArgsStr =
     if postDashArgs == [] then ""

@@ -31,7 +31,7 @@ use cargo::core::compiler::UnitInterner;
 use cargo::ops::{self, CompileOptions};
 use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -261,10 +261,7 @@ pub(crate) fn unit_setup_scripts(unit: &NixUnit, rules: &[UnitSetupRule]) -> Vec
 /// only a warning because the same rule list is legitimately shared
 /// between build, test, and clippy packages, and e.g. a `test-compile`
 /// rule matches nothing in a plain build plan.
-pub(crate) fn unmatched_unit_setup_rules(
-    units: &[NixUnit],
-    rules: &[UnitSetupRule],
-) -> Vec<usize> {
+pub(crate) fn unmatched_unit_setup_rules(units: &[NixUnit], rules: &[UnitSetupRule]) -> Vec<usize> {
     rules
         .iter()
         .enumerate()
@@ -424,6 +421,338 @@ pub fn local_compile_drv_paths(units: &[NixUnit]) -> Vec<&str> {
         })
         .filter_map(|u| u.drv_path.as_deref())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Declared feature-resolution scope
+// ---------------------------------------------------------------------------
+
+/// The package selection cargo resolves features over, independent of which
+/// packages the caller actually asked to build.
+///
+/// Cargo unifies features across whatever a single command line names, so
+/// `-p a` and `-p b` produce two different graphs even where they overlap.
+/// A declared scope pins the resolution input for every invocation that
+/// names it, and `-p` is demoted to a post-resolution root filter — so
+/// sibling builds share their unit derivations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionSpec {
+    /// Every workspace member, mirroring `cargo --workspace`.
+    Workspace,
+    /// A hand-picked member list, mirroring `cargo -p`. `exclude` has
+    /// already been subtracted.
+    Packages(Vec<String>),
+    /// Every workspace member bar the listed ones, mirroring
+    /// `cargo --workspace --exclude`.
+    Exclude(Vec<String>),
+}
+
+impl ResolutionSpec {
+    /// Stable textual form of the resolved selection. Feeds the unit-graph
+    /// cache key so two invocations that name the same scope look up the
+    /// same entry.
+    fn cache_component(&self) -> String {
+        match self {
+            Self::Workspace => "workspace".to_string(),
+            Self::Packages(p) => format!("packages={}", p.join(",")),
+            Self::Exclude(e) => format!("exclude={}", e.join(",")),
+        }
+    }
+}
+
+/// A resolution scope together with the manifest key it was read from. The
+/// key is carried so diagnostics can name the exact table entry the user
+/// has to edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionScope {
+    pub key: String,
+    pub spec: ResolutionSpec,
+}
+
+impl ResolutionScope {
+    /// `workspace.metadata.schnee.resolution.<key>` — the manifest path
+    /// every scope diagnostic points at.
+    pub fn manifest_key(&self) -> String {
+        format!("workspace.metadata.schnee.resolution.{}", self.key)
+    }
+
+    /// Cache-key component: the requested key plus the selection it
+    /// resolved to.
+    pub fn cache_component(&self) -> String {
+        format!("scope:{}:{}", self.key, self.spec.cache_component())
+    }
+}
+
+/// Read a declared resolution scope from
+/// `[workspace.metadata.schnee.resolution]` in the workspace manifest.
+///
+/// The table is keyed by target triple with a `default` fallback; `key` is
+/// looked up first and `default` second. A value is either the string
+/// `"workspace"` or a table with `packages` and an optional `exclude`.
+///
+/// Read only from the `workspace` table, never `package`: a member
+/// declaring its own scope would reintroduce exactly the per-invocation
+/// divergence the scope exists to remove.
+pub fn read_resolution_scope(manifest_path: &Path, key: &str) -> Result<ResolutionScope> {
+    let content = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    let table = doc
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("resolution"))
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "resolution scope {:?} was requested but {} declares no \
+                 [workspace.metadata.schnee.resolution] table",
+                key,
+                manifest_path.display(),
+            )
+        })?;
+    let (resolved_key, value) = match table.get(key) {
+        Some(v) => (key.to_string(), v),
+        None => match table.get("default") {
+            Some(v) => ("default".to_string(), v),
+            None => anyhow::bail!(
+                "workspace.metadata.schnee.resolution in {} has neither a {:?} \
+                 key nor a `default` key",
+                manifest_path.display(),
+                key,
+            ),
+        },
+    };
+    let spec = parse_resolution_spec(value, &resolved_key, manifest_path)?;
+    Ok(ResolutionScope {
+        key: resolved_key,
+        spec,
+    })
+}
+
+fn parse_resolution_spec(
+    value: &toml::Value,
+    key: &str,
+    manifest_path: &Path,
+) -> Result<ResolutionSpec> {
+    let where_ = format!(
+        "workspace.metadata.schnee.resolution.{} in {}",
+        key,
+        manifest_path.display(),
+    );
+    if let Some(s) = value.as_str() {
+        anyhow::ensure!(
+            s == "workspace",
+            "{}: the only accepted string value is \"workspace\" (got {:?})",
+            where_,
+            s,
+        );
+        return Ok(ResolutionSpec::Workspace);
+    }
+    let table = value
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("{}: expected \"workspace\" or a table", where_))?;
+    for name in table.keys() {
+        anyhow::ensure!(
+            name == "packages" || name == "exclude",
+            "{}: unknown field {:?}, expected `packages` or `exclude`",
+            where_,
+            name,
+        );
+    }
+    let string_list = |field: &str| -> Result<Vec<String>> {
+        match table.get(field) {
+            None => Ok(Vec::new()),
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{}: `{}` must be an array of strings", where_, field)
+                })?
+                .iter()
+                .map(|e| {
+                    e.as_str().map(String::from).ok_or_else(|| {
+                        anyhow::anyhow!("{}: `{}` must be an array of strings", where_, field)
+                    })
+                })
+                .collect(),
+        }
+    };
+    let packages = string_list("packages")?;
+    let exclude = string_list("exclude")?;
+    if packages.is_empty() {
+        anyhow::ensure!(
+            !exclude.is_empty(),
+            "{}: needs `packages`, `exclude`, or the string \"workspace\"",
+            where_,
+        );
+        return Ok(ResolutionSpec::Exclude(exclude));
+    }
+    // `exclude` subtracts from an explicit `packages` list. Cargo itself
+    // only accepts `--exclude` alongside `--workspace`, so the subtraction
+    // happens here rather than being handed to the resolver.
+    let kept: Vec<String> = packages
+        .into_iter()
+        .filter(|p| !exclude.contains(p))
+        .collect();
+    anyhow::ensure!(
+        !kept.is_empty(),
+        "{}: `exclude` removes every entry of `packages`",
+        where_,
+    );
+    Ok(ResolutionSpec::Packages(kept))
+}
+
+/// The cargo package name a unit belongs to, taken from the standard
+/// `CARGO_PKG_NAME` env every unit carries.
+fn unit_package_name(unit: &NixUnit) -> &str {
+    unit.cargo_envs
+        .iter()
+        .find(|(k, _)| k == "CARGO_PKG_NAME")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Narrow a scope-wide unit graph to the packages the caller asked for.
+///
+/// `units` is the full graph cargo resolved over the declared scope, with
+/// `is_root` set on every scope root. This picks the roots belonging to
+/// `packages` (minus `exclude`), clears `is_root` elsewhere, and drops
+/// every unit no longer reachable from the surviving roots.
+///
+/// Because the resolution input is the scope rather than the request, two
+/// invocations naming different packages within one scope produce
+/// byte-identical derivations for the units they share — which is the
+/// whole point of declaring a scope.
+///
+/// An empty `packages` means "every root in the scope", so the graph is
+/// returned untouched.
+pub fn narrow_to_requested_roots(
+    units: Vec<NixUnit>,
+    packages: &[String],
+    exclude: &[String],
+    scope: &ResolutionScope,
+) -> Result<Vec<NixUnit>> {
+    let requested: Vec<&String> = packages.iter().filter(|p| !exclude.contains(p)).collect();
+    if packages.is_empty() && exclude.is_empty() {
+        return Ok(units);
+    }
+
+    // `packages` empty and `requested` empty mean different things, and
+    // conflating them inverts the selection: `-p a --exclude a` would fall
+    // into the scope-wide arm below and build every root except `a`, which
+    // is the opposite of what the caller asked for.
+    anyhow::ensure!(
+        !(requested.is_empty() && !packages.is_empty()),
+        "every requested package is also excluded: -p {} with --exclude {} \
+         selects nothing to build",
+        packages.join(", "),
+        exclude.join(", "),
+    );
+
+    // Hard error rather than a silent empty build: a package outside the
+    // scope means the manifest and the build definition disagree, and the
+    // manifest key is the thing that has to change.
+    let scope_packages: HashSet<&str> = units
+        .iter()
+        .filter(|u| u.is_root)
+        .map(unit_package_name)
+        .collect();
+    for pkg in &requested {
+        anyhow::ensure!(
+            scope_packages.contains(pkg.as_str()),
+            "package `{}` is not in the resolution scope declared at {}. \
+             Scope roots: {}",
+            pkg,
+            scope.manifest_key(),
+            {
+                let mut names: Vec<&str> = scope_packages.iter().copied().collect();
+                names.sort_unstable();
+                names.join(", ")
+            },
+        );
+    }
+
+    let mut units = units;
+    let mut root_indices: Vec<usize> = Vec::new();
+    for (i, unit) in units.iter_mut().enumerate() {
+        if !unit.is_root {
+            continue;
+        }
+        let pkg = unit_package_name(unit);
+        let keep = if packages.is_empty() {
+            !exclude.iter().any(|e| e == pkg)
+        } else {
+            requested.iter().any(|p| p.as_str() == pkg)
+        };
+        if keep {
+            root_indices.push(i);
+        } else {
+            unit.is_root = false;
+        }
+    }
+
+    let key_to_idx: HashMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.key.as_str(), i))
+        .collect();
+
+    // Reachability walk. `all_dep_keys` skips BuildScriptRun units and
+    // `links_dep_keys` is populated only on them, so neither is a subset
+    // of the other and both have to be walked. Dropping a links dep would
+    // silently strip a build script's `DEP_*` environment, so a dangling
+    // one is an error, not a skip.
+    let mut reachable: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = root_indices.clone();
+    while let Some(idx) = stack.pop() {
+        if !reachable.insert(idx) {
+            continue;
+        }
+        let unit = &units[idx];
+        let direct = unit.dep_extern.iter().map(|(_, k)| k.as_str());
+        let transitive = unit.all_dep_keys.iter().map(|k| k.as_str());
+        let scripts = unit
+            .build_script_dep
+            .iter()
+            .chain(unit.build_script_compile_key.iter())
+            .map(|k| k.as_str());
+        for dep_key in direct.chain(transitive).chain(scripts) {
+            if let Some(&dep_idx) = key_to_idx.get(dep_key) {
+                stack.push(dep_idx);
+            }
+        }
+        for (dep_key, links_name) in &unit.links_dep_keys {
+            let dep_idx = key_to_idx.get(dep_key.as_str()).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unit {} declares a links dependency on `{}` (key {}) that \
+                     is not in the plan; pruning it would strip the build \
+                     script's DEP_* environment",
+                    unit.key,
+                    links_name,
+                    dep_key,
+                )
+            })?;
+            stack.push(dep_idx);
+        }
+    }
+
+    let before = units.len();
+    drop(key_to_idx);
+    let kept: Vec<NixUnit> = units
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| reachable.contains(i))
+        .map(|(_, u)| u)
+        .collect();
+    tracing::info!(
+        scope = %scope.manifest_key(),
+        roots = root_indices.len(),
+        kept = kept.len(),
+        pruned = before - kept.len(),
+        "Narrowed scope graph to requested roots",
+    );
+    Ok(kept)
 }
 
 /// Read custom sys-env mappings from `[workspace.metadata.schnee.sys-env]` or
@@ -694,6 +1023,11 @@ pub fn fresh_unit_graph(
     features: &[String],
     no_default_features: bool,
     all_targets: bool,
+    // Declared feature-resolution scope. When present it — not the `-p`
+    // list — is what cargo resolves over, so every invocation naming the
+    // same scope gets the same graph; `packages` then only picks roots
+    // out of it (see `narrow_to_requested_roots`).
+    resolution: Option<&ResolutionScope>,
 ) -> Result<(Vec<NixUnit>, Vec<(String, String)>, Vec<(String, String)>)> {
     let manifest_path = src.join("Cargo.toml");
     if !manifest_path.exists() {
@@ -761,9 +1095,23 @@ pub fn fresh_unit_graph(
             cargo::core::compiler::CompileTarget::new(&target.target_triple)?,
         )];
     }
-    // Package selection: -p/--package narrows the build to specific crates,
-    // --exclude removes crates from the default workspace set.
-    if !packages.is_empty() {
+    // Package selection.  With a declared scope the selection comes from
+    // the manifest and is identical for every invocation naming that
+    // scope, which is what lets their unit derivations be shared; -p and
+    // --exclude are applied afterwards, to the roots only.  Without one,
+    // -p/--package narrows the build to specific crates and --exclude
+    // removes crates from the default workspace set.
+    if let Some(scope) = resolution {
+        tracing::info!(
+            scope = %scope.manifest_key(),
+            "Resolving features over declared scope",
+        );
+        options.spec = match &scope.spec {
+            ResolutionSpec::Workspace => ops::Packages::All(Vec::new()),
+            ResolutionSpec::Packages(p) => ops::Packages::Packages(p.clone()),
+            ResolutionSpec::Exclude(e) => ops::Packages::OptOut(e.clone()),
+        };
+    } else if !packages.is_empty() {
         options.spec = ops::Packages::Packages(packages.to_vec());
     } else if !exclude.is_empty() {
         options.spec = ops::Packages::OptOut(exclude.to_vec());
@@ -827,7 +1175,7 @@ fn assign_per_crate_src_stores(
 ) -> Result<Vec<String>> {
     let mut unit_src_store: Vec<String> = vec![src_str.to_string(); units.len()];
     let mut per_crate: HashMap<String, String> = HashMap::new();
-    for i in 0 .. units.len() {
+    for i in 0..units.len() {
         // Pick the root this unit's source lives under and whether to slice it.
         //
         // Change 1 (local crates): slice compile/test/doc units. A local
@@ -845,7 +1193,11 @@ fn assign_per_crate_src_stores(
         // store) the way the shared aggregate did.
         let (is_local, is_bsr, self_contained_bs) = {
             let u = &units[i];
-            (u.is_local, matches!(u.kind, UnitKind::BuildScriptRun), u.self_contained_build_script)
+            (
+                u.is_local,
+                matches!(u.kind, UnitKind::BuildScriptRun),
+                u.self_contained_build_script,
+            )
         };
         let (root, sliceable) = if is_local {
             (src_str, !is_bsr || self_contained_bs)
@@ -890,7 +1242,7 @@ fn assign_per_crate_src_stores(
                 };
                 per_crate.insert(cache_key, p.clone());
                 p
-            },
+            }
         };
         // Rewrite the unit's source paths from `{root}/{crate_rel}` onto the
         // crate-rooted store, and reference it as this unit's src_store.
@@ -958,7 +1310,10 @@ mod slice_tests {
     fn ca_add(p: &str) -> Result<String> {
         let nar = crate::nar::serialize_nar(Path::new(p), None)?;
         let name = Path::new(p).file_name().unwrap().to_string_lossy();
-        Ok(crate::nar::compute_nar_store_path(&format!("{name}-src"), &nar))
+        Ok(crate::nar::compute_nar_store_path(
+            &format!("{name}-src"),
+            &nar,
+        ))
     }
 
     fn write(p: &Path, s: &str) {
@@ -971,8 +1326,13 @@ mod slice_tests {
     /// canonicalize resolves to the per-crate target and a content change moves
     /// the target the way a real CA store path moves.
     fn vendor_symlink(vendor: &str, store: &str, name: &str, body: &str) {
-        let target = Path::new(store).join(format!("{:x}-{name}", md5_like(body))).join(name);
-        write(&target.join("Cargo.toml"), &format!("[package]\nname = \"{name}\"\n"));
+        let target = Path::new(store)
+            .join(format!("{:x}-{name}", md5_like(body)))
+            .join(name);
+        write(
+            &target.join("Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\n"),
+        );
         write(&target.join("src/lib.rs"), body);
         let link = Path::new(vendor).join(name);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
@@ -1005,10 +1365,22 @@ mod slice_tests {
         let src = tmp.path().join("src").to_string_lossy().to_string();
         let vendor = tmp.path().join("vendor").to_string_lossy().to_string();
         let store = tmp.path().join("store").to_string_lossy().to_string();
-        write(&Path::new(&src).join("crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n");
-        write(&Path::new(&src).join("crate-a/src/lib.rs"), "pub fn a() {}\n");
-        write(&Path::new(&src).join("crate-b/Cargo.toml"), "[package]\nname = \"crate-b\"\n");
-        write(&Path::new(&src).join("crate-b/src/lib.rs"), "pub fn b() {}\n");
+        write(
+            &Path::new(&src).join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\n",
+        );
+        write(
+            &Path::new(&src).join("crate-a/src/lib.rs"),
+            "pub fn a() {}\n",
+        );
+        write(
+            &Path::new(&src).join("crate-b/Cargo.toml"),
+            "[package]\nname = \"crate-b\"\n",
+        );
+        write(
+            &Path::new(&src).join("crate-b/src/lib.rs"),
+            "pub fn b() {}\n",
+        );
         vendor_symlink(&vendor, &store, "serde", "pub fn s() {}\n");
         vendor_symlink(&vendor, &store, "once_cell", "pub fn o() {}\n");
 
@@ -1029,9 +1401,18 @@ mod slice_tests {
         let s1 = assign_per_crate_src_stores(&mut units, &src, &vendor, ca_add).unwrap();
 
         // Local compile unit: sliced off the whole tree, paths rewritten onto it.
-        assert_ne!(s1[0], src, "crate-a compile unit must be sliced off the whole tree");
-        assert!(units[0].source_file.starts_with(&s1[0]), "source_file rewritten onto per-crate store");
-        assert_eq!(units[0].manifest_dir, s1[0], "manifest_dir rewritten onto per-crate store");
+        assert_ne!(
+            s1[0], src,
+            "crate-a compile unit must be sliced off the whole tree"
+        );
+        assert!(
+            units[0].source_file.starts_with(&s1[0]),
+            "source_file rewritten onto per-crate store"
+        );
+        assert_eq!(
+            units[0].manifest_dir, s1[0],
+            "manifest_dir rewritten onto per-crate store"
+        );
         // A sliced local unit records its project-src-relative dir so the
         // remap builder can keep diagnostics rooted at the real workspace path.
         assert_eq!(
@@ -1040,7 +1421,10 @@ mod slice_tests {
             "sliced local unit must record its crate_rel"
         );
         // Local build-script-run unit keeps the whole tree (sibling reads).
-        assert_eq!(s1[2], src, "local build-script-run unit keeps the whole-tree src_store");
+        assert_eq!(
+            s1[2], src,
+            "local build-script-run unit keeps the whole-tree src_store"
+        );
         assert_eq!(
             units[2].sliced_crate_rel, None,
             "non-sliced local unit must not record a crate_rel"
@@ -1052,21 +1436,46 @@ mod slice_tests {
             units[3].sliced_crate_rel, None,
             "vendored sliced unit must not record a crate_rel"
         );
-        assert_eq!(units[2].source_file, format!("{src}/crate-a/src/lib.rs"), "local build-script unit not rewritten");
+        assert_eq!(
+            units[2].source_file,
+            format!("{src}/crate-a/src/lib.rs"),
+            "local build-script unit not rewritten"
+        );
         // Change 3: a local build-script-run that opts into self-contained IS
         // sliced to its own per-crate source, so it stops re-keying on unrelated
         // workspace edits.
-        assert_ne!(s1[5], src, "self-contained local build-script-run unit must be sliced off the whole tree");
-        assert_eq!(units[5].manifest_dir, s1[5], "self-contained build-script unit manifest_dir rewritten onto per-crate store");
+        assert_ne!(
+            s1[5], src,
+            "self-contained local build-script-run unit must be sliced off the whole tree"
+        );
+        assert_eq!(
+            units[5].manifest_dir, s1[5],
+            "self-contained build-script unit manifest_dir rewritten onto per-crate store"
+        );
         // Vendored units: resolved through the symlink farm onto their per-crate
         // store target, including the vendored build-script-run unit (a vendored
         // crate is self-contained). The assigned store is the symlink TARGET, so
         // the unit's paths point at real content, not the unmounted symlink.
-        assert!(s1[3].starts_with(&store), "vendored serde resolves to its per-crate store target");
-        assert_eq!(units[3].manifest_dir, s1[3], "vendored serde manifest_dir rewritten onto per-crate target");
-        assert!(units[3].source_file.starts_with(&s1[3]), "vendored serde source_file rewritten onto its target");
-        assert!(s1[4].starts_with(&store), "vendored once_cell build-script-run unit resolves to its target");
-        assert_eq!(units[4].manifest_dir, s1[4], "vendored once_cell manifest_dir rewritten onto per-crate target");
+        assert!(
+            s1[3].starts_with(&store),
+            "vendored serde resolves to its per-crate store target"
+        );
+        assert_eq!(
+            units[3].manifest_dir, s1[3],
+            "vendored serde manifest_dir rewritten onto per-crate target"
+        );
+        assert!(
+            units[3].source_file.starts_with(&s1[3]),
+            "vendored serde source_file rewritten onto its target"
+        );
+        assert!(
+            s1[4].starts_with(&store),
+            "vendored once_cell build-script-run unit resolves to its target"
+        );
+        assert_eq!(
+            units[4].manifest_dir, s1[4],
+            "vendored once_cell manifest_dir rewritten onto per-crate target"
+        );
 
         let a_store_before = s1[0].clone();
         let b_store_before = s1[1].clone();
@@ -1074,15 +1483,30 @@ mod slice_tests {
         let once_cell_before = s1[4].clone();
 
         // Edit ONLY local crate-b and vendored once_cell; re-run on fresh units.
-        write(&Path::new(&src).join("crate-b/src/lib.rs"), "pub fn b() { let _ = 1; }\n");
+        write(
+            &Path::new(&src).join("crate-b/src/lib.rs"),
+            "pub fn b() { let _ = 1; }\n",
+        );
         vendor_symlink(&vendor, &store, "once_cell", "pub fn o() { let _ = 1; }\n");
         let mut units2 = mk();
         let s2 = assign_per_crate_src_stores(&mut units2, &src, &vendor, ca_add).unwrap();
 
-        assert_eq!(s2[0], a_store_before, "editing crate-b must NOT change crate-a's assigned source store");
-        assert_ne!(s2[1], b_store_before, "crate-b's own assigned source store changes");
-        assert_eq!(s2[3], serde_store_before, "bumping once_cell must NOT change serde's per-crate vendor target");
-        assert_ne!(s2[4], once_cell_before, "once_cell's own per-crate vendor target changes");
+        assert_eq!(
+            s2[0], a_store_before,
+            "editing crate-b must NOT change crate-a's assigned source store"
+        );
+        assert_ne!(
+            s2[1], b_store_before,
+            "crate-b's own assigned source store changes"
+        );
+        assert_eq!(
+            s2[3], serde_store_before,
+            "bumping once_cell must NOT change serde's per-crate vendor target"
+        );
+        assert_ne!(
+            s2[4], once_cell_before,
+            "once_cell's own per-crate vendor target changes"
+        );
     }
 }
 
@@ -1256,14 +1680,14 @@ mod unit_setup_tests {
         let rules = [
             rule("my-bakend", "", "", "/nix/store/typo"),
             rule("my-backend", "", "", "/nix/store/hit"),
-            rule("my-backend", r#"["test-compile"]"#, "", "/nix/store/wrong-kind"),
+            rule(
+                "my-backend",
+                r#"["test-compile"]"#,
+                "",
+                "/nix/store/wrong-kind",
+            ),
         ];
-        let units = [unit(
-            "my-backend",
-            "my-backend",
-            UnitKind::Check,
-            true,
-        )];
+        let units = [unit("my-backend", "my-backend", UnitKind::Check, true)];
         assert_eq!(unmatched_unit_setup_rules(&units, &rules), [0, 2]);
     }
 
@@ -1341,6 +1765,12 @@ pub fn run_plan_nix(
     // `cargo schnee clippy --all-targets` so lint coverage extends to
     // test modules and example crates.
     all_targets: bool,
+    // Declared feature-resolution scope, already read from the workspace
+    // manifest by the caller.  Applies identically to the fresh and the
+    // cached path: `is_root` and `target_name` are serialised into the
+    // cache entry, so the cached graph is a whole-scope graph that still
+    // has to be narrowed to the roots this invocation asked for.
+    resolution: Option<&ResolutionScope>,
 ) -> Result<(
     Vec<(String, String, UnitKind)>,
     Vec<NixUnit>,
@@ -1406,8 +1836,18 @@ pub fn run_plan_nix(
                 features,
                 no_default_features,
                 all_targets,
+                resolution,
             )?
         };
+    // Both branches above yield the whole-scope graph when a scope is
+    // declared — the cached one because `is_root` is serialised as it was
+    // for the scope, the fresh one because `fresh_unit_graph` hands back
+    // every root cargo resolved.  Narrowing therefore has to happen here,
+    // on the joined path, or a cache hit and a cache miss would plan
+    // different unit sets.
+    if let Some(scope) = resolution {
+        nix_units = narrow_to_requested_roots(nix_units, packages, exclude, scope)?;
+    }
     tracing::Span::current().record("crate_count", nix_units.len());
     drop(_extract_span);
     tracing::info!(units = nix_units.len(), "extract_units complete");
@@ -2301,8 +2741,273 @@ source = \"git+https://example.com/pinned?branch=main#abc123abc123abc123abc123ab
         assert!(cfg.contains("branch = \"main\""));
 
         // Both git sources redirect to vendored copies …
-        assert_eq!(cfg.matches("replace-with = \"vendored-sources\"").count(), 2);
+        assert_eq!(
+            cfg.matches("replace-with = \"vendored-sources\"").count(),
+            2
+        );
         // … and the crates.io registry dep is left to the existing crates-io redirect.
         assert!(!cfg.contains("crates.io-index"));
+    }
+}
+
+#[cfg(test)]
+mod resolution_scope_tests {
+    use super::*;
+
+    fn manifest(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn target_key_wins_over_default() {
+        let (_d, p) = manifest(
+            "[workspace.metadata.schnee.resolution]\n\
+             default = \"workspace\"\n\
+             x86_64-pc-windows-msvc = { packages = [\"a\", \"b\"] }\n",
+        );
+        let scope = read_resolution_scope(&p, "x86_64-pc-windows-msvc").unwrap();
+        assert_eq!(scope.key, "x86_64-pc-windows-msvc");
+        assert_eq!(
+            scope.spec,
+            ResolutionSpec::Packages(vec!["a".into(), "b".into()]),
+        );
+    }
+
+    #[test]
+    fn unknown_key_falls_back_to_default() {
+        let (_d, p) = manifest("[workspace.metadata.schnee.resolution]\ndefault = \"workspace\"\n");
+        let scope = read_resolution_scope(&p, "aarch64-unknown-linux-gnu").unwrap();
+        assert_eq!(scope.key, "default");
+        assert_eq!(scope.spec, ResolutionSpec::Workspace);
+        assert_eq!(
+            scope.manifest_key(),
+            "workspace.metadata.schnee.resolution.default",
+        );
+    }
+
+    #[test]
+    fn exclude_subtracts_from_packages() {
+        let (_d, p) = manifest(
+            "[workspace.metadata.schnee.resolution]\n\
+             default = { packages = [\"a\", \"b\", \"c\"], exclude = [\"b\"] }\n",
+        );
+        let scope = read_resolution_scope(&p, "default").unwrap();
+        assert_eq!(
+            scope.spec,
+            ResolutionSpec::Packages(vec!["a".into(), "c".into()]),
+        );
+    }
+
+    #[test]
+    fn exclude_alone_opts_out_of_the_workspace() {
+        let (_d, p) = manifest(
+            "[workspace.metadata.schnee.resolution]\n\
+             default = { exclude = [\"slow\"] }\n",
+        );
+        let scope = read_resolution_scope(&p, "default").unwrap();
+        assert_eq!(scope.spec, ResolutionSpec::Exclude(vec!["slow".into()]));
+    }
+
+    /// A member declaring its own scope would reintroduce the divergence
+    /// the scope exists to remove, so only the workspace table is read.
+    #[test]
+    fn package_table_is_not_read() {
+        let (_d, p) = manifest("[package.metadata.schnee.resolution]\ndefault = \"workspace\"\n");
+        let err = read_resolution_scope(&p, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[workspace.metadata.schnee.resolution]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn missing_key_and_no_default_is_an_error() {
+        let (_d, p) = manifest(
+            "[workspace.metadata.schnee.resolution]\nx86_64-pc-windows-msvc = \"workspace\"\n",
+        );
+        let err = read_resolution_scope(&p, "aarch64-apple-darwin")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`default` key"), "{err}");
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let (_d, p) =
+            manifest("[workspace.metadata.schnee.resolution]\ndefault = { members = [\"a\"] }\n");
+        let err = read_resolution_scope(&p, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn only_workspace_is_an_accepted_string() {
+        let (_d, p) = manifest("[workspace.metadata.schnee.resolution]\ndefault = \"all\"\n");
+        let err = read_resolution_scope(&p, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"workspace\""), "{err}");
+    }
+
+    #[test]
+    fn cache_component_names_key_and_selection() {
+        let scope = ResolutionScope {
+            key: "x86_64-pc-windows-msvc".into(),
+            spec: ResolutionSpec::Packages(vec!["a".into(), "b".into()]),
+        };
+        assert_eq!(
+            scope.cache_component(),
+            "scope:x86_64-pc-windows-msvc:packages=a,b",
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::*;
+
+    fn scope() -> ResolutionScope {
+        ResolutionScope {
+            key: "x86_64-pc-windows-msvc".into(),
+            spec: ResolutionSpec::Workspace,
+        }
+    }
+
+    fn unit(key: &str, pkg: &str, kind: UnitKind, is_root: bool) -> NixUnit {
+        NixUnit {
+            key: key.to_string(),
+            drv_name: key.to_string(),
+            kind,
+            source_file: String::new(),
+            crate_name: pkg.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".to_string(),
+            features: vec![],
+            dep_extern: vec![],
+            all_dep_keys: vec![],
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: String::new(),
+            original_manifest_dir: String::new(),
+            cargo_envs: vec![("CARGO_PKG_NAME".to_string(), pkg.to_string())],
+            extra_filename: String::new(),
+            needs_linker: false,
+            is_local: true,
+            links: None,
+            links_dep_keys: vec![],
+            is_root,
+            target_name: pkg.to_string(),
+            for_host: false,
+            compile_test: false,
+            self_contained_build_script: false,
+            sliced_crate_rel: None,
+            drv_path: None,
+        }
+    }
+
+    fn keys(units: &[NixUnit]) -> Vec<&str> {
+        units.iter().map(|u| u.key.as_str()).collect()
+    }
+
+    /// Two scope roots sharing a dependency: asking for one keeps the
+    /// shared dep and drops the sibling's exclusive subtree.
+    #[test]
+    fn siblings_are_pruned_but_shared_deps_survive() {
+        let mut a = unit("a", "a", UnitKind::Compile, true);
+        a.dep_extern = vec![("shared".into(), "shared".into())];
+        let mut b = unit("b", "b", UnitKind::Compile, true);
+        b.dep_extern = vec![
+            ("shared".into(), "shared".into()),
+            ("only_b".into(), "only-b".into()),
+        ];
+        let units = vec![
+            a,
+            b,
+            unit("shared", "shared", UnitKind::Compile, false),
+            unit("only-b", "only-b", UnitKind::Compile, false),
+        ];
+        let kept = narrow_to_requested_roots(units, &["a".to_string()], &[], &scope()).unwrap();
+        assert_eq!(keys(&kept), vec!["a", "shared"]);
+        assert!(kept[0].is_root);
+        assert!(!kept[1].is_root);
+    }
+
+    /// `all_dep_keys` skips BuildScriptRun units and `links_dep_keys` is
+    /// populated only on them, so a walk over either alone loses edges.
+    #[test]
+    fn links_deps_are_followed_off_build_script_runs() {
+        let mut root = unit("root", "root", UnitKind::Compile, true);
+        root.build_script_dep = Some("run".into());
+        let mut run = unit("run", "root", UnitKind::BuildScriptRun, false);
+        run.build_script_compile_key = Some("bsc".into());
+        run.links_dep_keys = vec![("sys-run".into(), "z".into())];
+        let units = vec![
+            root,
+            run,
+            unit("bsc", "root", UnitKind::BuildScriptCompile, false),
+            unit("sys-run", "z-sys", UnitKind::BuildScriptRun, false),
+            unit("unrelated", "unrelated", UnitKind::Compile, false),
+        ];
+        let kept = narrow_to_requested_roots(units, &["root".to_string()], &[], &scope()).unwrap();
+        assert_eq!(keys(&kept), vec!["root", "run", "bsc", "sys-run"]);
+    }
+
+    /// A links dep that resolves to nothing would silently cost the build
+    /// script its `DEP_*` environment, so it is an error, not a skip.
+    #[test]
+    fn dangling_links_dep_is_an_error() {
+        let mut root = unit("root", "root", UnitKind::Compile, true);
+        root.build_script_dep = Some("run".into());
+        let mut run = unit("run", "root", UnitKind::BuildScriptRun, false);
+        run.links_dep_keys = vec![("gone".into(), "z".into())];
+        let err = narrow_to_requested_roots(vec![root, run], &["root".to_string()], &[], &scope())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DEP_*"), "{err}");
+    }
+
+    #[test]
+    fn requesting_a_non_scope_package_names_the_manifest_key() {
+        let units = vec![unit("a", "a", UnitKind::Compile, true)];
+        let err = narrow_to_requested_roots(units, &["b".to_string()], &[], &scope())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("workspace.metadata.schnee.resolution.x86_64-pc-windows-msvc"),
+            "{err}",
+        );
+    }
+
+    /// No `-p` means "every root in the scope", so nothing is narrowed.
+    #[test]
+    fn empty_request_keeps_the_whole_scope() {
+        let units = vec![
+            unit("a", "a", UnitKind::Compile, true),
+            unit("orphan", "orphan", UnitKind::Compile, false),
+        ];
+        let kept = narrow_to_requested_roots(units, &[], &[], &scope()).unwrap();
+        assert_eq!(keys(&kept), vec!["a", "orphan"]);
+    }
+
+    /// Excluding everything that was requested selects nothing, which is an
+    /// error.  Treating it as "no request" would invert the selection and
+    /// build every root in the scope except the excluded one.
+    #[test]
+    fn requesting_and_excluding_the_same_package_is_an_error() {
+        let units = vec![
+            unit("a", "a", UnitKind::Compile, true),
+            unit("b", "b", UnitKind::Compile, true),
+        ];
+        let err =
+            narrow_to_requested_roots(units, &["a".to_string()], &["a".to_string()], &scope())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("selects nothing to build"), "{err}");
     }
 }

@@ -626,6 +626,49 @@ Files matching these patterns are added to the source tree even if they appear
 in `.gitignore`. Files outside the project directory are supported and are
 stored with a `.parent` prefix in the Nix store tree.
 
+### Sharing a resolution across packages
+
+Cargo unifies features across whatever a single command line names, so
+`-p a` and `-p b` resolve two different graphs even for the crates they
+share. Packaging each binary of a workspace separately therefore
+recompiles the common dependencies once per binary, with different
+feature sets and different unit derivations.
+
+Declare a resolution scope to pin the resolution input independently of
+the request. The table lives in the workspace manifest only — a member
+declaring its own scope would reintroduce the divergence — and is keyed
+by target triple with a `default` fallback:
+
+```toml
+[workspace.metadata.schnee.resolution]
+default = "workspace"
+x86_64-pc-windows-msvc = { packages = ["app", "installer", "updater"] }
+```
+
+A value is either the string `"workspace"`, meaning every member, or a
+table with `packages` and an optional `exclude`. Name the scope from
+`lib.buildPackage` and from `lib.unitGraph`:
+
+```nix
+self.lib.buildPackage {
+  inherit pkgs src cargoDeps;
+  package = "installer";
+  target = "x86_64-pc-windows-msvc";
+  resolutionScope = "x86_64-pc-windows-msvc";
+}
+```
+
+Cargo then resolves over the scope, and `package` becomes a
+post-resolution root filter: the plan is pruned to what the requested
+roots reach, and every sibling naming the same scope gets byte-identical
+derivations for the units they share. Asking for a package outside the
+scope is a hard error naming the manifest key.
+
+`lib.unitGraph` takes the same `resolutionScope`, so one pre-computed
+graph serves every package in the scope. Pass `allTargets = true` when
+the graph also has to serve a `--all-targets` clippy gate — that unit
+set is larger, and the cache key records the difference.
+
 ### Packaging with `lib.buildPackage`
 
 For straightforward packaging, `lib.buildPackage` handles all the toolchain

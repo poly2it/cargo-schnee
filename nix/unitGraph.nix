@@ -60,6 +60,18 @@
   # check vs test vs doc, so the cache key incorporates this and the
   # consumer must use the same value at lookup time.
   intent ? "build",
+  # Key into `[workspace.metadata.schnee.resolution]`. When set, the
+  # graph covers the whole declared scope rather than `packages`, and
+  # each consumer narrows it to its own roots on load. That is what
+  # lets one graph serve several `buildPackage` calls; the consumers
+  # must pass the same `resolutionScope`.
+  resolutionScope ? null,
+  # Mirrors `cargo --all-targets`: plan tests, examples and benches
+  # alongside lib + bins. A clippy gate runs `--all-targets`, and the
+  # unit set differs, so a graph meant to serve one must set this —
+  # otherwise the consumer's cache key rejects it and it silently
+  # bootstraps from scratch.
+  allTargets ? false,
   ...
 }:
 
@@ -78,6 +90,9 @@ let
   featureFlags = lib.concatMap (f: [ "--features" f ]) features;
   targetFlag   = lib.optionals (target != null) [ "--target" target ];
   noDefaultFlag = lib.optionals noDefaultFeatures [ "--no-default-features" ];
+  scopeFlag =
+    lib.optionals (resolutionScope != null) [ "--resolution-scope" resolutionScope ];
+  allTargetsFlag = lib.optionals allTargets [ "--all-targets" ];
 
   args = profileFlag
     ++ targetFlag
@@ -85,6 +100,8 @@ let
     ++ excludeFlags
     ++ featureFlags
     ++ noDefaultFlag
+    ++ scopeFlag
+    ++ allTargetsFlag
     ++ [ "--intent" intent ];
 
   argsStr = lib.escapeShellArgs args;

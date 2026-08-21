@@ -88,6 +88,18 @@ struct SchneeArgs {
     #[arg(long, global = true, value_name = "PATH", requires = "plan_only")]
     plan_aggregator_out: Option<PathBuf>,
 
+    /// Resolve features over the named scope from
+    /// `[workspace.metadata.schnee.resolution]` instead of over the `-p`
+    /// selection.  The table is keyed by target triple with a `default`
+    /// fallback, so the natural value is the target triple.  With a scope
+    /// active, `-p` no longer influences resolution — it only picks which
+    /// of the scope's roots this invocation builds, and the graph is
+    /// pruned to what those roots reach.  Sibling invocations naming the
+    /// same scope therefore share every unit derivation they have in
+    /// common.
+    #[arg(long, global = true, value_name = "KEY")]
+    resolution_scope: Option<String>,
+
     #[command(subcommand)]
     command: SchneeCommand,
 }
@@ -421,6 +433,13 @@ enum SchneeCommand {
         /// (e.g. `test` and `doc` add additional units).
         #[arg(long, default_value = "build")]
         intent: String,
+        /// Plan test, example, and bench targets alongside the default
+        /// lib + bin set.  A graph shared with a clippy gate needs this:
+        /// `cargo clippy --all-targets` plans a strictly larger unit set,
+        /// and the cache key records the difference, so a graph computed
+        /// without it is rejected rather than reused.
+        #[arg(long)]
+        all_targets: bool,
         /// Where to write the resulting graph JSON.
         #[arg(long)]
         output: PathBuf,
@@ -1412,6 +1431,14 @@ fn intent_label(user_intent: &UserIntent) -> &'static str {
     }
 }
 
+/// Shape of the serialised plan, bumped by hand whenever a change makes an
+/// entry written by an older cargo-schnee unusable: a new or removed
+/// `NixUnit` field, a different meaning for an existing one, or a change to
+/// what `construct_derivation` emits from the same unit.  It is deliberately
+/// not `CARGO_PKG_VERSION`, which is pinned at `0.1.0` and so can never
+/// distinguish two builds of the binary.
+const PLAN_SCHEMA_VERSION: u32 = 1;
+
 /// Compose the unit-graph cache key.  Single point of truth shared by
 /// `run_build_pipeline` and `compute-graph`, so the graph files written
 /// by the latter validate against the exact key the former expects via
@@ -1436,9 +1463,20 @@ fn compose_unit_graph_key(
     features: &[String],
     no_default_features: bool,
     all_targets: bool,
+    resolution: Option<&plan_nix::ResolutionScope>,
 ) -> String {
+    // With a declared scope the graph covers the whole scope and `-p`
+    // only picks roots out of it afterwards, so the key names the scope,
+    // not the request.  Keying on the packages instead would give each
+    // sibling invocation its own cache entry and defeat the sharing the
+    // scope exists to produce.
+    let selection = match resolution {
+        Some(scope) => scope.cache_component(),
+        None => format!("{}:{}", packages.join(","), exclude.join(",")),
+    };
     format!(
-        "{}:{}:{}:{}:{}:{}{}:{}:{}:{}:{}:{}",
+        "schnee{}:{}:{}:{}:{}:{}:{}{}:{}:{}:{}:{}",
+        PLAN_SCHEMA_VERSION,
         lockfile_hash,
         manifest_hash,
         targets_hash,
@@ -1446,8 +1484,7 @@ fn compose_unit_graph_key(
         target_triple,
         intent_label(user_intent),
         format_intent_fields(user_intent),
-        packages.join(","),
-        exclude.join(","),
+        selection,
         features.join(","),
         no_default_features,
         all_targets,
@@ -1677,10 +1714,8 @@ fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<
 /// `project_dir` so the key agrees between a local checkout and the store
 /// copy that `compute-graph` plans against.
 fn hash_discovered_targets(manifest_path: &Path, project_dir: &Path) -> Result<String> {
-    let mut package_dirs: Vec<PathBuf> = vec![manifest_path
-        .parent()
-        .unwrap_or(project_dir)
-        .to_path_buf()];
+    let mut package_dirs: Vec<PathBuf> =
+        vec![manifest_path.parent().unwrap_or(project_dir).to_path_buf()];
     for manifest in workspace_member_manifests(manifest_path, project_dir)? {
         if let Some(dir) = manifest.parent() {
             package_dirs.push(dir.to_path_buf());
@@ -2053,6 +2088,9 @@ fn run_build_pipeline(
     // benches) instead of cargo's default selection.  Mirrors `cargo
     // ... --all-targets`; useful for `cargo clippy --all-targets`.
     all_targets: bool,
+    // Key into `[workspace.metadata.schnee.resolution]`.  See
+    // `SchneeArgs::resolution_scope`.
+    resolution_scope: Option<&str>,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -2076,6 +2114,14 @@ fn run_build_pipeline(
         packages.to_vec()
     };
     let packages = &packages[..];
+
+    // Read from the workspace root manifest even when the caller pointed
+    // at a member: a member declaring its own scope would reintroduce the
+    // per-invocation divergence the scope removes.
+    let resolution = resolution_scope
+        .map(|key| plan_nix::read_resolution_scope(&ws_root_manifest_canon, key))
+        .transpose()?;
+    let resolution = resolution.as_ref();
 
     let profile = if release {
         plan_nix::ProfileConfig::release()
@@ -2161,6 +2207,7 @@ fn run_build_pipeline(
         features,
         no_default_features,
         all_targets,
+        resolution,
     );
     // If `CARGO_SCHNEE_UNIT_GRAPH` points at a graph generated for the
     // same `unit_graph_key`, fold its contents into the in-memory cache so
@@ -2256,28 +2303,45 @@ fn run_build_pipeline(
         &unit_setup,
         registration_jobs,
         all_targets,
+        resolution,
     )?;
 
     // Update unit graph cache. The `cache_key` field is populated for
     // both in-tree and `compute-graph`-emitted entries so the load
     // path uses the same defence-in-depth check regardless of source.
-    cache.unit_graphs.insert(
-        unit_graph_key.clone(),
-        UnitGraphCacheEntry {
-            src_store: src_store.clone(),
-            units: plan_units
-                .iter()
-                .map(|u| {
-                    let mut c = u.clone();
-                    c.clear_drv_path();
-                    c
-                })
-                .collect(),
-            target_cfg_envs: cfg_envs,
-            host_cfg_envs,
-            cache_key: unit_graph_key,
-        },
-    );
+    //
+    // Entries filed under a scope key must be whole-scope graphs, since
+    // the next invocation may ask for different roots out of the same
+    // scope. `plan_units` here has already been narrowed to this
+    // invocation's roots, so writing it back would serve a truncated
+    // graph to a sibling. Skip the write in that case — the shared graph
+    // arrives via `CARGO_SCHNEE_UNIT_GRAPH` in the pipeline that cares,
+    // and a scope-less build still caches as before.
+    let narrowed = resolution.is_some() && !(packages.is_empty() && exclude.is_empty());
+    if narrowed {
+        tracing::debug!(
+            "Not caching the unit graph: it is narrowed to this invocation's \
+             roots and the key names the whole scope",
+        );
+    } else {
+        cache.unit_graphs.insert(
+            unit_graph_key.clone(),
+            UnitGraphCacheEntry {
+                src_store: src_store.clone(),
+                units: plan_units
+                    .iter()
+                    .map(|u| {
+                        let mut c = u.clone();
+                        c.clear_drv_path();
+                        c
+                    })
+                    .collect(),
+                target_cfg_envs: cfg_envs,
+                host_cfg_envs,
+                cache_key: unit_graph_key,
+            },
+        );
+    }
 
     let plan_duration = plan_start.elapsed();
 
@@ -2319,9 +2383,8 @@ fn run_build_pipeline(
             .with_context(|| format!("Writing plan output to {}", out_path.display()))?;
 
         if let Some(agg_out) = plan_aggregator_out {
-            std::fs::write(agg_out, format!("{}\n", aggregator_drv)).with_context(|| {
-                format!("Writing aggregator drv path to {}", agg_out.display())
-            })?;
+            std::fs::write(agg_out, format!("{}\n", aggregator_drv))
+                .with_context(|| format!("Writing aggregator drv path to {}", agg_out.display()))?;
         }
 
         if let Err(e) = cache.save(project_dir) {
@@ -2891,6 +2954,8 @@ fn main() -> Result<()> {
     let plan_only_ref = plan_only.as_deref();
     let plan_aggregator_out = args.plan_aggregator_out.clone();
     let plan_aggregator_out_ref = plan_aggregator_out.as_deref();
+    let resolution_scope_arg = args.resolution_scope.clone();
+    let resolution_scope = resolution_scope_arg.as_deref();
 
     match args.command {
         SchneeCommand::Check {
@@ -2927,6 +2992,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
         }
         SchneeCommand::Build {
@@ -2963,6 +3029,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
         }
         SchneeCommand::Run {
@@ -3001,6 +3068,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
 
             if plan_only.is_some() {
@@ -3083,6 +3151,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
 
             if plan_only.is_some() {
@@ -3152,6 +3221,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
 
             if plan_only.is_some() {
@@ -3264,6 +3334,7 @@ fn main() -> Result<()> {
                 &[],
                 registration_jobs,
                 false,
+                None,
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -3323,6 +3394,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 all_targets,
+                resolution_scope,
             )?;
         }
         SchneeCommand::Doc {
@@ -3364,6 +3436,7 @@ fn main() -> Result<()> {
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
+                resolution_scope,
             )?;
 
             if plan_only.is_some() {
@@ -3452,6 +3525,7 @@ fn main() -> Result<()> {
                 &[],
                 registration_jobs,
                 false,
+                None,
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {
@@ -3469,6 +3543,7 @@ fn main() -> Result<()> {
             ref features,
             no_default_features,
             ref intent,
+            all_targets,
             ref output,
         } => {
             let manifest_path = resolve_manifest(manifest_path)?;
@@ -3516,11 +3591,15 @@ fn main() -> Result<()> {
                 ),
             };
             let targets_hash = hash_discovered_targets(&manifest_path, project_dir)?;
-            // `compute-graph` always plans the default target set (no
-            // `--all-targets`); embed that in the key so the cache check
-            // in `run_build_pipeline` correctly rejects this entry on a
-            // `--all-targets` build (where the unit set differs).
-            let all_targets = false;
+            // The `--all-targets` selection is part of the key because it
+            // is a strictly larger unit set: a graph computed without it
+            // is rejected by a `--all-targets` build rather than reused.
+            // A graph shared with a clippy gate therefore has to be
+            // computed with it.
+            let resolution = resolution_scope
+                .map(|key| plan_nix::read_resolution_scope(&project_dir.join("Cargo.toml"), key))
+                .transpose()?;
+            let resolution = resolution.as_ref();
             let unit_graph_key = compose_unit_graph_key(
                 &lockfile_hash,
                 &manifest_hash,
@@ -3533,8 +3612,12 @@ fn main() -> Result<()> {
                 features,
                 no_default_features,
                 all_targets,
+                resolution,
             );
 
+            // With a scope declared the emitted graph deliberately covers
+            // the whole scope, `-p` and all: consumers narrow it to their
+            // own roots on load, which is what lets them share it.
             let (units, cfg_envs, host_cfg_envs) = plan_nix::fresh_unit_graph(
                 project_dir,
                 vendor_dir,
@@ -3546,6 +3629,7 @@ fn main() -> Result<()> {
                 features,
                 no_default_features,
                 all_targets,
+                resolution,
             )?;
 
             // Match the convention used by the in-tree cache: drv_path is

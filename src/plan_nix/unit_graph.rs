@@ -78,15 +78,6 @@ pub(super) fn extract_units_from_bcx(
         .iter()
         .filter_map(|u| key_map.get(u).cloned())
         .collect();
-    // Map root keys to their target names
-    let root_target_names: HashMap<String, String> = roots
-        .iter()
-        .filter_map(|u| {
-            key_map
-                .get(u)
-                .map(|k| (k.clone(), u.target.name().to_string()))
-        })
-        .collect();
 
     // Topological sort on deduplicated units
     let topo_units = toposort(&deduped_units, &bcx.unit_graph, &key_map)?;
@@ -414,7 +405,12 @@ pub(super) fn extract_units_from_bcx(
                 }));
 
         let is_root = root_keys.contains(&key);
-        let target_name = root_target_names.get(&key).cloned().unwrap_or_default();
+        // Populated for every unit, not only roots: a scope-wide graph is
+        // narrowed to a caller's roots after the fact, and a unit that is
+        // a non-root here can be a root for a sibling invocation reading
+        // the same cached graph.  Nothing in `derivation.rs` reads this,
+        // so filling it in moves no derivation hash.
+        let target_name = unit.target.name().to_string();
         let for_host = matches!(unit.kind, CompileKind::Host);
 
         // For `Check { test: true }` units, append `-test` to the drv
@@ -1207,17 +1203,11 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             redirect.insert(nix_units[idx].key.clone(), new_key.clone());
         }
 
-        // Merge is_root and target_name from all variants.
-        let mut merged_is_root = false;
-        let mut merged_target_name = String::new();
-        for &idx in indices {
-            if nix_units[idx].is_root {
-                merged_is_root = true;
-                if merged_target_name.is_empty() {
-                    merged_target_name = nix_units[idx].target_name.clone();
-                }
-            }
-        }
+        // Merge is_root from all variants.  `target_name` needs no merge:
+        // `feature_agnostic_group_key` keys on crate name, source file and
+        // manifest dir, so every variant in a group is the same cargo
+        // target and already carries the same name.
+        let merged_is_root = indices.iter().any(|&idx| nix_units[idx].is_root);
 
         // Merge dep_extern: union across all variants, preferring the smallest key
         // (which will be redirected later).
@@ -1244,9 +1234,6 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         u.features = unified;
         u.extra_filename = new_extra_filename;
         u.is_root = merged_is_root;
-        if merged_is_root && !merged_target_name.is_empty() {
-            u.target_name = merged_target_name;
-        }
         u.dep_extern = merged_dep_extern_vec;
     }
 
@@ -1328,7 +1315,10 @@ mod tests {
         let tokio_before = per_crate_vendor_id("tokio", "1.0.0", "bbb");
         let tokio_after = per_crate_vendor_id("tokio", "1.1.0", "ccc");
 
-        assert_eq!(serde_before, serde_after, "serde's vendor identity is unchanged by a tokio bump");
+        assert_eq!(
+            serde_before, serde_after,
+            "serde's vendor identity is unchanged by a tokio bump"
+        );
         assert_ne!(tokio_before, tokio_after, "tokio's own identity changes");
         assert_ne!(
             aggregate_vendor_id(&lock_v1),
