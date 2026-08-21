@@ -58,12 +58,11 @@
 //!   `Derivation::from_json` in `src/libstore/derivations.cc`.
 
 use anyhow::{Context, Result};
-use tracing::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::OnceLock;
-
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Store directory
@@ -153,7 +152,10 @@ impl TargetNix {
 fn detect_uncached() -> Result<TargetNix> {
     let version = run_nix_version_cli()?;
     let (major, minor) = parse_version(&version).with_context(|| {
-        format!("Could not parse Nix version from `nix --version`: {:?}", version)
+        format!(
+            "Could not parse Nix version from `nix --version`: {:?}",
+            version
+        )
     })?;
     debug!(
         "Detected Nix CLI version {}.{} via `nix --version`",
@@ -183,9 +185,9 @@ fn run_nix_version_cli() -> Result<String> {
 /// Picks the first whitespace-delimited token that begins with a digit and
 /// contains a dot.
 fn parse_version(s: &str) -> Option<(u32, u32)> {
-    let token = s.split_whitespace().find(|t| {
-        t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
-    })?;
+    let token = s
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.'))?;
     let mut parts = token.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
@@ -527,7 +529,9 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["args", "builder", "env", "inputs", "name", "outputs", "system", "version"],
+            vec![
+                "args", "builder", "env", "inputs", "name", "outputs", "system", "version"
+            ],
         );
     }
 

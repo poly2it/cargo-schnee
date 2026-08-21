@@ -34,7 +34,10 @@ pub fn serialize_nar(root: &Path, allowed_files: Option<&HashSet<PathBuf>>) -> R
 /// skeleton means a `.rs` body edit does not move the planner's input (so it
 /// neither re-runs nor re-emits the unit-drv set), while adding/removing a
 /// source file or editing a manifest does.
-pub fn serialize_nar_skeleton(root: &Path, allowed_files: Option<&HashSet<PathBuf>>) -> Result<Vec<u8>> {
+pub fn serialize_nar_skeleton(
+    root: &Path,
+    allowed_files: Option<&HashSet<PathBuf>>,
+) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024 * 1024);
     nar_string(&mut buf, "nix-archive-1");
     nar_serialize_path(&mut buf, root, root, allowed_files, true)?;
@@ -274,9 +277,15 @@ mod tests {
     fn per_crate_source_path_independent_of_siblings() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write(&root.join("crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n");
+        write(
+            &root.join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\n",
+        );
         write(&root.join("crate-a/src/lib.rs"), "pub fn a() {}\n");
-        write(&root.join("crate-b/Cargo.toml"), "[package]\nname = \"crate-b\"\n");
+        write(
+            &root.join("crate-b/Cargo.toml"),
+            "[package]\nname = \"crate-b\"\n",
+        );
         write(&root.join("crate-b/src/lib.rs"), "pub fn b() {}\n");
 
         let allowed: HashSet<PathBuf> = [
@@ -291,17 +300,28 @@ mod tests {
 
         let a1 = crate_source_store_path(root, Path::new("crate-a"), &allowed).unwrap();
         let b1 = crate_source_store_path(root, Path::new("crate-b"), &allowed).unwrap();
-        let whole1 = compute_nar_store_path("project-src", &serialize_nar(root, Some(&allowed)).unwrap());
+        let whole1 =
+            compute_nar_store_path("project-src", &serialize_nar(root, Some(&allowed)).unwrap());
 
         // Edit ONLY crate-b.
-        write(&root.join("crate-b/src/lib.rs"), "pub fn b() { /* changed */ }\n");
+        write(
+            &root.join("crate-b/src/lib.rs"),
+            "pub fn b() { /* changed */ }\n",
+        );
 
         let a2 = crate_source_store_path(root, Path::new("crate-a"), &allowed).unwrap();
         let b2 = crate_source_store_path(root, Path::new("crate-b"), &allowed).unwrap();
-        let whole2 = compute_nar_store_path("project-src", &serialize_nar(root, Some(&allowed)).unwrap());
+        let whole2 =
+            compute_nar_store_path("project-src", &serialize_nar(root, Some(&allowed)).unwrap());
 
-        assert_eq!(a1, a2, "editing crate-b must NOT change crate-a's per-crate source path");
-        assert_ne!(b1, b2, "editing crate-b must change crate-b's per-crate source path");
+        assert_eq!(
+            a1, a2,
+            "editing crate-b must NOT change crate-a's per-crate source path"
+        );
+        assert_ne!(
+            b1, b2,
+            "editing crate-b must change crate-b's per-crate source path"
+        );
         assert_ne!(
             whole1, whole2,
             "the whole-tree NAR couples all crates: it moves on any edit (the bug being fixed)"
@@ -315,9 +335,15 @@ mod tests {
     fn skeleton_source_path_is_body_independent() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"crate-a\"]\n");
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate-a\"]\n",
+        );
         write(&root.join("Cargo.lock"), "# lock\n");
-        write(&root.join("crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n");
+        write(
+            &root.join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\n",
+        );
         write(&root.join("crate-a/src/lib.rs"), "pub fn a() {}\n");
 
         let allowed: HashSet<PathBuf> = [
@@ -333,12 +359,18 @@ mod tests {
         let s1 = skeleton_source_store_path(root, &allowed).unwrap();
 
         // A source BODY edit must not move the skeleton.
-        write(&root.join("crate-a/src/lib.rs"), "pub fn a() { let _ = 1; }\n");
+        write(
+            &root.join("crate-a/src/lib.rs"),
+            "pub fn a() { let _ = 1; }\n",
+        );
         let s2 = skeleton_source_store_path(root, &allowed).unwrap();
         assert_eq!(s1, s2, "a .rs body edit must NOT move the planner skeleton");
 
         // A manifest edit must move it.
-        write(&root.join("crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\nedition = \"2021\"\n");
+        write(
+            &root.join("crate-a/Cargo.toml"),
+            "[package]\nname = \"crate-a\"\nedition = \"2021\"\n",
+        );
         let s3 = skeleton_source_store_path(root, &allowed).unwrap();
         assert_ne!(s2, s3, "a manifest edit must move the planner skeleton");
 
@@ -347,7 +379,10 @@ mod tests {
         let mut allowed2 = allowed.clone();
         allowed2.insert(PathBuf::from("crate-a/src/bin/extra.rs"));
         let s4 = skeleton_source_store_path(root, &allowed2).unwrap();
-        assert_ne!(s3, s4, "adding a source file must move the planner skeleton");
+        assert_ne!(
+            s3, s4,
+            "adding a source file must move the planner skeleton"
+        );
     }
 
     #[test]

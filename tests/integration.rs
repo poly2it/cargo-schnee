@@ -1150,7 +1150,14 @@ fn fixture_dev_dep_cycle() {
     run_schnee_cmd(
         "clippy",
         &manifest,
-        &["--release", "--no-deps", "--all-targets", "--", "--deny", "warnings"],
+        &[
+            "--release",
+            "--no-deps",
+            "--all-targets",
+            "--",
+            "--deny",
+            "warnings",
+        ],
     );
 }
 

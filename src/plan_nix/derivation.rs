@@ -2,11 +2,11 @@ use super::util::{collect_store_paths, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
 use anyhow::{Context, Result};
-use tracing::debug;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tracing::debug;
 
 /// Built-in lookup table mapping `links` values to env vars that tell -sys crates
 /// to use pkg-config instead of building bundled C code.

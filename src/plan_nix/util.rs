@@ -19,7 +19,9 @@ pub(crate) fn collect_store_paths(s: &str, paths: &mut HashSet<String>) {
                 // <store-path>=<replacement>` doesn't accidentally extend the
                 // captured path past the literal store entry.  `=` is not a
                 // valid character in Nix store names so this is loss-free.
-                let name_end = rest.find(['/', ' ', '"', '\'', ')', '=']).unwrap_or(rest.len());
+                let name_end = rest
+                    .find(['/', ' ', '"', '\'', ')', '='])
+                    .unwrap_or(rest.len());
                 let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
                 paths.insert(root.to_string());
             }
@@ -328,11 +330,7 @@ mod tests {
             &mut paths,
         );
         assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src"));
-        assert!(
-            !paths
-                .iter()
-                .any(|p| p.contains("=crates"))
-        );
+        assert!(!paths.iter().any(|p| p.contains("=crates")));
     }
 
     #[test]
