@@ -848,6 +848,31 @@ matched no unit in the plan — usually a typo'd package or target name, though
 a rule list shared between build, test, and clippy packages can legitimately
 match nothing in one of them.
 
+##### Scoping
+
+A rule's `script` is mounted in the planner sandbox together with its whole
+reference closure, so every rule a call carries is a build input of that
+call. A script naming an expensive derivation — a generated query cache, a
+fixture corpus — would therefore block every package sharing the rule list on
+building it, including packages whose plan never contains the crate the rule
+names.
+
+Rules are scoped to the call before they reach the planner. When `package`
+names a workspace member, the plan covers that member and the crates
+reachable from it over path dependencies, so a rule naming a member outside
+that set is dropped and its closure is not built. Declaring the whole rule
+list once, in arguments shared across a workspace, is therefore the intended
+usage: each call takes the rules that concern it.
+
+The filter never drops a rule the plan could match. Rules with `package =
+"*"`, rules naming something that is not a workspace member — a vendored
+dependency, a path dependency in a sibling workspace — and every rule on a
+call with no `package` argument are all kept, because their reachability is
+not decidable from the workspace manifests. A call whose path dependencies
+leave this workspace keeps every rule for the same reason. Rules are
+validated before scoping, so a malformed rule still fails the call that
+declares it even when it is dropped.
+
 `lib.testPackage` additionally accepts `testRunnerSetup`, a single script
 store path sourced in the test runner before the first test binary executes,
 under the same contract (`SCHNEE_AUX_DIR` is `$out/schnee-aux` in the runner's

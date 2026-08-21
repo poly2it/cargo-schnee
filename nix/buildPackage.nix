@@ -78,6 +78,12 @@
   # install step surfaces at $out/schnee-aux/<target-name>/.  An empty
   # list leaves every generated derivation byte-identical to a run
   # without rules; with rules present only matching units change.
+  #
+  # Rules are scoped to the call before they reach the planner: when
+  # `package` names a workspace member, a rule naming a different member
+  # is dropped, so its script's closure is not a build input here.  See
+  # the `unitSetup scoping` section below.  This makes it safe to declare
+  # one rule list across every crate of a workspace.
   unitSetup ? [],
   sourceRootPrefix ? null,
   doCheck ? false,
@@ -214,22 +220,24 @@ let
         ) (builtins.attrNames dirs));
     in if hasGlob then expanded else [ m ];
 
-  memberCargoToml =
-    if package != null && (rootCargoToml ? workspace) then
-      let
-        memberPatterns = rootCargoToml.workspace.members or [];
-        allMembers = builtins.concatMap expandMember memberPatterns;
-        findMember = builtins.foldl' (acc: m:
-          if acc != null then acc
+  # Every workspace member's parsed manifest, keyed by cargo package name.
+  # Drives both the pname/version detection below and the unitSetup scoping
+  # further down, so the member manifests are read once per call.
+  memberManifests =
+    if rootCargoToml ? workspace then
+      builtins.listToAttrs (lib.concatMap (m:
+        let cargoPath = src + "/${m}/Cargo.toml";
+        in if !builtins.pathExists cargoPath then []
           else
-            let cargoPath = src + "/${m}/Cargo.toml";
-            in if !builtins.pathExists cargoPath then null
-              else
-                let toml = builtins.fromTOML (builtins.readFile cargoPath);
-                in if (toml.package.name or "") == package then toml else null
-        ) null allMembers;
-      in findMember
-    else null;
+            let
+              toml = builtins.fromTOML (builtins.readFile cargoPath);
+              name = toml.package.name or null;
+            in lib.optional (name != null) (lib.nameValuePair name toml)
+      ) (builtins.concatMap expandMember (rootCargoToml.workspace.members or [])))
+    else {};
+
+  memberCargoToml =
+    if package != null then memberManifests.${package} or null else null;
 
   effectiveCargoToml =
     if memberCargoToml != null then memberCargoToml
@@ -383,9 +391,96 @@ let
       { inherit (rule) package; script = "${rule.script}"; }
       // lib.optionalAttrs (rule ? kinds) { inherit (rule) kinds; }
       // lib.optionalAttrs (rule ? targets) { inherit (rule) targets; };
+  validatedUnitSetup = map validateUnitSetupRule unitSetup;
+
+  # -- unitSetup scoping -------------------------------------------------
+  # Every rule a call carries becomes a build input of that call's planner:
+  # `unitSetupJson` embeds each rule's `script` store path, the planner
+  # exports it, and the sandbox therefore mounts the script together with
+  # its whole reference closure.  When a script names an expensive
+  # derivation — a generated query cache, a fixture corpus — every package
+  # sharing the rule list blocks on building it, including packages whose
+  # plan never contains the crate the rule names.
+  #
+  # Drop the rules this call cannot match.  A `package` argument pins the
+  # plan to one workspace member and the crates reachable from it, so a
+  # rule naming a member outside that set matches no unit and only costs
+  # its closure.  A caller can therefore put the whole rule list in the
+  # arguments it shares across every crate in a workspace and let each
+  # call take the rules that concern it.
+  #
+  # The filter is one-sided: it drops a rule only when the rule names a
+  # crate this call provably does not plan.  Rules matching every package
+  # ("*"), and rules naming something that is not a workspace member — a
+  # vendored dependency, a path dependency in a sibling workspace — are
+  # kept, because their reachability is not decidable from the workspace
+  # manifests alone.  Rules are validated before filtering, so a typo'd
+  # rule still fails the call that declares it rather than going quiet.
+  workspaceDeps = rootCargoToml.workspace.dependencies or {};
+
+  # The package names of `toml`'s path dependencies, across every
+  # dependency section including the `[target.<cfg>.…]` ones.  A dependency
+  # is local when its own table carries `path`, or when it inherits from
+  # `[workspace.dependencies]` and the inherited entry carries `path`.  A
+  # `package` field renames the crate, so it wins over the table key.
+  localDepNames = toml:
+    let
+      depSections = t: [
+        (t.dependencies or {})
+        (t."dev-dependencies" or {})
+        (t."build-dependencies" or {})
+      ];
+      sections =
+        depSections toml
+        ++ lib.concatMap depSections (lib.attrValues (toml.target or {}));
+      resolve = key: value:
+        if !(builtins.isAttrs value) then null
+        else if value ? path then value.package or key
+        else if value.workspace or false then
+          let inherited = workspaceDeps.${key} or null; in
+          if builtins.isAttrs inherited && inherited ? path
+          then inherited.package or key
+          else null
+        else null;
+    in lib.filter (n: n != null)
+      (lib.concatMap (s: lib.mapAttrsToList resolve s) sections);
+
+  # Walk the local path dependencies out from `root`, accumulating the
+  # workspace members reached (`seen`, `root` included) and whether the walk
+  # stayed inside this workspace (`bounded`).  A path dependency that is not
+  # a member lives in a sibling workspace, whose manifest is not readable
+  # from `src` — it may path-depend back into this workspace, so the walk
+  # can no longer bound what gets planned and clears `bounded`.  Registry
+  # dependencies never appear here, since `localDepNames` yields path
+  # dependencies only.
+  reachableMembers = root:
+    let
+      walk = acc: name:
+        if lib.elem name acc.seen then acc
+        else
+          let
+            acc' = acc // { seen = acc.seen ++ [ name ]; };
+            toml = memberManifests.${name} or null;
+          in
+            if toml == null then acc' // { bounded = false; }
+            else builtins.foldl' walk acc' (localDepNames toml);
+    in walk { seen = []; bounded = true; } root;
+
+  scopedUnitSetup =
+    if package == null || memberManifests == {} then validatedUnitSetup
+    else
+      let reach = reachableMembers package; in
+      if !reach.bounded then validatedUnitSetup
+      else
+        lib.filter (rule:
+          rule.package == "*"
+          || lib.elem rule.package reach.seen
+          || !(memberManifests ? ${rule.package})
+        ) validatedUnitSetup;
+
   unitSetupJson =
-    if unitSetup == [] then null
-    else builtins.toJSON (map validateUnitSetupRule unitSetup);
+    if scopedUnitSetup == [] then null
+    else builtins.toJSON scopedUnitSetup;
 
   # -- unit-graph auto-wiring --------------------------------------------
   # clippy plans with the same unit set as check (local units swap rustc
