@@ -1,12 +1,12 @@
-use super::util::{collect_store_paths, shell_quote};
+use super::util::{collect_store_paths, manifest_symlink_name, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
-use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
+use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
 use anyhow::{Context, Result};
-use log::debug;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tracing::debug;
 
 /// Built-in lookup table mapping `links` values to env vars that tell -sys crates
 /// to use pkg-config instead of building bundled C code.
@@ -29,6 +29,9 @@ pub(super) fn construct_derivation(
     key_to_idx: &HashMap<String, usize>,
     dep_drv_map: &HashMap<String, String>,
     bash_path: &str,
+    // Store root containing `bash_path`'s binary.  Must be in `inputSrcs`
+    // so the sandbox bind-mounts the builder; see `util::which_bash`.
+    bash_store: &str,
     rustc_path: &str,
     rustdoc_path: &str,
     proc_macro_rlib: &str,
@@ -54,9 +57,48 @@ pub(super) fn construct_derivation(
     src_store: &str,
     document_private_items: bool,
     passthru_closure: &[String],
+    // When `Some`, swap rustc for clippy-driver on local (workspace) compile
+    // units.  Dep units keep using rustc so their per-unit derivations stay
+    // byte-identical to a regular check / build run.
+    clippy_path: Option<&str>,
+    // clippy-driver's nix store closure.  Only added to inputSrcs of units
+    // that actually use clippy_path so dep units are unaffected.
+    clippy_closure: &[String],
+    // Lint args forwarded to clippy-driver after the rustc command line.
+    // Only applied to units that actually run clippy so dep-unit derivation
+    // hashes stay stable when the caller toggles deny-warnings on or off.
+    clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules to inject into every compile unit's rustc
+    // command line.  Each pair is `(src_relative, replacement)` where
+    // `src_relative` is interpreted relative to `src_store` — empty string
+    // remaps the project-src root itself.  Sorted shortest-first inside
+    // `build_compile_script` so rustc's "last matching wins" rule resolves
+    // longer (more specific) entries on top of shorter ones.
+    path_prefix_remaps: &[(String, String)],
+    // Store paths of caller-supplied setup scripts, in rule order, sourced
+    // into the unit's sandbox right before the driver / build-script
+    // invocation.  Empty for units no rule matches, keeping those units'
+    // derivations byte-identical to a run without rules.  The paths land
+    // in `inputSrcs` via the `collect_store_paths` scan of the script
+    // text, so the scripts and their reference closures are mounted with
+    // no extra plumbing.
+    setup_scripts: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+
+    // Decide whether this unit should be linted.  Doc and BuildScriptRun
+    // are excluded — Doc runs rustdoc, BuildScriptRun executes a binary.
+    // Only local (workspace) units swap; deps keep their cached rustc drvs.
+    let use_clippy = clippy_path.is_some()
+        && unit.is_local
+        && !matches!(unit.kind, UnitKind::Doc | UnitKind::BuildScriptRun);
+    let effective_rustc = if use_clippy {
+        clippy_path.unwrap()
+    } else {
+        rustc_path
+    };
+
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -76,6 +118,7 @@ pub(super) fn construct_derivation(
             custom_sys_env,
             passthru_envs,
             src_store,
+            setup_scripts,
         )?,
         UnitKind::Doc => build_doc_script(
             unit,
@@ -86,13 +129,16 @@ pub(super) fn construct_derivation(
             resolved_sysroot,
             &coreutils_bin_dir,
             document_private_items,
+            path_prefix_remaps,
+            src_store,
+            setup_scripts,
         )?,
         _ => build_compile_script(
             unit,
             units,
             key_to_idx,
             dep_drv_map,
-            rustc_path,
+            effective_rustc,
             proc_macro_rlib,
             resolved_sysroot,
             &coreutils_bin_dir,
@@ -100,6 +146,10 @@ pub(super) fn construct_derivation(
             profile,
             target,
             win_sdk_lib_dirs,
+            if use_clippy { clippy_lint_args } else { &[] },
+            path_prefix_remaps,
+            src_store,
+            setup_scripts,
         )?,
     };
 
@@ -178,7 +228,18 @@ pub(super) fn construct_derivation(
     for path in rustc_closure {
         input_srcs.insert(path.clone());
     }
+    // clippy-driver's closure is added only to local units that actually run
+    // clippy.  Adding it unconditionally would invalidate dep unit caches.
+    if use_clippy {
+        for path in clippy_closure {
+            input_srcs.insert(path.clone());
+        }
+    }
     input_srcs.insert(coreutils_store.to_string());
+    // The builder shells out via `bash_path`; its containing store root
+    // must be bind-mounted into the sandbox or the build fails before any
+    // user code runs.
+    input_srcs.insert(bash_store.to_string());
 
     if unit.needs_linker || unit.kind == UnitKind::BuildScriptRun {
         for path in cc_closure {
@@ -231,6 +292,67 @@ pub(super) fn construct_derivation(
     }))
 }
 
+/// Build the `--remap-path-prefix` argument tokens for a unit.
+///
+/// `path_prefix_remaps` are `(src_relative, replacement)` pairs expressed
+/// relative to the *project-src* root, so callers need not know the build's
+/// content-addressed hash. `src_store` is the unit's actual source store: the
+/// project-src store for non-sliced units, or a flat per-crate
+/// `<hash>-<member>` store for sliced ones (`assign_per_crate_src_stores`).
+///
+/// rustc resolves overlapping remaps "last matching wins", so emit shortest
+/// `src_relative` first and let longer (more specific) entries override.
+///
+/// `sliced_crate_rel` re-roots the project-src-root remap for a sliced local
+/// crate. Without it, `--remap-path-prefix <crate_store>=<replacement>`
+/// collapses `<crate_store>/src/x` to `<replacement>/src/x`, dropping the
+/// `<member>/` directory and colliding every crate's `src/lib.rs`. With it the
+/// root remap targets `<replacement>/<crate_rel>` so the crate keeps its real
+/// workspace path. Only the root remap (`src_relative == ""`) is adjusted; a
+/// non-root remap names a subpath that, for a sliced crate, refers to an
+/// external source not under this crate store and simply will not match.
+fn remap_args(
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
+    sliced_crate_rel: Option<&str>,
+) -> Vec<String> {
+    let mut sorted: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
+    sorted.sort_by_key(|(src_relative, _)| src_relative.len());
+    let mut out = Vec::new();
+    for (src_relative, replacement) in sorted {
+        let from = if src_relative.is_empty() {
+            src_store.to_string()
+        } else {
+            format!("{}/{}", src_store, src_relative)
+        };
+        let to = match sliced_crate_rel {
+            Some(rel) if src_relative.is_empty() => format!("{}/{}", replacement, rel),
+            _ => replacement.clone(),
+        };
+        out.push("--remap-path-prefix".into());
+        out.push(shell_quote(&format!("{}={}", from, to)));
+    }
+    out
+}
+
+/// Shell fragment sourcing each caller-supplied setup script in rule
+/// order, with `SCHNEE_AUX_DIR` — the unit's auxiliary output channel —
+/// exported first.  Callers place it after the cargo env exports and the
+/// `mkdir` that creates `$out`, immediately before the driver invocation,
+/// so a script's exports persist into the driver and an EXIT trap it sets
+/// fires after the work completes.  Empty when no rule matched, keeping
+/// non-matching units byte-identical to a run without rules.
+fn setup_source_fragment(setup_scripts: &[String]) -> String {
+    if setup_scripts.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("export SCHNEE_AUX_DIR=$out/schnee-aux && ");
+    for script in setup_scripts {
+        s.push_str(&format!(". {} && ", shell_quote(script)));
+    }
+    s
+}
+
 /// Build the shell script for a regular compilation or build-script compilation.
 #[allow(clippy::too_many_arguments)]
 fn build_compile_script(
@@ -246,6 +368,17 @@ fn build_compile_script(
     profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
+    // Extra rustc / clippy-driver flags appended after every other
+    // arg.  Used to forward post-`--` clippy lint flags such as
+    // `--deny warnings`; empty for normal compile units.
+    extra_rustc_args: &[String],
+    // `--remap-path-prefix` rules.  See `construct_derivation` doc.
+    path_prefix_remaps: &[(String, String)],
+    // Project-src store path; remaps with `src_relative = ""` rewrite this
+    // root, longer entries rewrite subdirectories.
+    src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -311,8 +444,12 @@ fn build_compile_script(
         parts.push("prefer-dynamic".into());
     }
 
-    // --test for test harness units (test and bench both use CompileMode::Test)
-    if unit.kind == UnitKind::TestCompile {
+    // --test for test harness units (test and bench both use
+    // CompileMode::Test) AND for any Check unit pulled in via
+    // `--all-targets` whose mode is `CompileMode::Check { test: true }`
+    // — integration tests need rustc to synthesise a `main` and the
+    // harness even in check/clippy intent.
+    if unit.kind == UnitKind::TestCompile || unit.compile_test {
         parts.push("--test".into());
     }
 
@@ -374,7 +511,7 @@ fn build_compile_script(
             parts.push("--extern".into());
             parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
         } else {
-            log::warn!(
+            tracing::warn!(
                 "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
                 unit.key,
                 extern_name,
@@ -390,6 +527,28 @@ fn build_compile_script(
             parts.push("-L".into());
             parts.push(format!("dependency={}", placeholder));
         }
+    }
+
+    // `--remap-path-prefix`: rewrite source paths in diagnostics, debug
+    // info, and macro expansions.  Each `(src_relative, replacement)` is
+    // interpreted relative to `src_store` so callers don't have to know the
+    // per-build content-addressed hash; empty `src_relative` rewrites the
+    // project-src root itself.  rustc resolves multiple remaps with
+    // "last matching wins" — sort shortest-first so longer (more specific)
+    // entries override shorter ones for paths that match both.
+    parts.extend(remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    ));
+
+    // Caller-supplied flags forwarded to clippy-driver (or rustc).  For
+    // clippy units this is e.g. `["--deny", "warnings"]` from
+    // `cargo schnee clippy -- --deny warnings`; empty for regular
+    // compile units.  Appended last so the deny level applies on top of
+    // any allow level set by earlier flags.
+    for arg in extra_rustc_args {
+        parts.push(shell_quote(arg));
     }
 
     // Build the script
@@ -449,25 +608,19 @@ fn build_compile_script(
     // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
     // a readable+writable location.
     let tmp_manifest_path;
-    let manifest_dir_for_compile =
-        if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
-            let hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(unit.original_manifest_dir.as_bytes());
-                hex_lower(&hasher.finalize()[..8])
-            };
-            tmp_manifest_path = format!("/tmp/_schnee_md_{}", hash);
-            let ln_path = format!("{}/ln", coreutils_bin_dir);
-            script.push_str(&format!(
-                "{} -sfn {} {} && ",
-                shell_quote(&ln_path),
-                shell_quote(&unit.manifest_dir),
-                shell_quote(&tmp_manifest_path),
-            ));
-            &tmp_manifest_path
-        } else {
-            &unit.manifest_dir
-        };
+    let manifest_dir_for_compile = if unit.kind == UnitKind::TestCompile {
+        tmp_manifest_path = manifest_symlink_name(&unit.manifest_dir);
+        let ln_path = format!("{}/ln", coreutils_bin_dir);
+        script.push_str(&format!(
+            "{} -sfn {} {} && ",
+            shell_quote(&ln_path),
+            shell_quote(&unit.manifest_dir),
+            shell_quote(&tmp_manifest_path),
+        ));
+        &tmp_manifest_path
+    } else {
+        &unit.manifest_dir
+    };
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
         shell_quote(manifest_dir_for_compile)
@@ -475,12 +628,11 @@ fn build_compile_script(
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
     let cat_path = format!("{}/cat", coreutils_bin_dir);
-    script.push_str(&format!(
-        "{} -p $out && {} {}",
-        shell_quote(&mkdir_path),
-        shell_quote(rustc_path),
-        parts.join(" "),
-    ));
+    // The mkdir stays ahead of the setup hook so `$out` (and thereby
+    // SCHNEE_AUX_DIR's parent) exists before the first script sources.
+    script.push_str(&format!("{} -p $out && ", shell_quote(&mkdir_path)));
+    script.push_str(&setup_source_fragment(setup_scripts));
+    script.push_str(&format!("{} {}", shell_quote(rustc_path), parts.join(" ")));
 
     // Append $EXTRA_ARGS (own + transitive build script link directives)
     // Capture stderr to $out/diagnostics for replay on cached builds,
@@ -504,6 +656,10 @@ fn build_doc_script(
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
     document_private_items: bool,
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -554,6 +710,26 @@ fn build_doc_script(
     parts.push("-C".into());
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
 
+    // `--remap-path-prefix`: rewrite source paths in rustdoc diagnostics so
+    // they match the repo, same as the compile path. Without this, doc lints
+    // surface raw `<store>/...` paths no downstream mapper can resolve.
+    //
+    // Unlike rustc, where `--remap-path-prefix` is stable, rustdoc gates the
+    // flag behind `-Z unstable-options`. The pinned toolchain reports as
+    // stable, so `RUSTC_BOOTSTRAP` is exported below to let rustdoc accept the
+    // unstable flag. Only emit the gate when there are remaps to apply.
+    let remap = remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    );
+    let needs_unstable_options = !remap.is_empty();
+    if needs_unstable_options {
+        parts.push("-Z".into());
+        parts.push("unstable-options".into());
+    }
+    parts.extend(remap);
+
     // --extern deps — point to .rmeta/.rlib from dependency compile outputs
     for (extern_name, dep_key) in &unit.dep_extern {
         if let Some(dep_drv) = dep_drv_map.get(dep_key) {
@@ -580,6 +756,12 @@ fn build_doc_script(
     // Initialize EXTRA_ARGS for build script directives
     script.push_str(r#"EXTRA_ARGS="" && "#);
 
+    // Let the stable-reporting toolchain accept the `-Z unstable-options`
+    // gate that rustdoc requires for `--remap-path-prefix`.
+    if needs_unstable_options {
+        script.push_str("export RUSTC_BOOTSTRAP=1 && ");
+    }
+
     // Parse build script output if we depend on one
     if let Some(ref bs_key) = unit.build_script_dep
         && let Some(bs_drv) = dep_drv_map.get(bs_key)
@@ -602,9 +784,12 @@ fn build_doc_script(
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
     let cat_path = format!("{}/cat", coreutils_bin_dir);
+    // The mkdir stays ahead of the setup hook so `$out` (and thereby
+    // SCHNEE_AUX_DIR's parent) exists before the first script sources.
+    script.push_str(&format!("{} -p $out/doc && ", shell_quote(&mkdir_path)));
+    script.push_str(&setup_source_fragment(setup_scripts));
     script.push_str(&format!(
-        "{} -p $out/doc && {} {}",
-        shell_quote(&mkdir_path),
+        "{} {}",
         shell_quote(rustdoc_path),
         parts.join(" "),
     ));
@@ -638,6 +823,8 @@ fn build_run_script(
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
     src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     // The build script compile derivation provides the binary
     let bs_compile_key = unit
@@ -861,6 +1048,11 @@ fn build_run_script(
         "WDIRS_EOF\n",
     ));
     script.push_str("cc -shared -fPIC -o $TMPDIR/_wdirs.so $TMPDIR/_wdirs.c -ldl && ");
+    // Setup hook: `$out` already exists (mkdir at the top of this script)
+    // and every cargo env export — including the workdir-rewritten
+    // CARGO_MANIFEST_DIR — is in place, so scripts see the same
+    // environment the build script binary is about to run under.
+    script.push_str(&setup_source_fragment(setup_scripts));
     script.push_str(&format!(
         "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
@@ -897,8 +1089,12 @@ pub(super) fn nix_store_closure(store_path: &str) -> Result<Vec<String>> {
 }
 
 pub(super) fn nix_derivation_add(json: &serde_json::Value) -> Result<String> {
-    let json_str = serde_json::to_string(json)?;
-    debug!("nix derivation add input: {}", json_str);
+    use super::derivation_format::{NixDerivation, StoreDir, TargetNix};
+    let target = TargetNix::detect()?;
+    let store = StoreDir::detect();
+    let derivation = NixDerivation::from_ir(json, target, &store)?;
+    let json_str = serde_json::to_string(&derivation)?;
+    debug!("nix derivation add input ({:?}): {}", target, json_str);
     let mut child = Command::new("nix")
         .args([
             "derivation",
@@ -961,6 +1157,90 @@ pub(super) fn self_placeholder(output_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The project-src root remap that the consumer expresses via
+    // `sourceRootPrefix = "crates"`: rewrite the project-src store root to
+    // `crates`.
+    fn root_remap() -> Vec<(String, String)> {
+        vec![(String::new(), "crates".to_string())]
+    }
+
+    #[test]
+    fn remap_non_sliced_root_maps_store_to_replacement() {
+        let args = remap_args(&root_remap(), "/nix/store/h-project-src", None);
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-project-src=crates"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_root_preserves_member_dir() {
+        // A per-crate-sliced unit's src_store is the flat `<hash>-<member>`
+        // store. The root remap must target `crates/<member>`, not bare
+        // `crates`, or the member directory is dropped and every crate's
+        // `src/lib.rs` collapses to `crates/src/lib.rs`.
+        let args = remap_args(
+            &root_remap(),
+            "/nix/store/h-skeptiva-ai-common",
+            Some("skeptiva-ai-common"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-skeptiva-ai-common=crates/skeptiva-ai-common"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_member_under_subdir() {
+        // crate_rel carries the full project-src-relative path, including any
+        // parent dirs (a non-flat `crates/<member>` workspace layout).
+        let args = remap_args(
+            &root_remap(),
+            "/nix/store/h-msedge-shim",
+            Some("crates/skeptiva-ai-msedge-shim"),
+        );
+        assert_eq!(
+            args[1],
+            shell_quote("/nix/store/h-msedge-shim=crates/crates/skeptiva-ai-msedge-shim"),
+        );
+    }
+
+    #[test]
+    fn remap_non_root_entry_not_crate_rel_adjusted() {
+        // Non-root remaps (e.g. extraSources identity remaps) target a
+        // specific subpath; for a sliced crate they reference an external
+        // source not under this crate store, so they keep `replacement`
+        // verbatim and simply will not match this crate's paths.
+        let remaps = vec![("sub/dir".to_string(), "X".to_string())];
+        let args = remap_args(&remaps, "/nix/store/h-crate", Some("member"));
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-crate/sub/dir=X"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sorts_shortest_src_relative_first() {
+        // rustc resolves overlapping remaps "last matching wins", so the
+        // most specific (longest src_relative) must be emitted last.
+        let remaps = vec![
+            ("aa/bb".to_string(), "deep".to_string()),
+            (String::new(), "root".to_string()),
+        ];
+        let args = remap_args(&remaps, "/nix/store/h-src", None);
+        assert_eq!(args[1], shell_quote("/nix/store/h-src=root"));
+        assert_eq!(args[3], shell_quote("/nix/store/h-src/aa/bb=deep"));
+    }
 
     #[test]
     fn self_placeholder_format() {
@@ -1035,6 +1315,9 @@ mod tests {
             is_root: true,
             target_name: name.to_string(),
             for_host: false,
+            compile_test: false,
+            self_contained_build_script: false,
+            sliced_crate_rel: None,
             drv_path: None,
         }
     }
@@ -1055,6 +1338,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1082,6 +1368,39 @@ mod tests {
         assert!(script.contains("diagnostics"));
         // Must NOT have --document-private-items
         assert!(!script.contains("--document-private-items"));
+        // With no remaps there is nothing to gate, so no unstable opt-in.
+        assert!(!script.contains("-Z unstable-options"));
+        assert!(!script.contains("RUSTC_BOOTSTRAP"));
+    }
+
+    #[test]
+    fn build_doc_script_remap_opts_into_unstable_options() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &root_remap(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
+        )
+        .unwrap();
+
+        // rustdoc gates `--remap-path-prefix` behind `-Z unstable-options`,
+        // which the stable-reporting toolchain only accepts with
+        // `RUSTC_BOOTSTRAP` set.
+        assert!(script.contains("--remap-path-prefix"));
+        assert!(script.contains("-Z unstable-options"));
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 &&"));
     }
 
     #[test]
@@ -1100,6 +1419,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1122,6 +1444,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1145,6 +1470,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1168,10 +1496,237 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
         assert!(script.contains("--cap-lints allow"));
+    }
+
+    // -- unit setup script tests ---------------------------------------------
+
+    const SETUP_A: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-setup-a.sh";
+    const SETUP_B: &str = "/nix/store/cccccccccccccccccccccccccccccccc-setup-b.sh";
+    const SRC_STORE: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src";
+
+    fn make_check_unit(name: &str) -> NixUnit {
+        let mut unit = make_doc_unit(name, &[], &[], true);
+        unit.kind = UnitKind::Check;
+        unit.key = format!("{}-check", name);
+        unit
+    }
+
+    fn check_script(setup_scripts: &[String]) -> String {
+        let units = vec![make_check_unit("my-lib")];
+        let key_to_idx = HashMap::from([("my-lib-check".to_string(), 0_usize)]);
+        build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            setup_scripts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn check_script_sources_setup_between_envs_and_driver() {
+        // The sourcing fragment sits after the CARGO_MANIFEST_DIR export
+        // and before the driver invocation, with `mkdir -p $out` and the
+        // SCHNEE_AUX_DIR export preceding it — so a script's exports are
+        // readable, $out exists, and its exports reach the driver.
+        let script = check_script(&[SETUP_A.to_string()]);
+        let manifest = script.find("export CARGO_MANIFEST_DIR=").unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out && ")
+            .unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let driver = script.find("/nix/store/rustc-bin/bin/rustc").unwrap();
+        assert!(manifest < mkdir, "mkdir must follow the cargo env exports");
+        assert!(mkdir < aux, "$out must exist before SCHNEE_AUX_DIR is set");
+        assert!(
+            aux < source,
+            "SCHNEE_AUX_DIR must be exported before sourcing"
+        );
+        assert!(
+            source < driver,
+            "scripts must source before the driver runs"
+        );
+    }
+
+    #[test]
+    fn check_script_sources_two_scripts_in_list_order() {
+        let script = check_script(&[SETUP_A.to_string(), SETUP_B.to_string()]);
+        let a = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let b = script.find(&format!(". {} && ", SETUP_B)).unwrap();
+        assert!(a < b, "matched scripts must source in rule order");
+    }
+
+    #[test]
+    fn check_script_without_setup_is_byte_identical_to_pre_feature_shape() {
+        // No matched scripts: no hook artefacts at all, and the mkdir
+        // stays directly adjacent to the driver invocation — the exact
+        // pre-feature byte layout.
+        let script = check_script(&[]);
+        assert!(!script.contains("SCHNEE_AUX_DIR"));
+        assert!(
+            script.contains(
+                "/nix/store/coreutils/bin/mkdir -p $out && /nix/store/rustc-bin/bin/rustc"
+            )
+        );
+        // And the with-scripts variant differs only by the inserted
+        // fragment: removing it restores the byte-identical script.
+        let with = check_script(&[SETUP_A.to_string()]);
+        let fragment = format!("export SCHNEE_AUX_DIR=$out/schnee-aux && . {} && ", SETUP_A);
+        assert_eq!(with.replacen(&fragment, "", 1), script);
+    }
+
+    #[test]
+    fn doc_script_sources_setup_between_mkdir_and_rustdoc() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &[],
+            SRC_STORE,
+            &[SETUP_A.to_string()],
+        )
+        .unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out/doc && ")
+            .unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let driver = script.find("/nix/store/rustdoc-bin/bin/rustdoc").unwrap();
+        assert!(mkdir < aux && aux < source && source < driver);
+    }
+
+    #[test]
+    fn run_script_sources_setup_before_build_script_binary() {
+        let mut bs_compile = make_doc_unit("my-lib", &[], &[], true);
+        bs_compile.kind = UnitKind::BuildScriptCompile;
+        bs_compile.key = "my-lib-bsc".into();
+        bs_compile.crate_name = "build_script_build".into();
+        bs_compile.crate_types = vec!["bin".into()];
+        let mut run = make_doc_unit("my-lib", &[], &[], true);
+        run.kind = UnitKind::BuildScriptRun;
+        run.key = "my-lib-bsr".into();
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        let units = vec![bs_compile, run];
+        let key_to_idx = HashMap::from([
+            ("my-lib-bsc".to_string(), 0_usize),
+            ("my-lib-bsr".to_string(), 1_usize),
+        ]);
+        let dep_drv_map = HashMap::from([(
+            "my-lib-bsc".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
+        )]);
+        let script = build_run_script(
+            &units[1],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/cc/bin",
+            &None,
+            "",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[SETUP_A.to_string()],
+        )
+        .unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out $out/out_dir && ")
+            .unwrap();
+        let manifest = script.rfind("export CARGO_MANIFEST_DIR=").unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let exec = script.find("cd $_bs_workdir && LD_PRELOAD=").unwrap();
+        assert!(mkdir < aux, "$out must exist before SCHNEE_AUX_DIR is set");
+        assert!(
+            manifest < aux,
+            "the hook must follow the workdir-rewritten CARGO_MANIFEST_DIR export"
+        );
+        assert!(aux < source && source < exec);
+    }
+
+    #[test]
+    fn run_script_without_setup_has_no_hook_artefacts() {
+        let mut bs_compile = make_doc_unit("my-lib", &[], &[], true);
+        bs_compile.kind = UnitKind::BuildScriptCompile;
+        bs_compile.key = "my-lib-bsc".into();
+        bs_compile.crate_types = vec!["bin".into()];
+        let mut run = make_doc_unit("my-lib", &[], &[], true);
+        run.kind = UnitKind::BuildScriptRun;
+        run.key = "my-lib-bsr".into();
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        let units = vec![bs_compile, run];
+        let key_to_idx = HashMap::from([
+            ("my-lib-bsc".to_string(), 0_usize),
+            ("my-lib-bsr".to_string(), 1_usize),
+        ]);
+        let dep_drv_map = HashMap::from([(
+            "my-lib-bsc".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
+        )]);
+        let script = build_run_script(
+            &units[1],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/cc/bin",
+            &None,
+            "",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+        assert!(!script.contains("SCHNEE_AUX_DIR"));
+        assert!(script.contains("_wdirs.c -ldl && cd $_bs_workdir"));
     }
 
     #[test]
@@ -1190,9 +1745,95 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
         assert!(!script.contains("--cap-lints"));
+    }
+
+    // -- TestCompile CARGO_MANIFEST_DIR symlink tests ----------------------------
+
+    fn make_test_compile_unit(name: &str, project_root: &str) -> NixUnit {
+        NixUnit {
+            key: format!("{}-test", name),
+            drv_name: format!("{}-0.1.0-{}-test", name, name),
+            kind: UnitKind::TestCompile,
+            source_file: format!(
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}/src/lib.rs",
+                name
+            ),
+            crate_name: name.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".into(),
+            features: Vec::new(),
+            dep_extern: Vec::new(),
+            all_dep_keys: Vec::new(),
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}", name),
+            original_manifest_dir: format!("{}/{}", project_root, name),
+            cargo_envs: vec![("CARGO_PKG_NAME".into(), name.into())],
+            extra_filename: "-abc123".into(),
+            needs_linker: true,
+            is_local: true,
+            links: None,
+            links_dep_keys: Vec::new(),
+            is_root: true,
+            target_name: name.to_string(),
+            for_host: false,
+            compile_test: true,
+            self_contained_build_script: false,
+            sliced_crate_rel: Some(name.to_string()),
+            drv_path: None,
+        }
+    }
+
+    fn test_compile_script(unit: &NixUnit) -> String {
+        let units = vec![unit.clone()];
+        build_compile_script(
+            &units[0],
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-my-lib",
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The manifest-dir symlink a test binary bakes in must not depend on
+    /// where the checkout happens to live, or the same source compiled from
+    /// two directories produces two derivations and neither can reuse the
+    /// other's build.
+    #[test]
+    fn test_compile_script_ignores_checkout_location() {
+        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let b = make_test_compile_unit("my-lib", "/home/dev/workspace-2");
+        assert_eq!(test_compile_script(&a), test_compile_script(&b));
+    }
+
+    /// Two crates in one workspace must still get distinct symlinks, or the
+    /// runner's `ln -sfn` for one clobbers the other.
+    #[test]
+    fn manifest_symlink_name_differs_per_crate() {
+        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let b = make_test_compile_unit("other-lib", "/home/dev/workspace-1");
+        assert_ne!(
+            manifest_symlink_name(&a.manifest_dir),
+            manifest_symlink_name(&b.manifest_dir)
+        );
     }
 }

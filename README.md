@@ -399,17 +399,23 @@ from the hash, the sorted references, and the store prefix. That fingerprint
 is hashed again, XOR-folded from 32 bytes to 20, and encoded in nix-base32
 to produce the final `/nix/store/<hash>-<name>.drv` path.
 
-If the `.drv` path already exists in the store, registration is skipped.
-Otherwise, the derivation is registered via the Nix daemon Unix socket at
-`/nix/var/nix/daemon-socket/socket` using the `wopAddTextToStore` operation,
-opcode 8. The daemon protocol uses u64 little-endian integers and
-length-prefixed strings padded to 8-byte boundaries. If the daemon connection
-fails, cargo-schnee falls back to spawning `nix derivation add` as a
-subprocess.
-
-Units are registered level-by-level in topological order. All units at the
-same depth can be registered in a single batch since their dependencies are
-already resolved.
+Because paths are computed client-side, construction never waits on the
+daemon: derivations are constructed level-by-level in topological order
+(in parallel within each level), each level's computed paths feeding the
+next level's `inputDrvs`. A single batched `wopQueryValidPaths` round
+trip then partitions the whole DAG into cache hits and misses — on a
+warm store, registration is that one round trip. Misses are registered
+via the Nix daemon Unix socket (resolved from `NIX_REMOTE`, then
+`NIX_DAEMON_SOCKET_PATH`, then the system socket) using the
+`wopAddTextToStore` operation, opcode 8, level-by-level so a drv's
+references are always valid before its dependents are added. The daemon
+protocol uses u64 little-endian integers and length-prefixed strings
+padded to 8-byte boundaries; the socket is buffered so a message costs
+one syscall, not one per protocol word. Tool closures (`rustc`, `cc`,
+system libraries) are resolved over the same connection via
+`wopQueryPathInfo` BFS instead of spawning `nix-store -qR` per root. If
+the daemon connection fails, cargo-schnee falls back to the nix CLI for
+both registration and closure queries.
 
 When cargo-schnee itself runs inside a Nix derivation, as is the case with
 `buildRustPackage` integration, the outer build must have
@@ -626,6 +632,49 @@ Files matching these patterns are added to the source tree even if they appear
 in `.gitignore`. Files outside the project directory are supported and are
 stored with a `.parent` prefix in the Nix store tree.
 
+### Sharing a resolution across packages
+
+Cargo unifies features across whatever a single command line names, so
+`-p a` and `-p b` resolve two different graphs even for the crates they
+share. Packaging each binary of a workspace separately therefore
+recompiles the common dependencies once per binary, with different
+feature sets and different unit derivations.
+
+Declare a resolution scope to pin the resolution input independently of
+the request. The table lives in the workspace manifest only — a member
+declaring its own scope would reintroduce the divergence — and is keyed
+by target triple with a `default` fallback:
+
+```toml
+[workspace.metadata.schnee.resolution]
+default = "workspace"
+x86_64-pc-windows-msvc = { packages = ["app", "installer", "updater"] }
+```
+
+A value is either the string `"workspace"`, meaning every member, or a
+table with `packages` and an optional `exclude`. Name the scope from
+`lib.buildPackage` and from `lib.unitGraph`:
+
+```nix
+self.lib.buildPackage {
+  inherit pkgs src cargoDeps;
+  package = "installer";
+  target = "x86_64-pc-windows-msvc";
+  resolutionScope = "x86_64-pc-windows-msvc";
+}
+```
+
+Cargo then resolves over the scope, and `package` becomes a
+post-resolution root filter: the plan is pruned to what the requested
+roots reach, and every sibling naming the same scope gets byte-identical
+derivations for the units they share. Asking for a package outside the
+scope is a hard error naming the manifest key.
+
+`lib.unitGraph` takes the same `resolutionScope`, so one pre-computed
+graph serves every package in the scope. Pass `allTargets = true` when
+the graph also has to serve a `--all-targets` clippy gate — that unit
+set is larger, and the cache key records the difference.
+
 ### Packaging with `lib.buildPackage`
 
 For straightforward packaging, `lib.buildPackage` handles all the toolchain
@@ -667,9 +716,9 @@ path.
 
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
-`wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`, `postInstall`,
-`postFixup`, and `meta`. Unrecognised attributes are passed through to
-`buildRustPackage`.
+`unitSetup`, `wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`,
+`postInstall`, `postFixup`, and `meta`. Unrecognised attributes are passed
+through to `buildRustPackage`.
 
 #### `env`
 
@@ -725,6 +774,109 @@ devShells.default = pkgs.mkShell {
   BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
 };
 ```
+
+#### `unitSetup`
+
+`unitSetup` is an ordered list of rules that source caller-supplied shell
+scripts inside selected per-unit sandboxes, immediately before the compiler,
+rustdoc, clippy-driver, or build-script invocation runs. Use it when a
+compilation depends on external state at execution time — the driving case is
+sqlx's `query!` macro family, which expands against a live `DATABASE_URL` and
+writes query metadata into `SQLX_OFFLINE_DIR` as a side effect of compilation.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  unitSetup = [
+    {
+      # Cargo package name, or "*" to match every package. Matches
+      # vendored dependencies as well as workspace members.
+      package = "my-backend";
+      # Unit kinds the rule applies to. Default: the four macro-expansion
+      # kinds — compile, check, test-compile, doc. The build-script kinds
+      # build-script-compile and build-script-run may be named explicitly.
+      kinds = [ "check" ];
+      # Optional filter on cargo target names, e.g. restrict to the lib
+      # target of a package that also has bins. Default: all targets.
+      targets = [ "my-backend" ];
+      # Store path of a shell script.
+      script = ./setup.sh;
+    }
+  ];
+}
+```
+
+Every rule matching a unit contributes its script, sourced in list order.
+The script contract:
+
+- The script is *sourced*, not executed: its exports persist into the
+  subsequent compiler or build-script invocation, and an `EXIT` trap it sets
+  fires when the surrounding script exits — after the work completes — giving
+  daemonised helpers (e.g. an embedded PostgreSQL on a Unix socket) a defined
+  shutdown point.
+- It runs after all cargo environment exports, so `CARGO_MANIFEST_DIR`,
+  `CARGO_PKG_NAME`, and friends are readable, and `$out` already exists.
+- `SCHNEE_AUX_DIR` is exported, naming a directory the script may create and
+  populate with auxiliary output. The install step merges each *root* unit's
+  aux directory into `$out/schnee-aux/<target-name>/` in the package output.
+  Only root units surface this way: aux output written in a non-root unit
+  (e.g. a dependency's compile unit) stays inside that unit's own store
+  output and is not installed. Doc roots have no target name; the install
+  step warns when it discards their aux output for that reason.
+- A nonzero exit fails the unit with that exit code; stderr passes through.
+- The script runs mid-chain in the unit's build shell: it must not `cd` or
+  change shell options (`set -e`, `set -u`, …), which would perturb the
+  driver invocation that follows it.
+- The sandbox has no network and no default `PATH`; scripts must reference
+  tools by absolute store path. The script and its reference closure are
+  mounted automatically.
+
+With `unitSetup` absent or empty, every generated derivation is byte-identical
+to a run without the feature; with rules present, only matching units change
+and all other units keep sharing caches with ordinary builds. A rule matching
+a vendored package forks that package's unit caches — the intended meaning,
+not an error. `lib.testPackage` and `lib.clippyPackage` forward `unitSetup`
+like any shared argument; clippy units are check units with a swapped driver,
+so `kinds = [ "check" ]` covers them.
+
+Matching limitations: `package` compares by name only, so when the dependency
+graph carries a crate at several versions a rule matches all of them; and
+`targets` compares names with `-` collapsed to `_`, so it cannot distinguish a
+lib target from a same-named bin target. The planner warns about any rule that
+matched no unit in the plan — usually a typo'd package or target name, though
+a rule list shared between build, test, and clippy packages can legitimately
+match nothing in one of them.
+
+##### Scoping
+
+A rule's `script` is mounted in the planner sandbox together with its whole
+reference closure, so every rule a call carries is a build input of that
+call. A script naming an expensive derivation — a generated query cache, a
+fixture corpus — would therefore block every package sharing the rule list on
+building it, including packages whose plan never contains the crate the rule
+names.
+
+Rules are scoped to the call before they reach the planner. When `package`
+names a workspace member, the plan covers that member and the crates
+reachable from it over path dependencies, so a rule naming a member outside
+that set is dropped and its closure is not built. Declaring the whole rule
+list once, in arguments shared across a workspace, is therefore the intended
+usage: each call takes the rules that concern it.
+
+The filter never drops a rule the plan could match. Rules with `package =
+"*"`, rules naming something that is not a workspace member — a vendored
+dependency, a path dependency in a sibling workspace — and every rule on a
+call with no `package` argument are all kept, because their reachability is
+not decidable from the workspace manifests. A call whose path dependencies
+leave this workspace keeps every rule for the same reason. Rules are
+validated before scoping, so a malformed rule still fails the call that
+declares it even when it is dropped.
+
+`lib.testPackage` additionally accepts `testRunnerSetup`, a single script
+store path sourced in the test runner before the first test binary executes,
+under the same contract (`SCHNEE_AUX_DIR` is `$out/schnee-aux` in the runner's
+output; the `EXIT` trap runs after the last binary exits).
 
 For Windows targets, `buildPackage` automatically sets `dontFixup = true`
 because patchelf and strip do not work on PE binaries. When `doCheck` is
@@ -868,7 +1020,58 @@ cargo schnee build --write-profile-to profile.txt \
 # Verify in-process .drv path computation against nix derivation add.
 cargo schnee build --verify-drv-paths \
     --manifest-path examples/simple/Cargo.toml
+
+# Override the per-level worker count for derivation registration. Pass
+# `1` to reproduce the pre-Phase-4 serial path; defaults to the number
+# of available CPU cores capped per topological level by the level's
+# width.
+cargo schnee build --registration-jobs 1 \
+    --manifest-path examples/simple/Cargo.toml
+
+# Bypass the unit-graph cache (both target/.schnee-cache.json and the
+# CARGO_SCHNEE_UNIT_GRAPH env-var hand-off). Forces a full cargo
+# bootstrap. Use this when investigating a suspected stale-graph issue.
+cargo schnee build --no-graph-cache \
+    --manifest-path examples/simple/Cargo.toml
 ```
+
+### Pre-computed unit graphs
+
+The planner's cargo bootstrap (resolve + unit extraction) is the
+largest phase of a warm replan. `lib.unitGraph` moves it into its own
+derivation containing the workspace's unit graph. The graph takes `src`
+as an input, so any source edit rebuilds it; the reuse it buys is
+across consumers of one source, not across edits to it.
+
+`lib.buildPackage` wires this automatically whenever the
+resolver-relevant selection is fully expressed in structured args
+(`package`, `features`, `noDefaultFeatures`, `buildType`, `target`,
+`intent`); any `cargoExtraArgs` entry disables it, since those flags
+could affect resolution invisibly. Pass `autoUnitGraph = false` to opt
+out, or wire a graph manually through the buildPackage `env`:
+
+```nix
+let
+  graph = self.lib.unitGraph {
+    inherit pkgs rustToolchain;
+    src = ./.;
+    cargoDeps = cargoVendoredDeps;
+  };
+in
+self.lib.buildPackage {
+  inherit pkgs rustToolchain;
+  src = ./.;
+  cargoDeps = cargoVendoredDeps;
+  env = { CARGO_SCHNEE_UNIT_GRAPH = "${graph}"; };
+}
+```
+
+The graph is keyed on cargo's resolution inputs (Cargo.lock + every
+workspace Cargo.toml + the vendor dir + cargo-schnee version + profile
++ target + features), so it's shared across worktrees, branches, and
+machines with the same lockfile. cargo-schnee validates the embedded
+key on load and falls through to a fresh bootstrap on any mismatch, so
+a stale or wrong-input graph is silently ignored rather than served.
 
 ### Environment variables
 
@@ -878,3 +1081,7 @@ cargo schnee build --verify-drv-paths \
 | `CARGO_SCHNEE_PASSTHRU_ENVS` | Space-separated list of environment variable names to forward into build-script derivations. |
 | `CARGO_TARGET_<TRIPLE>_LINKER` | Cross-linker for the given target triple. Used in derivation builder scripts. |
 | `CARGO_TARGET_<TRIPLE>_RUNNER` | Runner for cross-compiled binaries, such as `wine`. Required by `run`, `test`, and `bench` on cross targets. |
+| `CARGO_SCHNEE_UNIT_GRAPH` | Path (file or directory containing `graph.json`) to a pre-computed unit-graph entry from `cargo-schnee compute-graph` or `lib.unitGraph`. cargo-schnee validates the embedded key against the current invocation's resolution inputs and falls back to a fresh bootstrap on mismatch. |
+| `CARGO_SCHNEE_REGISTRATION_JOBS` | Worker count for parallel derivation registration. The `--registration-jobs` flag takes precedence; the env var is for callers that can't pass cargo-schnee args through (e.g. consumers of `lib.buildPackage`). |
+| `CARGO_SCHNEE_TRACE` | Path to write a `chrome://tracing` JSON file capturing the planner's internal phases (`extract_units`, `query_closures`, `compute_topo_levels`, `register_derivations`). Disabled when unset. |
+| `SCHNEE_LOG` | Tracing-subscriber filter, same syntax as `RUST_LOG`. Defaults to `cargo_schnee=warn` (verbosity bumps with `-v`/`-vv`/`-vvv`). |

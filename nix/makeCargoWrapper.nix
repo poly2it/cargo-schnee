@@ -34,15 +34,22 @@ let
         shift
         args=()
         ${varInits}
+        # Setup runs before arg parsing so any args it injects (e.g.
+        # --vendor-dir from schneeSetup) land at the start of the cargo
+        # invocation rather than after a caller-supplied `--` separator,
+        # which would smuggle them into the test harness.
+        ${setup}
         while [ $# -gt 0 ]; do
           case "$1" in
             ${forwardCases}
             --) args+=("--" "$@"); shift $#; break ;;
             --release) args+=("--release"); shift ;;
-            *) shift ;;
+            # cargo-schnee does not support this argument; dropping it
+            # silently turns e.g. `cargo test some_filter` into a
+            # full-suite run, so at least say what got discarded.
+            *) echo "warning: cargo wrapper: cargo-schnee ${subcmd} does not support '$1' — argument dropped" >&2; shift ;;
           esac
         done
-        ${setup}
         ${command} "''${args[@]}"
         __ec=$?
         ${postRun}
