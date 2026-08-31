@@ -1079,6 +1079,21 @@ fn fixture_test_manifest_dir_writable() {
     run_schnee_test(&manifest);
 }
 
+/// A workspace member is sliced to its own per-crate source store, so its
+/// manifest dir no longer sits under the project source store. Each member
+/// must still get its own CARGO_MANIFEST_DIR symlink, pointing at the
+/// checkout rather than at the store path it was compiled against.
+#[test]
+#[ignore]
+fn fixture_workspace_manifest_dir_writable() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/workspace-manifest-dir-writable");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
+}
+
 /// Building from a workspace member's manifest should scope the build to
 /// that member only, matching standard `cargo` behaviour.
 /// Regression test for: cargo test from a subcrate builds the entire workspace.

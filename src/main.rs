@@ -2014,21 +2014,19 @@ fn run_binary(
     Ok(status)
 }
 
-/// Create a deterministic `/tmp` symlink for CARGO_MANIFEST_DIR.
+/// Re-point a test binary's CARGO_MANIFEST_DIR symlink at the checkout.
 ///
-/// At compile time the derivation creates the same symlink pointing to the
-/// Nix store path so proc macros can read files. Here at runtime we
-/// re-create it pointing to the writable project directory, so both
+/// The compile derivation created the same path pointing at the crate's Nix
+/// store path so proc macros could read files. Here at runtime we re-create
+/// it pointing to the writable project directory, so both
 /// `env!("CARGO_MANIFEST_DIR")` (baked at compile time) and
 /// `std::env::var("CARGO_MANIFEST_DIR")` resolve to a readable+writable
 /// location.
-fn schnee_manifest_symlink(project_manifest_dir: &str) -> String {
-    let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(project_manifest_dir.as_bytes());
-        nix_encoding::hex_lower(&hasher.finalize()[..8])
-    };
-    let tmp_path = format!("/tmp/_schnee_md_{}", hash);
+///
+/// `store_manifest_dir` names the symlink and must be the same store path the
+/// derivation hashed, or the binary looks up a path nothing created.
+fn schnee_manifest_symlink(store_manifest_dir: &str, project_manifest_dir: &str) -> String {
+    let tmp_path = plan_nix::util::manifest_symlink_name(store_manifest_dir);
     // Atomically replace any stale symlink (may point to a store path from
     // a previous build).
     let _ = std::fs::remove_file(&tmp_path);
@@ -2036,9 +2034,23 @@ fn schnee_manifest_symlink(project_manifest_dir: &str) -> String {
     tmp_path
 }
 
+/// One root unit of a finished build, as the subcommands consume it.
+struct RootUnit {
+    drv_path: String,
+    target_name: String,
+    kind: plan_nix::UnitKind,
+    /// The crate's content-addressed store path. `manifest_symlink_name`
+    /// derives the unit's CARGO_MANIFEST_DIR symlink from it, so the runner
+    /// must hash this and not the checkout path.
+    store_manifest_dir: String,
+    /// The crate's directory in the checkout, which that symlink points at
+    /// once the binary runs.
+    project_manifest_dir: String,
+    bin_path: Option<PathBuf>,
+}
+
 struct BuildResult {
-    /// Root derivation paths with target names, unit kinds, manifest dirs, and binary paths
-    root_drvs: Vec<(String, String, plan_nix::UnitKind, String, Option<PathBuf>)>,
+    root_units: Vec<RootUnit>,
     /// target/<profile>/ directory
     target_debug: PathBuf,
 }
@@ -2391,7 +2403,7 @@ fn run_build_pipeline(
             tracing::warn!("Failed to save build cache: {}", e);
         }
         return Ok(BuildResult {
-            root_drvs: Vec::new(),
+            root_units: Vec::new(),
             target_debug: PathBuf::new(),
         });
     }
@@ -2801,34 +2813,33 @@ fn run_build_pipeline(
         );
     }
 
-    // Build root_drvs with manifest dirs and binary paths
-    let root_drvs_with_kind: Vec<(String, String, plan_nix::UnitKind, String, Option<PathBuf>)> =
-        root_drvs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (drv_path, target_name, kind))| {
-                let unit = plan_units
-                    .iter()
-                    .find(|u| u.drv_path.as_deref() == Some(&drv_path));
-                // Map store-path manifest_dir back to the project directory for
-                // runtime CARGO_MANIFEST_DIR (covers std::env::var() lookups).
-                let manifest_dir = unit
-                    .map(|u| {
-                        let store_prefix = src_store_prefix.trim_end_matches('/');
-                        if let Some(suffix) = u.manifest_dir.strip_prefix(store_prefix) {
-                            format!("{}{}", project_dir.display(), suffix)
-                        } else {
-                            u.manifest_dir.clone()
-                        }
-                    })
-                    .unwrap_or_default();
-                let bin_path = root_bin_paths.get(idx).cloned().flatten();
-                (drv_path, target_name, kind, manifest_dir, bin_path)
-            })
-            .collect();
+    // Pair each root with its manifest dirs and binary path.  The planner
+    // already recorded `original_manifest_dir` as the checkout path before
+    // per-crate slicing rewrote `manifest_dir` onto a crate store, so read it
+    // rather than stripping a prefix off `manifest_dir`, which no longer
+    // matches the project source store for a sliced crate.
+    let root_units: Vec<RootUnit> = root_drvs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (drv_path, target_name, kind))| {
+            let unit = plan_units
+                .iter()
+                .find(|u| u.drv_path.as_deref() == Some(&drv_path));
+            RootUnit {
+                store_manifest_dir: unit.map(|u| u.manifest_dir.clone()).unwrap_or_default(),
+                project_manifest_dir: unit
+                    .map(|u| u.original_manifest_dir.clone())
+                    .unwrap_or_default(),
+                bin_path: root_bin_paths.get(idx).cloned().flatten(),
+                drv_path,
+                target_name,
+                kind,
+            }
+        })
+        .collect();
 
     Ok(BuildResult {
-        root_drvs: root_drvs_with_kind,
+        root_units,
         target_debug,
     })
 }
@@ -3077,22 +3088,22 @@ fn main() -> Result<()> {
 
             // Find the binary to run
             let bin_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::Compile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::Compile))
                 .collect();
 
-            let (_, target_name, _, manifest_dir, _) = if let Some(bin_name) = bin {
+            let root = if let Some(bin_name) = bin {
                 bin_roots
                     .iter()
-                    .find(|(_, name, _, _, _)| name == bin_name)
+                    .find(|u| &u.target_name == bin_name)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "no bin target named `{}`\navailable targets: {}",
                             bin_name,
                             bin_roots
                                 .iter()
-                                .map(|(_, n, _, _, _)| n.as_str())
+                                .map(|u| u.target_name.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -3104,16 +3115,16 @@ fn main() -> Result<()> {
                     "multiple binary targets found, use --bin to specify one: {}",
                     bin_roots
                         .iter()
-                        .map(|(_, n, _, _, _)| n.as_str())
+                        .map(|u| u.target_name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             };
 
-            let bin_name = binary_name(target_name, target);
+            let bin_name = binary_name(&root.target_name, target);
             let binary_path = result.target_debug.join(&bin_name);
             shell::status("Running", &format!("`{}`", binary_path.display()));
-            let status = run_binary(&binary_path, args, target, Some(manifest_dir))?;
+            let status = run_binary(&binary_path, args, target, Some(&root.project_manifest_dir))?;
             std::process::exit(status.code().unwrap_or(1));
         }
         SchneeCommand::Test {
@@ -3160,9 +3171,9 @@ fn main() -> Result<()> {
 
             // Find test binaries (TestCompile roots)
             let test_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if test_roots.is_empty() {
@@ -3171,9 +3182,11 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, _target_name, _, manifest_dir, bin_path) in &test_roots {
-                let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path
+            for root in &test_roots {
+                let symlink_path =
+                    schnee_manifest_symlink(&root.store_manifest_dir, &root.project_manifest_dir);
+                let binary_path = root
+                    .bin_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("test root has no binary output"))?;
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
@@ -3230,9 +3243,9 @@ fn main() -> Result<()> {
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
             let bench_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if bench_roots.is_empty() {
@@ -3241,9 +3254,11 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, _target_name, _, manifest_dir, bin_path) in &bench_roots {
-                let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path
+            for root in &bench_roots {
+                let symlink_path =
+                    schnee_manifest_symlink(&root.store_manifest_dir, &root.project_manifest_dir);
+                let binary_path = root
+                    .bin_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("bench root has no binary output"))?;
                 shell::status(
@@ -3448,13 +3463,13 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&target_doc)?;
 
             let doc_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::Doc))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::Doc))
                 .collect();
 
-            for (_, target_name, _, _, _) in &doc_roots {
-                shell::status("Documenting", target_name);
+            for root in &doc_roots {
+                shell::status("Documenting", &root.target_name);
             }
 
             // Each doc derivation output has $out/doc/<crate_name>/ and
@@ -3462,9 +3477,9 @@ fn main() -> Result<()> {
             let out_paths: Vec<String> = {
                 let mut cmd = Command::new("nix-store");
                 cmd.arg("--realise");
-                for (drv_path, _, kind, _, _) in &result.root_drvs {
-                    if matches!(kind, plan_nix::UnitKind::Doc) {
-                        cmd.arg(drv_path);
+                for root in &result.root_units {
+                    if matches!(root.kind, plan_nix::UnitKind::Doc) {
+                        cmd.arg(&root.drv_path);
                     }
                 }
                 let output = cmd

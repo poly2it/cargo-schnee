@@ -1,6 +1,6 @@
-use super::util::{collect_store_paths, shell_quote};
+use super::util::{collect_store_paths, manifest_symlink_name, shell_quote};
 use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
-use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
+use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -608,25 +608,19 @@ fn build_compile_script(
     // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
     // a readable+writable location.
     let tmp_manifest_path;
-    let manifest_dir_for_compile =
-        if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
-            let hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(unit.original_manifest_dir.as_bytes());
-                hex_lower(&hasher.finalize()[..8])
-            };
-            tmp_manifest_path = format!("/tmp/_schnee_md_{}", hash);
-            let ln_path = format!("{}/ln", coreutils_bin_dir);
-            script.push_str(&format!(
-                "{} -sfn {} {} && ",
-                shell_quote(&ln_path),
-                shell_quote(&unit.manifest_dir),
-                shell_quote(&tmp_manifest_path),
-            ));
-            &tmp_manifest_path
-        } else {
-            &unit.manifest_dir
-        };
+    let manifest_dir_for_compile = if unit.kind == UnitKind::TestCompile {
+        tmp_manifest_path = manifest_symlink_name(&unit.manifest_dir);
+        let ln_path = format!("{}/ln", coreutils_bin_dir);
+        script.push_str(&format!(
+            "{} -sfn {} {} && ",
+            shell_quote(&ln_path),
+            shell_quote(&unit.manifest_dir),
+            shell_quote(&tmp_manifest_path),
+        ));
+        &tmp_manifest_path
+    } else {
+        &unit.manifest_dir
+    };
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
         shell_quote(manifest_dir_for_compile)
@@ -1758,5 +1752,88 @@ mod tests {
         .unwrap();
 
         assert!(!script.contains("--cap-lints"));
+    }
+
+    // -- TestCompile CARGO_MANIFEST_DIR symlink tests ----------------------------
+
+    fn make_test_compile_unit(name: &str, project_root: &str) -> NixUnit {
+        NixUnit {
+            key: format!("{}-test", name),
+            drv_name: format!("{}-0.1.0-{}-test", name, name),
+            kind: UnitKind::TestCompile,
+            source_file: format!(
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}/src/lib.rs",
+                name
+            ),
+            crate_name: name.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".into(),
+            features: Vec::new(),
+            dep_extern: Vec::new(),
+            all_dep_keys: Vec::new(),
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}", name),
+            original_manifest_dir: format!("{}/{}", project_root, name),
+            cargo_envs: vec![("CARGO_PKG_NAME".into(), name.into())],
+            extra_filename: "-abc123".into(),
+            needs_linker: true,
+            is_local: true,
+            links: None,
+            links_dep_keys: Vec::new(),
+            is_root: true,
+            target_name: name.to_string(),
+            for_host: false,
+            compile_test: true,
+            self_contained_build_script: false,
+            sliced_crate_rel: Some(name.to_string()),
+            drv_path: None,
+        }
+    }
+
+    fn test_compile_script(unit: &NixUnit) -> String {
+        let units = vec![unit.clone()];
+        build_compile_script(
+            &units[0],
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-my-lib",
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The manifest-dir symlink a test binary bakes in must not depend on
+    /// where the checkout happens to live, or the same source compiled from
+    /// two directories produces two derivations and neither can reuse the
+    /// other's build.
+    #[test]
+    fn test_compile_script_ignores_checkout_location() {
+        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let b = make_test_compile_unit("my-lib", "/home/dev/workspace-2");
+        assert_eq!(test_compile_script(&a), test_compile_script(&b));
+    }
+
+    /// Two crates in one workspace must still get distinct symlinks, or the
+    /// runner's `ln -sfn` for one clobbers the other.
+    #[test]
+    fn manifest_symlink_name_differs_per_crate() {
+        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let b = make_test_compile_unit("other-lib", "/home/dev/workspace-1");
+        assert_ne!(
+            manifest_symlink_name(&a.manifest_dir),
+            manifest_symlink_name(&b.manifest_dir)
+        );
     }
 }

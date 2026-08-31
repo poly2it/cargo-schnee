@@ -293,9 +293,11 @@ pub struct NixUnit {
     pub(crate) build_script_compile_key: Option<String>,
     /// CARGO_MANIFEST_DIR for the package (mapped to nix store path)
     pub(crate) manifest_dir: String,
-    /// Original (pre-mapping) manifest dir — the writable project path.
-    /// For TestCompile units, this is used as CARGO_MANIFEST_DIR so that
-    /// compile-time `env!("CARGO_MANIFEST_DIR")` captures a writable path.
+    /// Original (pre-mapping) manifest dir, which is the writable project
+    /// path. The runner points a root unit's CARGO_MANIFEST_DIR here so a
+    /// test binary reads and writes the checkout rather than the read-only
+    /// store. It never reaches a derivation, because hashing it would key
+    /// the build on where the checkout happens to live.
     #[serde(default)]
     pub(crate) original_manifest_dir: String,
     /// Standard cargo env vars for build scripts
@@ -1852,9 +1854,9 @@ pub fn run_plan_nix(
     drop(_extract_span);
     tracing::info!(units = nix_units.len(), "extract_units complete");
 
-    // Populate original_manifest_dir for TestCompile units so that compile-time
-    // env!("CARGO_MANIFEST_DIR") captures the writable project path instead of
-    // the read-only nix store path.
+    // Record every local unit's checkout directory before per-crate slicing
+    // rewrites `manifest_dir` onto a crate store, which is the last point at
+    // which the project-src prefix still matches.
     if let Some(proj) = project_dir {
         let proj_str = proj.to_string_lossy();
         for unit in &mut nix_units {
