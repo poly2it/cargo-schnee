@@ -21,6 +21,32 @@ const SYS_PKG_CONFIG_ENVS: &[(&str, &str)] = &[
     ("zstd", "ZSTD_SYS_USE_PKG_CONFIG"),
 ];
 
+/// Keys of the build-script-run units whose `cargo:rustc-link-lib` and
+/// `cargo:rustc-link-search` directives reach `unit`'s linker.
+///
+/// Cargo passes a linker only the directives printed by build scripts of the
+/// same compile kind.  `all_dep_keys` crosses that boundary, because a proc
+/// macro is an ordinary `--extern` dep and the closure walk pulls in its
+/// entire host subtree.  Without this filter a cross target unit receives
+/// host library search paths ahead of its own target ones, and rustc resolves
+/// `-l static=foo` against the host directory first, so it hands the target
+/// linker a host-format archive.  The unit's own build script is left out,
+/// because both call sites read it separately.
+fn linked_build_script_keys<'a>(
+    unit: &NixUnit,
+    units: &'a [NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+) -> Vec<&'a str> {
+    unit.all_dep_keys
+        .iter()
+        .filter_map(|dep_key| key_to_idx.get(dep_key))
+        .map(|&dep_idx| &units[dep_idx])
+        .filter(|dep| dep.for_host == unit.for_host)
+        .filter_map(|dep| dep.build_script_dep.as_deref())
+        .filter(|bs_key| unit.build_script_dep.as_deref() != Some(*bs_key))
+        .collect()
+}
+
 /// Build the derivation JSON for a single unit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn construct_derivation(
@@ -206,15 +232,12 @@ pub(super) fn construct_derivation(
                 .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
         }
     }
-    // For linking: add all transitive build script run outputs to inputDrvs.
-    // Their `cargo:rustc-link-lib` and `cargo:rustc-link-search` directives need
-    // to be read at build time and passed to the linker.
+    // For linking: add every build-script-run output whose link directives
+    // this unit replays.  The script builder walks the same set, so an output
+    // that cannot change the compiler invocation is not an input either.
     if unit.needs_linker && unit.kind != UnitKind::BuildScriptRun {
-        for dep_key in &unit.all_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key)
-                && let Some(ref bs_key) = units[dep_idx].build_script_dep
-                && let Some(drv) = dep_drv_map.get(bs_key)
-            {
+        for bs_key in linked_build_script_keys(unit, units, key_to_idx) {
+            if let Some(drv) = dep_drv_map.get(bs_key) {
                 input_drvs.entry(drv.clone()).or_insert_with(
                     || serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}),
                 );
@@ -574,25 +597,17 @@ fn build_compile_script(
         ));
     }
 
-    // For linking: read cargo:rustc-link-lib and cargo:rustc-link-search from
-    // ALL transitive dependencies' build script outputs. Cargo propagates these
-    // to the final linker invocation.
+    // For linking: read `cargo:rustc-link-lib` and `cargo:rustc-link-search`
+    // from the transitive dependencies of this unit's own compile kind, which
+    // is the set cargo propagates to the final linker invocation.
     if unit.needs_linker {
-        for dep_key in &unit.all_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key)
-                && let Some(ref bs_key) = units[dep_idx].build_script_dep
-            {
-                // Skip own build script (already handled above)
-                if unit.build_script_dep.as_ref() == Some(bs_key) {
-                    continue;
-                }
-                if let Some(bs_drv) = dep_drv_map.get(bs_key) {
-                    let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
-                    script.push_str(&format!(
-                        r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
-                        ph = bs_placeholder,
-                    ));
-                }
+        for bs_key in linked_build_script_keys(unit, units, key_to_idx) {
+            if let Some(bs_drv) = dep_drv_map.get(bs_key) {
+                let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
+                script.push_str(&format!(
+                    r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
+                    ph = bs_placeholder,
+                ));
             }
         }
     }
@@ -1834,6 +1849,128 @@ mod tests {
         assert_ne!(
             manifest_symlink_name(&a.manifest_dir),
             manifest_symlink_name(&b.manifest_dir)
+        );
+    }
+
+    // -- cross-compile link directive scoping ------------------------------
+
+    const HOST_BS_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-sys-host-bs.drv";
+    const TARGET_BS_DRV: &str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-sys-target-bs.drv";
+
+    /// A cross build in which a `-sys` crate is planned twice, once for the
+    /// host because a proc macro needs it and once for the requested target.
+    /// The target bin reaches the host build-script-run unit through
+    /// `all_dep_keys`, because the proc macro is an ordinary `--extern` dep
+    /// and the closure walk does not stop at it.
+    ///
+    /// The two build scripts print different directives, since the host one
+    /// resolves the system library through the host pkg-config while the
+    /// target one builds the bundled copy.
+    fn cross_units() -> (
+        Vec<NixUnit>,
+        HashMap<String, usize>,
+        HashMap<String, String>,
+    ) {
+        let mut host_sys = make_doc_unit("sys-host", &[], &[], false);
+        host_sys.key = "sys-host".into();
+        host_sys.kind = UnitKind::Compile;
+        host_sys.for_host = true;
+        host_sys.build_script_dep = Some("sys-host-bs".into());
+
+        let mut target_sys = make_doc_unit("sys-target", &[], &[], false);
+        target_sys.key = "sys-target".into();
+        target_sys.kind = UnitKind::Compile;
+        target_sys.build_script_dep = Some("sys-target-bs".into());
+
+        let mut app = make_doc_unit("app", &[], &[("mymacro", "sys-host")], true);
+        app.key = "app".into();
+        app.kind = UnitKind::Compile;
+        app.crate_types = vec!["bin".into()];
+        app.needs_linker = true;
+        app.all_dep_keys = vec!["sys-host".into(), "sys-target".into()];
+
+        let units = vec![app, host_sys, target_sys];
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map = HashMap::from([
+            ("sys-host-bs".to_string(), HOST_BS_DRV.to_string()),
+            ("sys-target-bs".to_string(), TARGET_BS_DRV.to_string()),
+        ]);
+        (units, key_to_idx, dep_drv_map)
+    }
+
+    fn cross_link_script(units: &[NixUnit], dep_drv_map: &HashMap<String, String>) -> String {
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        build_compile_script(
+            &units[0],
+            units,
+            &key_to_idx,
+            dep_drv_map,
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &ProfileConfig::dev(),
+            &TargetConfig::with_target("aarch64-unknown-linux-gnu"),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// A host build script's `cargo:rustc-link-search` must not reach the
+    /// cross linker, because rustc searches `-L` directories in the order it
+    /// receives them and would resolve the archive out of the host one.
+    #[test]
+    fn cross_link_unit_skips_host_build_script_directives() {
+        let (units, _, dep_drv_map) = cross_units();
+        let script = cross_link_script(&units, &dep_drv_map);
+        let host = downstream_placeholder(HOST_BS_DRV, "out").unwrap();
+        let target = downstream_placeholder(TARGET_BS_DRV, "out").unwrap();
+        assert!(
+            script.contains(&target),
+            "the target build script's directives must still be read"
+        );
+        assert!(
+            !script.contains(&host),
+            "a host build script's link directives must not reach the cross linker"
+        );
+    }
+
+    /// The inputs and the script must name the same build scripts, or the
+    /// derivation depends on an output it never reads and rebuilds when that
+    /// output changes.
+    #[test]
+    fn linked_build_script_keys_scopes_to_compile_kind() {
+        let (units, key_to_idx, _) = cross_units();
+        assert_eq!(
+            linked_build_script_keys(&units[0], &units, &key_to_idx),
+            vec!["sys-target-bs"]
+        );
+    }
+
+    /// A native build plans one compile kind, so every build script in the
+    /// closure still reaches the linker and no derivation hash moves.
+    #[test]
+    fn native_link_unit_keeps_every_build_script() {
+        let (mut units, key_to_idx, _) = cross_units();
+        for unit in &mut units {
+            unit.for_host = true;
+        }
+        assert_eq!(
+            linked_build_script_keys(&units[0], &units, &key_to_idx),
+            vec!["sys-host-bs", "sys-target-bs"]
         );
     }
 }
