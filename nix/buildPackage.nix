@@ -1,8 +1,42 @@
 # lib.buildPackage — first-class build API for cargo-schnee.
 #
-# Wraps buildRustPackage with cargo-schnee's toolchain wrapper, invariants,
-# and a custom install phase.  Consumers pass a flat attribute set instead of
-# wiring makeCargoWrapper + cargoOverrides + requiredSystemFeatures manually.
+# Pipeline:
+#
+#   1. The `planner` derivation runs `cargo-schnee --plan-only` inside
+#      its sandbox.  Registration uses the daemon's `add_text_to_store`
+#      RPC over the bind-mounted socket, so the planner requires the
+#      `recursive-nix` system feature.  It registers every unit drv
+#      plus an aggregator drv that depends on the workspace roots, then
+#      exits; it never calls `nix-store --realise`.  Registration is
+#      pure metadata, so the sandbox holds one build user briefly and
+#      never blocks on sub-builds.  Concurrent planners do not deadlock
+#      on the build-user pool.
+#
+#   2. `builtins.outputOf aggregatorWrapper.outPath "out"` resolves to
+#      the aggregator drv.  Nix realises the planner first, reads the
+#      aggregator drv file the planner copied into its `$out`, and
+#      schedules that drv on the outer scheduler.  The unit DAG is flat
+#      under one global `max-jobs`, with no slot inversion regardless
+#      of CI concurrency.
+#
+#   3. A thin `runCommand` install step lays out the cargo-schnee root
+#      drv's output under `$out/bin` and `$out/lib` in nixpkgs
+#      convention, applies `postInstall`, and wraps binaries with
+#      `makeWrapper` when `wrapBinaries` is set.
+#
+# This replaces the previous buildRustPackage-based implementation,
+# which wedged CI under concurrent invocations: every planner sandbox
+# held a build user while waiting on its inner units' own user-pool
+# acquisition, a classic resource-ordering deadlock.  The new pipeline
+# confines recursive-nix to the brief, leaf-only registration step,
+# which never recurses into builds.
+#
+# `recursive-nix` is therefore part of the planner's contract, not a
+# residual cost to be eliminated.  Truly removing it requires
+# constructing one wrapper derivation per unit at nix eval time and
+# chaining `builtins.outputOf` references through them; that is
+# architecturally feasible but adds substantial nix-eval-time overhead
+# without a correctness or concurrency benefit over the current shape.
 { self }:
 
 {
@@ -11,6 +45,13 @@
   cargoLock ? null,
   cargoHash ? null,
   cargoDeps ? null,
+  # Optional per-git-dependency NAR hashes (keyed `"<name>-<version>"`).
+  # Git deps are vendored automatically via `builtins.fetchGit` (see the
+  # `allowBuiltinFetchGit` note below), so this is normally unnecessary —
+  # supply it only to pin a dep to a fixed-output (binary-cache-substitutable)
+  # fetch instead.  Forwarded verbatim to `importCargoLock`; only used with
+  # `cargoLock`.
+  outputHashes ? {},
   pname ? null,
   version ? null,
   package ? null,
@@ -20,351 +61,717 @@
   nativeBuildInputs ? [],
   buildInputs ? [],
   cargoExtraArgs ? [],
+  # Args appended after `--` to the cargo-schnee subcommand.  Used by
+  # clippyPackage to pass lint flags through to clippy-driver.
+  postDashArgs ? [],
   extraSources ? {},
   env ? {},
   passthruEnv ? [],
-  wrapBinaries ? false,
-  doCheck ? true,
+  # Ordered unit setup rules.  Each rule names a cargo package (or "*"),
+  # optionally restricts unit kinds (default: compile, check,
+  # test-compile, doc) and cargo target names, and supplies a shell
+  # script (store path) sourced inside every matching unit's sandbox
+  # immediately before the compiler / rustdoc / clippy-driver /
+  # build-script invocation.  Scripts may export env vars, start helper
+  # processes with a defined EXIT-trap shutdown point, and write
+  # auxiliary output to $SCHNEE_AUX_DIR ($out/schnee-aux), which the
+  # install step surfaces at $out/schnee-aux/<target-name>/.  An empty
+  # list leaves every generated derivation byte-identical to a run
+  # without rules; with rules present only matching units change.
+  #
+  # Rules are scoped to the call before they reach the planner: when
+  # `package` names a workspace member, a rule naming a different member
+  # is dropped, so its script's closure is not a build input here.  See
+  # the `unitSetup scoping` section below.  This makes it safe to declare
+  # one rule list across every crate of a workspace.
+  unitSetup ? [],
+  sourceRootPrefix ? null,
+  doCheck ? false,
   preCheck ? "",
   postCheck ? "",
   buildType ? "release",
+  features ? [],
+  noDefaultFeatures ? false,
   preBuild ? "",
   postBuild ? "",
   postInstall ? "",
   postFixup ? "",
   meta ? {},
+  dontBuild ? false,
+  installPhase ? null,
+  # Cargo subcommand intent.  Default is `build`; consumers like
+  # `lib.testPackage` and `lib.clippyPackage` override to `test` /
+  # `clippy`.  Internal-ish — most callers use the `lib.*` wrappers.
+  intent ? "build",
+  # Pre-compute the cargo unit graph as a separate derivation
+  # (`lib.unitGraph`) and hand it to the planner via
+  # `CARGO_SCHNEE_UNIT_GRAPH`, so warm replans skip the full cargo
+  # resolve + bcx bootstrap — the single largest planner phase.  Only
+  # takes effect when every resolver-relevant flag is expressed in
+  # structured args: anything in `cargoExtraArgs` could affect
+  # resolution invisibly, so its presence disables the graph and the
+  # planner bootstraps as before.  cargo-schnee validates the embedded
+  # cache key on load and silently falls back on mismatch, so a stale
+  # or mismatched graph can never produce a wrong plan — only a slower
+  # one.
+  autoUnitGraph ? true,
+  # Key into `[workspace.metadata.schnee.resolution]` in the workspace
+  # manifest, keyed by target triple with a `default` fallback — so the
+  # natural value is the target triple.  Declaring it makes cargo resolve
+  # features over the scope rather than over this call's `package`
+  # selection, and demotes `package` to a post-resolution root filter.
+  # Several `buildPackage` calls naming the same scope therefore share
+  # every unit derivation they have in common, instead of each getting
+  # its own feature-unified graph.  `null` keeps the old behaviour.
+  resolutionScope ? null,
   ...
 }@args:
 
 let
   inherit (pkgs) lib;
+  schneeBin = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
-  # -- cross-compilation --------------------------------------------------
-  effectiveHostPkgs = if hostPkgs != null then hostPkgs else pkgs;
-  isWindows = target != null && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
+  # -- features not yet supported in the dyn-derivation pipeline -----
+  # cargoHash needs the cargoLock vendor path. doCheck inline runs the
+  # test phase in the same drv as the build; the new pipeline splits
+  # build and test into separate derivations, so use lib.testPackage
+  # instead. postBuild / postCheck / postFixup were buildRustPackage
+  # hook points with no equivalent in the direct-derivation model.
+  unsupported = lib.filterAttrs (n: v: v) {
+    "cargoHash" = cargoHash != null;
+    "doCheck = true (use lib.testPackage)" = doCheck;
+    "preCheck (use lib.testPackage)" = preCheck != "";
+    "postCheck (use lib.testPackage)" = postCheck != "";
+    "postBuild" = postBuild != "";
+    "postFixup" = postFixup != "";
+    "dontBuild" = dontBuild;
+    "installPhase override" = installPhase != null;
+    "hostPkgs (cross-compile not yet validated)" = hostPkgs != null;
+  };
+  _ = if unsupported != {} then
+    throw ''
+      cargo-schnee buildPackage: ${
+        lib.concatStringsSep ", " (lib.attrNames unsupported)
+      } not yet supported by the dyn-derivation pipeline.
+      See cargo-schnee's plan for migration status.''
+    else null;
 
-  # CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER etc.
-  cargoTargetEnvPrefix = lib.toUpper (builtins.replaceStrings ["-"] ["_"] target);
+  # -- vendoring ----------------------------------------------------------
+  effectiveCargoDeps =
+    if cargoDeps != null then cargoDeps
+    else if cargoLock != null then
+      # crates.io's API endpoint (`crates.io/api/v1/crates`) 403s any
+      # User-Agent containing `curl/...` (and `python-requests/...`) as
+      # an anti-abuse measure since April 2026 — see rust-lang/crates.io#13482.
+      # `pkgs.rustPlatform.importCargoLock` fetches through stock
+      # `fetchurl`, whose builder sends `curl/<ver> Nixpkgs/<ver>`, so
+      # every crate fetch fails with 403 until either nixpkgs ships the
+      # matching UA fix (NixOS/nixpkgs#512735 covers fetchCargoVendor
+      # only; fetchurl is still pending on the nixpkgs revision pinned
+      # downstream of this) or the crate's output path is already in
+      # the local store from a previous run.
+      #
+      # Override the registry download URL via `extraRegistries` (right-
+      # biased merge over the default mapping) so requests go to
+      # `static.crates.io`, which serves the same tarballs and does not
+      # apply the UA filter. URL template is `<download>/<name>/<ver>/
+      # download`, identical between the two hosts, so the recorded
+      # `outputHash`es in downstream `Cargo.lock`s remain valid and
+      # already-cached output paths are reused.
+      pkgs.rustPlatform.importCargoLock {
+        lockFile = cargoLock;
+        inherit outputHashes;
+        # A git dependency carries no content checksum in `Cargo.lock` (only
+        # its commit, in the source `#fragment`), so `importCargoLock` would
+        # otherwise demand a hand-written `outputHashes` entry per git dep.
+        # `allowBuiltinFetchGit` makes it vendor each git source with
+        # `builtins.fetchGit`, which pins purely on that commit (`allRefs` so
+        # a non-tip rev is still reachable) and needs no hash — git deps then
+        # resolve straight from the lockfile, like registry crates. A caller
+        # can still override any dep via `outputHashes` above.
+        allowBuiltinFetchGit = true;
+        extraRegistries = {
+          "https://github.com/rust-lang/crates.io-index" =
+            "https://static.crates.io/crates";
+        };
+      }
+    else throw "cargo-schnee buildPackage: cargoLock or cargoDeps required";
 
   # -- pname / version auto-detection ------------------------------------
   rootCargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
 
-  # For workspace builds with `package` set, find the member's Cargo.toml
-  # by scanning workspace.members for a path whose Cargo.toml has a matching name.
-  # Members may contain globs (e.g. "crates/*", "*"), so we expand those first.
-
-  # Expand a single member pattern into concrete directory paths.
-  # "crates/foo" (no glob)   -> [ "crates/foo" ]
-  # "crates/*"               -> list subdirectories of <src>/crates/
-  # "*"                      -> list subdirectories of <src>/
-  # "crates/*/sub"           -> list <src>/crates/X/sub for each X
-  #
-  # Only a single '*' segment is supported (matching Cargo's glob behaviour).
   expandMember = m:
     let
       hasGlob = lib.hasInfix "*" m;
-      # Split the pattern into segments around the glob.
       parts = lib.splitString "/*" m;
-      # prefix: everything before the glob ("crates" for "crates/*", "" for "*")
       prefix = builtins.head parts;
-      # suffix: everything after the glob ("/sub" for "crates/*/sub", "" for "crates/*")
       suffix = lib.concatStrings (builtins.tail parts);
-      # Trim leading "/" from suffix if present
       cleanSuffix = lib.removePrefix "/" suffix;
-      parentDir = if prefix == "*" || prefix == "" then src else src + "/${prefix}";
+      parentDir =
+        if prefix == "*" || prefix == "" then src else src + "/${prefix}";
       entries = builtins.readDir parentDir;
       dirs = lib.filterAttrs (_: type: type == "directory") entries;
-      expanded = builtins.filter (p: builtins.pathExists (src + "/${p}/Cargo.toml")) (
-        map (name:
-          let
-            base = if prefix == "*" || prefix == "" then name else "${prefix}/${name}";
-          in
-            if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
-        ) (builtins.attrNames dirs)
-      );
-    in
-      if hasGlob then expanded else [ m ];
+      expanded = builtins.filter
+        (p: builtins.pathExists (src + "/${p}/Cargo.toml"))
+        (map (n:
+          let base =
+            if prefix == "*" || prefix == "" then n else "${prefix}/${n}";
+          in if cleanSuffix != "" then "${base}/${cleanSuffix}" else base
+        ) (builtins.attrNames dirs));
+    in if hasGlob then expanded else [ m ];
 
-  memberCargoToml =
-    if package != null && (rootCargoToml ? workspace) then
-      let
-        memberPatterns = rootCargoToml.workspace.members or [];
-        allMembers = builtins.concatMap expandMember memberPatterns;
-        findMember = builtins.foldl' (acc: m:
-          if acc != null then acc
+  # Every workspace member's parsed manifest, keyed by cargo package name.
+  # Drives both the pname/version detection below and the unitSetup scoping
+  # further down, so the member manifests are read once per call.
+  memberManifests =
+    if rootCargoToml ? workspace then
+      builtins.listToAttrs (lib.concatMap (m:
+        let cargoPath = src + "/${m}/Cargo.toml";
+        in if !builtins.pathExists cargoPath then []
           else
             let
-              cargoPath = src + "/${m}/Cargo.toml";
-            in
-              if !builtins.pathExists cargoPath then null
-              else
-                let toml = builtins.fromTOML (builtins.readFile cargoPath);
-                in if (toml.package.name or "") == package then toml else null
-        ) null allMembers;
-      in findMember
-    else null;
+              toml = builtins.fromTOML (builtins.readFile cargoPath);
+              name = toml.package.name or null;
+            in lib.optional (name != null) (lib.nameValuePair name toml)
+      ) (builtins.concatMap expandMember (rootCargoToml.workspace.members or [])))
+    else {};
+
+  memberCargoToml =
+    if package != null then memberManifests.${package} or null else null;
 
   effectiveCargoToml =
     if memberCargoToml != null then memberCargoToml
-    else rootCargoToml;
+    else if rootCargoToml ? package then rootCargoToml
+    else null;
 
   detectedPname =
-    if package != null then package
-    else effectiveCargoToml.package.name or "unknown";
-  rawVersion = effectiveCargoToml.package.version or null;
-  detectedVersion = if builtins.isString rawVersion then rawVersion else "0.1.0";
-  finalPname = if pname != null then pname else detectedPname;
-  finalVersion = if version != null then version else detectedVersion;
+    if effectiveCargoToml != null
+    then effectiveCargoToml.package.name or null else null;
+
+  # Workspace inheritance: a member crate can declare
+  # `version.workspace = true` and pick up the version from the
+  # root `[workspace.package].version`.  Resolve that here so the
+  # derivation name doesn't fall back to "0.0.0" for inherited
+  # versions.
+  workspaceVersion =
+    rootCargoToml.workspace.package.version or null;
+  detectedVersion =
+    if effectiveCargoToml != null then
+      let v = effectiveCargoToml.package.version or null;
+      in
+        if builtins.isString v then v
+        else if builtins.isAttrs v && (v.workspace or false)
+                && builtins.isString workspaceVersion
+        then workspaceVersion
+        else null
+    else null;
+
+  # Note: don't fall back to `baseNameOf (toString src)` — when src is a
+  # nix store path that ends up unsafe in derivation names (would imply
+  # a cyclic store-path reference).  Pick a stable string instead and
+  # rely on the consumer to pass `pname` explicitly for workspace-doc
+  # builds where no [package] table exists at the root.
+  finalPname =
+    if pname != null then pname
+    else if detectedPname != null then detectedPname
+    else if package != null then package
+    else "unknown";
+  finalVersion =
+    if version != null then version
+    else if detectedVersion != null then detectedVersion
+    else "0.0.0";
 
   # -- toolchain ----------------------------------------------------------
-  effectiveRustc = if rustToolchain != null then rustToolchain else pkgs.rustc;
-  effectiveCargo = if rustToolchain != null then rustToolchain else pkgs.cargo;
-
-  schneeToolchain = self.lib.makeCargoWrapper {
-    inherit pkgs;
-    rustToolchain = effectiveRustc;
-    cargo = lib.getExe' effectiveCargo "cargo";
-    overrides = self.lib.cargoOverrides { inherit pkgs; };
-  };
-
-  schneeRustPlatform = effectiveHostPkgs.makeRustPlatform {
-    cargo = schneeToolchain;
-    rustc = schneeToolchain;
-  };
-
-  # -- vendoring ----------------------------------------------------------
-  vendorArgs =
-    if cargoDeps != null then { inherit cargoDeps; }
-    else if cargoLock != null then { cargoLock = { lockFile = cargoLock; }; }
-    else if cargoHash != null then { inherit cargoHash; }
-    else throw "cargo-schnee buildPackage: one of cargoLock, cargoHash, or cargoDeps must be provided";
+  effectiveRustToolchain =
+    if rustToolchain != null then rustToolchain else pkgs.rustc;
 
   # -- cargo flags --------------------------------------------------------
-  # Note: --target is NOT added here.  When `target` is set we override
-  # buildPhase entirely (see below) to avoid conflicting with the host
-  # --target that cargoBuildHook bakes in via @rustcTargetSpec@.
-  cargoBuildFlags = cargoExtraArgs
-    ++ lib.optionals (package != null) [ "-p" package ];
+  profileFlag =
+    if buildType == "release" then [ "--release" ]
+    else if buildType == "dev" then [ ]
+    else [ "--profile" buildType ];
+  packageFlags = lib.optionals (package != null) [ "-p" package ];
+  targetFlags = lib.optionals (target != null) [ "--target" target ];
+  featureFlags = lib.concatMap (f: [ "--features" f ]) features;
+  noDefaultFlag = lib.optionals noDefaultFeatures [ "--no-default-features" ];
+  resolutionScopeFlags =
+    lib.optionals (resolutionScope != null) [ "--resolution-scope" resolutionScope ];
 
-  # -- custom build phase for explicit target ------------------------------
-  # cargoBuildHook always injects `--target <hostPlatform>`.  When the
-  # caller passes a different `target` (e.g. x86_64-pc-windows-msvc) we
-  # must bypass the hook and call cargo directly.
-  targetBuildFlags = lib.concatStringsSep " " (
-    [ "--target" target ]
-    ++ lib.optionals (buildType == "release") [ "--release" ]
-    ++ lib.optionals (buildType != "dev" && buildType != "release") [ "--profile" buildType ]
-    ++ lib.optionals (package != null) [ "-p" package ]
-    ++ cargoExtraArgs
-  );
+  schneeArgs =
+    profileFlag ++ targetFlags ++ packageFlags ++ featureFlags
+    ++ noDefaultFlag ++ resolutionScopeFlags ++ cargoExtraArgs;
+  schneeArgsStr = lib.escapeShellArgs schneeArgs;
+  postDashArgsStr =
+    if postDashArgs == [] then ""
+    else "-- " + lib.escapeShellArgs postDashArgs;
 
-  buildPhaseForTarget = ''
-    runHook preBuild
-    cargo build ${targetBuildFlags}
-    runHook postBuild
-  '';
-
-  checkPhaseForTarget = ''
-    runHook preCheck
-    cargo test ${targetBuildFlags}
-    runHook postCheck
-  '';
-
-  # -- extraSources (postUnpack) ------------------------------------------
-  # For each { "../sibling" = ./source; } entry:
-  #  1. Copy source into workspace root (strip leading ../)
-  #  2. Patch Cargo.toml to rewrite the relative path
-  #  3. Update workspace exclude list
+  # -- extraSources injection (matches old behaviour) --------------------
   sanitiseName = relPath:
     let stripped = builtins.replaceStrings ["../"] [""] relPath;
     in if stripped == relPath
-       then throw "cargo-schnee buildPackage: extraSources keys must start with '../' (got '${relPath}')"
-       else stripped;
+      then throw "cargo-schnee buildPackage: extraSources keys must start with '../' (got '${relPath}')"
+      else stripped;
 
-  extraSourcesScript = lib.concatStringsSep "\n" (
-    lib.mapAttrsToList (relPath: source:
-      let inTreeName = sanitiseName relPath; in
-      ''
+  extraSourcesScript = lib.concatStringsSep "\n" (lib.mapAttrsToList
+    (relPath: source:
+      let inTreeName = sanitiseName relPath; in ''
         # extraSources: ${relPath} -> ${inTreeName}
-        mkdir -p "$(dirname "$sourceRoot/${inTreeName}")"
-        cp -r ${source} "$sourceRoot/${inTreeName}"
-        chmod -R u+w "$sourceRoot/${inTreeName}"
-
-        # Rewrite path dependency references in all Cargo.toml files
-        find "$sourceRoot" -name Cargo.toml -exec \
+        mkdir -p "$(dirname "workspace/${inTreeName}")"
+        cp -r ${source} "workspace/${inTreeName}"
+        chmod -R u+w "workspace/${inTreeName}"
+        find workspace -name Cargo.toml -exec \
           sed -i "s|${lib.escapeShellArg relPath}|${inTreeName}|g" {} +
-
-        # Add to workspace exclude list (if workspace section exists)
-        if grep -q '^\[workspace\]' "$sourceRoot/Cargo.toml" 2>/dev/null; then
-          if grep -q 'exclude' "$sourceRoot/Cargo.toml"; then
-            sed -i 's|exclude = \[|exclude = ["${inTreeName}", |' "$sourceRoot/Cargo.toml"
+        if grep -q '^\[workspace\]' "workspace/Cargo.toml" 2>/dev/null; then
+          if grep -q 'exclude' "workspace/Cargo.toml"; then
+            sed -i 's|exclude = \[|exclude = ["${inTreeName}", |' \
+              "workspace/Cargo.toml"
           else
-            sed -i '/^\[workspace\]/a exclude = ["${inTreeName}"]' "$sourceRoot/Cargo.toml"
+            sed -i '/^\[workspace\]/a exclude = ["${inTreeName}"]' \
+              "workspace/Cargo.toml"
           fi
         fi
-      ''
-    ) extraSources
-  );
+      '') extraSources);
 
-  # -- install phase ------------------------------------------------------
-  # Cargo maps the "dev" profile to the "debug" output directory.
-  profileDir =
-    if buildType == "release" then "release"
-    else if buildType == "dev" then "debug"
-    else buildType;
+  # -- sourceRootPrefix path remap --------------------------------------
+  rootRemap =
+    lib.optionalAttrs (sourceRootPrefix != null) { "" = sourceRootPrefix; };
+  extraSourceRemaps = lib.mapAttrs'
+    (relPath: _:
+      let n = sanitiseName relPath; in lib.nameValuePair n n)
+    extraSources;
+  effectivePathPrefixRemaps = rootRemap // extraSourceRemaps;
+  pathPrefixRemapsJson =
+    if effectivePathPrefixRemaps != {}
+    then builtins.toJSON
+      (lib.mapAttrsToList (f: t: [f t]) effectivePathPrefixRemaps)
+    else null;
 
-  # Cross-compiled output lands in target/<triple>/<profile>/.
-  releaseDir =
-    if target != null
-    then "target/${target}/${profileDir}"
-    else "target/${profileDir}";
+  # -- unitSetup serialisation -------------------------------------------
+  # Same pattern as CARGO_SCHNEE_PATH_PREFIX_REMAPS: JSON through the
+  # planner environment.  `"${rule.script}"` coerces a path literal to
+  # its store path (importing it if needed) and carries string context,
+  # so the script and its closure are mounted in the planner sandbox.
+  unitSetupRuleAttrs = [ "package" "kinds" "targets" "script" ];
+  # A script must resolve to a store path the planner can mount: a path
+  # literal (imported on coercion), a derivation, or a string that either
+  # carries context or already names a store path.  Anything else — e.g.
+  # a relative-path string like "./setup.sh" — would only fail much later
+  # with a daemon-level error that never mentions unitSetup.
+  unitSetupScriptOk = script:
+    builtins.isPath script
+    || lib.isDerivation script
+    || (builtins.isString script
+        && (builtins.hasContext script
+            || lib.hasPrefix builtins.storeDir script));
+  isStringList = xs: builtins.isList xs && lib.all builtins.isString xs;
+  validateUnitSetupRule = rule:
+    if !(builtins.isAttrs rule) then
+      throw "cargo-schnee buildPackage: unitSetup rules must be attrsets"
+    else if !(rule ? package) || !(rule ? script) then
+      throw "cargo-schnee buildPackage: unitSetup rules require `package` and `script`"
+    else if removeAttrs rule unitSetupRuleAttrs != {} then
+      throw ''
+        cargo-schnee buildPackage: unknown unitSetup rule attribute(s): ${
+          lib.concatStringsSep ", "
+            (lib.attrNames (removeAttrs rule unitSetupRuleAttrs))
+        }''
+    else if !(builtins.isString rule.package) then
+      throw "cargo-schnee buildPackage: unitSetup rule `package` must be a string"
+    else if !(unitSetupScriptOk rule.script) then
+      throw ("cargo-schnee buildPackage: unitSetup rule `script` must be a "
+        + "path literal, a derivation, or a store-path string; got "
+        + (if builtins.isString rule.script
+           then "the context-free string \"${rule.script}\""
+           else "a ${builtins.typeOf rule.script}"))
+    else if rule ? kinds && !(isStringList rule.kinds) then
+      throw "cargo-schnee buildPackage: unitSetup rule `kinds` must be a list of strings"
+    else if rule ? targets && !(isStringList rule.targets) then
+      throw "cargo-schnee buildPackage: unitSetup rule `targets` must be a list of strings"
+    else
+      { inherit (rule) package; script = "${rule.script}"; }
+      // lib.optionalAttrs (rule ? kinds) { inherit (rule) kinds; }
+      // lib.optionalAttrs (rule ? targets) { inherit (rule) targets; };
+  validatedUnitSetup = map validateUnitSetupRule unitSetup;
 
-  installPhaseWindows = ''
-    runHook preInstall
+  # -- unitSetup scoping -------------------------------------------------
+  # Every rule a call carries becomes a build input of that call's planner:
+  # `unitSetupJson` embeds each rule's `script` store path, the planner
+  # exports it, and the sandbox therefore mounts the script together with
+  # its whole reference closure.  When a script names an expensive
+  # derivation — a generated query cache, a fixture corpus — every package
+  # sharing the rule list blocks on building it, including packages whose
+  # plan never contains the crate the rule names.
+  #
+  # Drop the rules this call cannot match.  A `package` argument pins the
+  # plan to one workspace member and the crates reachable from it, so a
+  # rule naming a member outside that set matches no unit and only costs
+  # its closure.  A caller can therefore put the whole rule list in the
+  # arguments it shares across every crate in a workspace and let each
+  # call take the rules that concern it.
+  #
+  # The filter is one-sided: it drops a rule only when the rule names a
+  # crate this call provably does not plan.  Rules matching every package
+  # ("*"), and rules naming something that is not a workspace member — a
+  # vendored dependency, a path dependency in a sibling workspace — are
+  # kept, because their reachability is not decidable from the workspace
+  # manifests alone.  Rules are validated before filtering, so a typo'd
+  # rule still fails the call that declares it rather than going quiet.
+  workspaceDeps = rootCargoToml.workspace.dependencies or {};
 
-    releaseDir="${releaseDir}"
-    mkdir -p $out/bin
+  # The package names of `toml`'s path dependencies, across every
+  # dependency section including the `[target.<cfg>.…]` ones.  A dependency
+  # is local when its own table carries `path`, or when it inherits from
+  # `[workspace.dependencies]` and the inherited entry carries `path`.  A
+  # `package` field renames the crate, so it wins over the table key.
+  localDepNames = toml:
+    let
+      depSections = t: [
+        (t.dependencies or {})
+        (t."dev-dependencies" or {})
+        (t."build-dependencies" or {})
+      ];
+      sections =
+        depSections toml
+        ++ lib.concatMap depSections (lib.attrValues (toml.target or {}));
+      resolve = key: value:
+        if !(builtins.isAttrs value) then null
+        else if value ? path then value.package or key
+        else if value.workspace or false then
+          let inherited = workspaceDeps.${key} or null; in
+          if builtins.isAttrs inherited && inherited ? path
+          then inherited.package or key
+          else null
+        else null;
+    in lib.filter (n: n != null)
+      (lib.concatMap (s: lib.mapAttrsToList resolve s) sections);
 
-    for f in "$releaseDir"/*.exe; do
-      [ -f "$f" ] || continue
-      install -m755 "$f" "$out/bin/"
-    done
+  # Walk the local path dependencies out from `root`, accumulating the
+  # workspace members reached (`seen`, `root` included) and whether the walk
+  # stayed inside this workspace (`bounded`).  A path dependency that is not
+  # a member lives in a sibling workspace, whose manifest is not readable
+  # from `src` — it may path-depend back into this workspace, so the walk
+  # can no longer bound what gets planned and clears `bounded`.  Registry
+  # dependencies never appear here, since `localDepNames` yields path
+  # dependencies only.
+  reachableMembers = root:
+    let
+      walk = acc: name:
+        if lib.elem name acc.seen then acc
+        else
+          let
+            acc' = acc // { seen = acc.seen ++ [ name ]; };
+            toml = memberManifests.${name} or null;
+          in
+            if toml == null then acc' // { bounded = false; }
+            else builtins.foldl' walk acc' (localDepNames toml);
+    in walk { seen = []; bounded = true; } root;
 
-    # Install PDB debug symbol files if present
-    for f in "$releaseDir"/*.pdb; do
-      [ -f "$f" ] || continue
-      install -m644 "$f" "$out/bin/"
-    done
+  scopedUnitSetup =
+    if package == null || memberManifests == {} then validatedUnitSetup
+    else
+      let reach = reachableMembers package; in
+      if !reach.bounded then validatedUnitSetup
+      else
+        lib.filter (rule:
+          rule.package == "*"
+          || lib.elem rule.package reach.seen
+          || !(memberManifests ? ${rule.package})
+        ) validatedUnitSetup;
 
-    # Install DLLs if any
-    for f in "$releaseDir"/*.dll; do
-      [ -f "$f" ] || continue
-      install -m755 "$f" "$out/bin/"
-    done
+  unitSetupJson =
+    if scopedUnitSetup == [] then null
+    else builtins.toJSON scopedUnitSetup;
 
-    rmdir --ignore-fail-on-non-empty $out/bin 2>/dev/null || true
+  # -- unit-graph auto-wiring --------------------------------------------
+  # clippy plans with the same unit set as check (local units swap rustc
+  # for clippy-driver at execution, not planning, time — see
+  # `SchneeCommand::Clippy` in src/main.rs), and `compute-graph` only
+  # accepts the planner-level intents.
+  graphIntent = if intent == "clippy" then "check" else intent;
+  autoUnitGraphOn =
+    autoUnitGraph
+    && cargoExtraArgs == []
+    && builtins.elem graphIntent [ "build" "check" "test" "bench" "doc" ]
+    && !(env ? CARGO_SCHNEE_UNIT_GRAPH);
+  # `resolutionScope` has to reach the graph too.  cargo-schnee keys the
+  # cached graph on the scope, so a graph computed without it fails the
+  # key check on load, and `parse_unit_graph_file` answers a mismatch by
+  # warning and bootstrapping afresh.  A derivation that succeeds discards
+  # its stderr, so the symptom would be a correct build that shares
+  # nothing, with no diagnostic anywhere.
+  unitGraphDrv = self.lib.unitGraph {
+    inherit pkgs src rustToolchain buildType target features
+      noDefaultFeatures resolutionScope;
+    cargoDeps = effectiveCargoDeps;
+    packages = lib.optionals (package != null) [ package ];
+    intent = graphIntent;
+  };
 
-    runHook postInstall
-  '';
+  # -- planner env --------------------------------------------------------
+  plannerEnv = env
+    // lib.optionalAttrs autoUnitGraphOn {
+      CARGO_SCHNEE_UNIT_GRAPH = "${unitGraphDrv}";
+    }
+    // lib.optionalAttrs (passthruEnv != []) {
+      CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
+    }
+    // lib.optionalAttrs (pathPrefixRemapsJson != null) {
+      CARGO_SCHNEE_PATH_PREFIX_REMAPS = pathPrefixRemapsJson;
+    }
+    // lib.optionalAttrs (unitSetupJson != null) {
+      CARGO_SCHNEE_UNIT_SETUP = unitSetupJson;
+    };
 
-  installPhaseNative = ''
-    runHook preInstall
+  envExportLines = lib.concatMapStrings
+    (n: ''export ${n}=${lib.escapeShellArg (toString plannerEnv.${n})}
+'')
+    (lib.attrNames plannerEnv);
 
-    releaseDir="${releaseDir}"
-    mkdir -p $out/bin $out/lib
+  # Native tools available to the planner sandbox.  cc-wrapper picks
+  # up `${stdenv.cc}/bin` and that's what cargo's build scripts find as
+  # `cc`; rustToolchain provides rustc/cargo/rustdoc/clippy-driver.
+  binPath = lib.makeBinPath ([
+    effectiveRustToolchain
+    pkgs.stdenv.cc
+    pkgs.coreutils
+    pkgs.bashNonInteractive
+    pkgs.nix
+    pkgs.gnutar
+    pkgs.gzip
+    pkgs.findutils
+    pkgs.gnused
+    pkgs.gnugrep
+  ] ++ nativeBuildInputs);
 
-    for f in "$releaseDir"/*; do
-      [ -f "$f" ] || continue
-      [ -x "$f" ] || continue
-      name="$(basename "$f")"
-      case "$name" in build-script-*|*.d) continue ;; esac
-      echo "$name" | grep -qE -- '-[0-9a-f]{16}$' && continue
-      case "$name" in *.so|*.so.*|*.a|*.dylib) continue ;; esac
-      install -m755 "$f" "$out/bin/"
-    done
+  # Resolve `.dev` (or other) outputs preferentially for inputs that
+  # ship `.pc` files in a separate output (the standard nixpkgs
+  # multi-output convention).  Falls back to the main output if there's
+  # no `.dev`.  Mirrors what stdenv's pkg-config setup hook does.
+  pickOutput = output: pkg: pkg.${output} or pkg;
+  pkgConfigPath = lib.makeSearchPath "lib/pkgconfig"
+    (map (pickOutput "dev") buildInputs);
+  cIncludePath = lib.makeSearchPath "include"
+    (map (pickOutput "dev") buildInputs);
+  libraryPath = lib.makeLibraryPath buildInputs;
 
-    # Install shared libraries if any
-    for f in "$releaseDir"/lib*.so "$releaseDir"/lib*.so.* "$releaseDir"/lib*.a "$releaseDir"/lib*.dylib; do
-      [ -f "$f" ] && install -m644 "$f" "$out/lib/" || true
-    done
+  plannerName = "${finalPname}-${finalVersion}-${intent}-planner";
 
-    rmdir --ignore-fail-on-non-empty $out/lib $out/bin 2>/dev/null || true
+  # Planner derivation's $out is a directory containing:
+  #   - plan.txt: one root drv path per line (cargo-schnee --plan-only).
+  #   - <hash>-<unit>.drv: a copy of every root drv file referenced by
+  #     plan.txt, byte-identical to the originals registered in the
+  #     store via add_text_to_store.
+  #
+  # The drv copies let us build per-root wrapper derivations whose
+  # `outputOf "out"` resolves to each cargo-schnee root drv.  Since the
+  # wrapper bytes match the originals, dedup wins: the realised builds
+  # are the same per-unit drvs the planner registered, scheduled by
+  # nix's outer scheduler under one global max-jobs.
+  planner = derivation {
+    name = plannerName;
+    system = pkgs.stdenv.hostPlatform.system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" ''
+      set -euo pipefail
+      export PATH=${binPath}
+      ${lib.optionalString (pkgConfigPath != "")
+        "export PKG_CONFIG_PATH=${pkgConfigPath}"}
+      ${lib.optionalString (cIncludePath != "")
+        "export C_INCLUDE_PATH=${cIncludePath}"}
+      ${lib.optionalString (libraryPath != "")
+        "export LIBRARY_PATH=${libraryPath}"}
+      ${envExportLines}
 
-    runHook postInstall
-  '';
+      mkdir -p workspace
+      cp -r ${src}/. workspace/
+      chmod -R u+w workspace
 
-  installPhase = if isWindows then installPhaseWindows else installPhaseNative;
+      ${extraSourcesScript}
 
-  # -- wrapBinaries (postFixup) -------------------------------------------
-  wrapBinariesScript = lib.optionalString wrapBinaries ''
-    if [ -d "$out/bin" ]; then
-      for bin in $out/bin/*; do
-        [ -f "$bin" ] || continue
-        wrapProgram "$bin" \
-          --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath buildInputs}"
+      cd workspace
+
+      # cargo-schnee's cargoSetupPostPatchHook compatibility: when the
+      # vendor dir is read-only (it is — store path), point cargoDepsCopy
+      # at the original so Cargo.lock validation can still run.
+      export cargoDepsCopy="$cargoDeps"
+
+      ${preBuild}
+
+      # cargo plugin convention: argv[1] is the plugin name ("schnee").
+      # Global flags like --plan-only attach to the SchneeArgs subgroup
+      # and must come AFTER the plugin name.
+      ${schneeBin}/bin/cargo-schnee schnee \
+        --plan-only "$TMPDIR/plan-out.txt" \
+        --plan-aggregator-out "$TMPDIR/aggregator.txt" \
+        ${intent} \
+        --vendor-dir "$cargoDeps" \
+        ${schneeArgsStr} ${postDashArgsStr}
+
+      mkdir -p "$out"
+      cp "$TMPDIR/plan-out.txt" "$out/plan.txt"
+      cp "$TMPDIR/aggregator.txt" "$out/aggregator.txt"
+      # Copy the aggregator drv file under a FIXED filename so the
+      # wrapper-cp pattern below does not have to learn the name
+      # via `builtins.readFile`. Reading the file at eval time is an
+      # IFD that forces realising this planner derivation before the
+      # rest of the package can be evaluated; under Nix master's
+      # stricter handling of floating-output derivations this fails
+      # with "cannot operate on output 'out' of the unbuilt
+      # derivation". The bytes the wrapper copies are unchanged, so
+      # the content-addressed text-output hash (and therefore the
+      # `outputOf` chain) is identical.
+      AGG=$(${pkgs.coreutils}/bin/head -1 "$TMPDIR/aggregator.txt")
+      cp "$AGG" "$out/aggregator.drv"
+    '' ];
+
+    cargoDeps = effectiveCargoDeps;
+
+    requiredSystemFeatures = [ "recursive-nix" ];
+    NIX_CONFIG = "extra-experimental-features = "
+      + "flakes ca-derivations dynamic-derivations pipe-operators";
+
+    __contentAddressed = true;
+    outputHashMode = "recursive";
+    outputHashAlgo = "sha256";
+  };
+
+  # Wrap the aggregator drv in a tiny text-output drv whose `$out` is
+  # a byte-identical copy of the registered aggregator file.  Then
+  # `builtins.outputOf wrapper.outPath "out"` resolves to the
+  # aggregator's realisation, which the outer daemon builds — and
+  # transitively builds every root.
+  #
+  # The planner emits the aggregator drv at a fixed `$out/aggregator.drv`
+  # so we can reference it via a plain string interpolation. The
+  # earlier design read `aggregator.txt` via `builtins.readFile`,
+  # which is IFD: it forces the planner to be realised at eval time.
+  # Nix master's stricter handling of floating-output derivations
+  # rejects that with "cannot operate on output 'out' of the unbuilt
+  # derivation", so every downstream `nix build .#<pkg>` failed.
+  aggregatorWrapper = derivation {
+    name = "${finalPname}-${finalVersion}-aggregator.drv";
+    system = pkgs.stdenv.hostPlatform.system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" ''
+      ${pkgs.coreutils}/bin/cp ${planner}/aggregator.drv $out
+    '' ];
+    __contentAddressed = true;
+    outputHashMode = "text";
+    outputHashAlgo = "sha256";
+  };
+
+  aggregatorOutput = builtins.outputOf aggregatorWrapper.outPath "out";
+
+  # -- install step ------------------------------------------------------
+  isWindows = target != null
+    && (lib.hasInfix "windows" target || lib.hasInfix "msvc" target);
+
+  # Per-root layout copy.  Doc emits a `doc/` subtree of HTML; other
+  # intents emit linker output (a hash-suffixed binary plus .d /
+  # .rmeta sidecars).  Each root's loop runs against `$ROOT` and
+  # `$TARGET_NAME` injected at install time.  `$TARGET_NAME` is the
+  # canonical name cargo reports via `unit.target.name()`, propagated
+  # through the aggregator's `root-N.target_name` metadata file.
+  # Using it directly is the single source of truth for naming and
+  # avoids the brittle `_→-` filename heuristic that corrupts bins
+  # with genuinely underscored target names.
+  installRoot =
+    if intent == "doc" then ''
+      if [ -d "$ROOT/doc" ]; then
+        # --no-preserve=mode so files copied from a read-only nix
+        # store input land writeable, allowing subsequent doc roots
+        # to merge into the same tree without permission errors.
+        cp -r --no-preserve=mode "$ROOT/doc/." "$out/share/doc/"
+      fi
+    '' else if isWindows then ''
+      for f in "$ROOT"/*.exe "$ROOT"/*.dll "$ROOT"/*.pdb; do
+        [ -f "$f" ] || continue
+        ext="''${f##*.}"
+        mode=755
+        [ "$ext" = "pdb" ] && mode=644
+        install -m"$mode" "$f" "$out/bin/''${TARGET_NAME}.''${ext}"
       done
-    fi
+    '' else ''
+      for f in "$ROOT"/*; do
+        [ -f "$f" ] || continue
+        name="$(basename "$f")"
+        case "$name" in
+          *.d|*.rmeta|build-script-*|*-build-script|diagnostics) continue ;;
+        esac
+        case "$name" in
+          *.so|*.so.*|*.a|*.dylib)
+            # Native libs: keep cargo's `lib<crate>.<ext>` convention.
+            # Strip the per-unit hash; the underscored crate name is
+            # the canonical form for libs, so no further translation.
+            clean="$(echo "$name" | sed -E 's/-[0-9a-f]{16}//')"
+            install -m644 "$f" "$out/lib/$clean"
+            ;;
+          *)
+            if [ -x "$f" ]; then
+              install -m755 "$f" "$out/bin/''${TARGET_NAME}"
+            fi
+            ;;
+        esac
+      done
+    '';
+
+  installInit =
+    if intent == "doc" then ''mkdir -p "$out/share/doc"''
+    else ''mkdir -p "$out/bin" "$out/lib"'';
+
+  installFinish =
+    if intent == "doc" then ""
+    else ''rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true'';
+
+  installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
+    inherit meta;
+    aggregator = aggregatorOutput;
+    # Forward the caller's `nativeBuildInputs` so their setup hooks
+    # (e.g. `makeWrapper`'s `wrapProgram`, `installShellFiles`) load in
+    # `postInstall`.  autoPatchelfHook rewrites each installed ELF's RUNPATH
+    # from its actual DT_NEEDED against `buildInputs`, so dynamically-linked
+    # binaries find their libraries without an LD_LIBRARY_PATH wrapper; static
+    # binaries and Windows PE outputs have nothing to patch and are untouched.
+    nativeBuildInputs = nativeBuildInputs
+      ++ lib.optionals (!isWindows) [ pkgs.autoPatchelfHook ];
+    inherit buildInputs;
+    passthru = { inherit planner aggregatorWrapper aggregatorOutput; };
+  } ''
+    set -euo pipefail
+    ${installInit}
+    # Walk each root-N symlink in the aggregator output.  Each
+    # symlink target is a single cargo-schnee root drv's $out
+    # (binary, lib, doc subtree, etc.).  The sibling `root-N.target_name`
+    # text file (a regular file, filtered out by the `-d` guard) carries
+    # cargo's canonical target name for use in the rename below.
+    for ROOT in $aggregator/root-*; do
+      [ -d "$ROOT" ] || continue
+      TARGET_NAME="$(cat "''${ROOT}.target_name" 2>/dev/null || true)"
+      if [ -z "$TARGET_NAME" ] && [ "${intent}" != "doc" ]; then
+        echo "cargo-schnee: aggregator emitted no target_name for $ROOT" >&2
+        exit 1
+      fi
+      ${installRoot}
+      # Auxiliary output written by unitSetup scripts (SCHNEE_AUX_DIR)
+      # surfaces at a documented per-target location instead of leaving
+      # consumers to walk aggregator internals.  Roots without aux
+      # output contribute nothing; the directory is absent when no
+      # script wrote to it.  Doc roots carry no target name, so their
+      # aux output has no destination — warn instead of dropping it
+      # silently.
+      if [ -d "$ROOT/schnee-aux" ]; then
+        if [ -n "$TARGET_NAME" ]; then
+          mkdir -p "$out/schnee-aux/$TARGET_NAME"
+          cp -r --no-preserve=mode "$ROOT/schnee-aux/." \
+            "$out/schnee-aux/$TARGET_NAME/"
+        else
+          echo "cargo-schnee: discarding unitSetup auxiliary output of $ROOT: this root has no target name (doc roots do not); it remains readable inside the root's own store output" >&2
+        fi
+      fi
+    done
+    ${installFinish}
+    ${postInstall}
   '';
-
-  # -- Windows test runner (Wine) -----------------------------------------
-  # When targeting Windows with doCheck, automatically configure Wine so
-  # that consumers don't need to wire up the runner, HOME, DLL overrides,
-  # and display vars manually.
-  wineEnvAttrs = lib.optionalAttrs (isWindows && doCheck) {
-    "CARGO_TARGET_${cargoTargetEnvPrefix}_RUNNER" = "wine";
-    WINEDLLOVERRIDES = "mscoree=d;mshtml=d";
-    DISPLAY = "";
-  };
-
-  winePreCheck = lib.optionalString (isWindows && doCheck) ''
-    export HOME="$TMPDIR/wine-home"
-    mkdir -p "$HOME"
-    unset WAYLAND_DISPLAY
-  '';
-
-  # -- passthruEnv --------------------------------------------------------
-  passthruEnvAttrs = lib.optionalAttrs (passthruEnv != []) {
-    CARGO_SCHNEE_PASSTHRU_ENVS = builtins.concatStringsSep " " passthruEnv;
-  };
-
-  # -- extra args passthrough ---------------------------------------------
-  # Forward unrecognised attributes (e.g. postUnpack, patches, …) to
-  # buildRustPackage, excluding the ones we consumed above.
-  consumedKeys = [
-    "pkgs" "src" "cargoLock" "cargoHash" "cargoDeps"
-    "pname" "version" "package" "hostPkgs" "target" "rustToolchain"
-    "nativeBuildInputs" "buildInputs" "cargoExtraArgs"
-    "extraSources" "env" "passthruEnv" "wrapBinaries" "doCheck"
-    "preCheck" "postCheck"
-    "buildType" "preBuild" "postBuild" "postInstall" "postFixup" "meta"
-  ];
-  extraAttrs = removeAttrs args consumedKeys;
 
 in
-  assert lib.assertMsg (!(wrapBinaries && isWindows))
-    "cargo-schnee buildPackage: wrapBinaries is not supported for Windows targets (dontFixup is required for PE binaries)";
-
-  schneeRustPlatform.buildRustPackage (vendorArgs // extraAttrs // {
-    pname = finalPname;
-    version = finalVersion;
-    inherit src;
-    inherit buildType;
-    inherit cargoBuildFlags;
-    inherit installPhase;
-    inherit preBuild postBuild postInstall meta;
-
-    nativeBuildInputs = [ pkgs.nix ]
-      ++ nativeBuildInputs
-      ++ lib.optionals wrapBinaries [ pkgs.makeWrapper ]
-      ++ lib.optionals (isWindows && doCheck) [ pkgs.wineWow64Packages.stable ];
-
-    inherit buildInputs;
-
-    # cargo-schnee invariants — these must not leak to the consumer
-    requiredSystemFeatures = [ "recursive-nix" ];
-    NIX_CONFIG = "extra-experimental-features = flakes pipe-operators ca-derivations";
-    auditable = false;
-    inherit doCheck postCheck;
-    preCheck = winePreCheck + preCheck;
-
-    # Skip nixpkgs' cargoSetupPostUnpackHook (cp -Lr + chmod -R of the vendor
-    # dir).  cargo-schnee reads $cargoDeps directly via --vendor-dir.
-    dontCargoSetupPostUnpack = true;
-
-    # Set cargoDepsCopy so cargoSetupPostPatchHook's Cargo.lock validation
-    # still works against the original (read-only) vendor path.
-    postUnpack = ''
-      export cargoDepsCopy="$cargoDeps"
-    '' + (args.postUnpack or "") + extraSourcesScript;
-
-    postFixup = wrapBinariesScript + postFixup;
-
-    env = wineEnvAttrs // env // passthruEnvAttrs;
-  } // lib.optionalAttrs (target != null) {
-    # Bypass cargoBuildHook/cargoCheckHook which inject the host --target.
-    buildPhase = buildPhaseForTarget;
-    checkPhase = checkPhaseForTarget;
-  } // lib.optionalAttrs isWindows {
-    # patchelf/strip don't work on PE binaries
-    dontFixup = true;
-  })
+  installed

@@ -1,0 +1,10 @@
+[package]
+name = "my-macro"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+host-only-sys = { path = "../host-only-sys" }

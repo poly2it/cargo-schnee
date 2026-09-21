@@ -28,12 +28,42 @@ let
     cargoDeps = cargoVendoredDeps;
   };
 
+  # Pre-compute the cargo unit graph once and feed it to both variants
+  # via `CARGO_SCHNEE_UNIT_GRAPH`. The graph is a deterministic function
+  # of cargo's resolution inputs (Cargo.lock + workspace Cargo.toml
+  # files + cargoDeps + cargo-schnee version + profile/target/etc.).
+  # `justSrc` and `justSrcModified` share Cargo.lock and the same
+  # Cargo.toml content — only `src/lib.rs` / `src/main.rs` differ — so
+  # one graph file serves both.
+  unitGraphDrv = cargo-schnee.lib.unitGraph {
+    inherit pkgs rustToolchain;
+    src = justSrc;
+    cargoDeps = cargoVendoredDeps;
+  };
+
+  # Capture cargo-schnee's planner spans into a Chrome `trace_event`
+  # file under the VM's 9p-shared `/results` mount, one file per
+  # variant. The host runner copies these into `bench/profiles/`
+  # alongside the existing nixprof traces — see the matching `cp` glob
+  # in `bench/flake.nix`.
+  #
+  # `bench/nix/vm.nix` chmods `/results` 1777 at boot so the build user
+  # (`nixbld`) can write through the mount; without that, `init_tracing`
+  # in cargo-schnee logs a warning and silently disables the chrome
+  # layer rather than crashing the binary.
+  schneeBenchEnv = name: {
+    CARGO_SCHNEE_TRACE = "/results/schnee-planner-${name}.trace_event";
+    CARGO_SCHNEE_UNIT_GRAPH = "${unitGraphDrv}";
+  };
+
 in {
   clean = cargo-schnee.lib.buildPackage (common // {
     src = justSrc;
+    env = schneeBenchEnv "clean";
   });
 
   incremental = cargo-schnee.lib.buildPackage (common // {
     src = justSrcModified;
+    env = schneeBenchEnv "incremental";
   });
 }

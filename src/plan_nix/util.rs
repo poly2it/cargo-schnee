@@ -1,5 +1,6 @@
 use crate::nix_encoding::NIX_BASE32;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,13 @@ pub(crate) fn collect_store_paths(s: &str, paths: &mut HashSet<String>) {
             let hash_part = &after_prefix[..32];
             if hash_part.bytes().all(|b| NIX_BASE32.contains(&b)) {
                 let rest = &after_prefix[33..];
-                let name_end = rest.find(['/', ' ', '"', '\'', ')']).unwrap_or(rest.len());
+                // `=` terminates the name so `--remap-path-prefix
+                // <store-path>=<replacement>` doesn't accidentally extend the
+                // captured path past the literal store entry.  `=` is not a
+                // valid character in Nix store names so this is loss-free.
+                let name_end = rest
+                    .find(['/', ' ', '"', '\'', ')', '='])
+                    .unwrap_or(rest.len());
                 let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
                 paths.insert(root.to_string());
             }
@@ -30,6 +37,26 @@ pub(super) fn which_rustc() -> Result<PathBuf> {
 
 pub(super) fn which_rustdoc() -> Result<PathBuf> {
     which_command("rustdoc")
+}
+
+pub(super) fn which_clippy_driver() -> Result<PathBuf> {
+    which_command("clippy-driver")
+}
+
+/// Resolve `bash` on PATH and return the canonical binary path together
+/// with the containing store root.  Derivations that name `bash` as
+/// `"builder"` must list the store root in `inputSrcs`; otherwise the
+/// sandbox does not bind-mount it and the build fails with
+/// `executing '/nix/store/.../bin/bash': No such file or directory`.
+pub(super) fn which_bash() -> Result<(String, String)> {
+    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let bash_store = PathBuf::from(&bash_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path from {}", bash_path))?
+        .to_string_lossy()
+        .to_string();
+    Ok((bash_path, bash_store))
 }
 
 pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
@@ -155,6 +182,27 @@ pub(crate) fn shell_quote(s: &str) -> String {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The `/tmp` path a `TestCompile` unit uses as `CARGO_MANIFEST_DIR`.
+///
+/// The compile derivation points this symlink at the crate's read-only store
+/// path so proc macros such as `sqlx::migrate!` can read the crate's files,
+/// and the test runner re-points the same path at the writable checkout so
+/// `std::env::var("CARGO_MANIFEST_DIR")` and the `env!` value baked into the
+/// binary both resolve somewhere writable.
+///
+/// `store_manifest_dir` is the crate's content-addressed store path, never the
+/// checkout path. Hashing the checkout path would put the location of the tree
+/// into the derivation, so the same crate compiled from two directories would
+/// build twice and neither result could substitute for the other.
+pub(crate) fn manifest_symlink_name(store_manifest_dir: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(store_manifest_dir.as_bytes());
+    format!(
+        "/tmp/_schnee_md_{}",
+        crate::nix_encoding::hex_lower(&hasher.finalize()[..8])
+    )
 }
 
 pub(crate) fn sanitize_drv_name(name: &str) -> String {
@@ -291,6 +339,20 @@ mod tests {
             &mut paths,
         );
         assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-start"));
+    }
+
+    #[test]
+    fn collect_store_paths_terminates_at_equals() {
+        // `--remap-path-prefix <path>=<replacement>` lands a literal
+        // `<store-path>=<replacement>` token in the script.  The replacement
+        // must not be appended to the captured store path.
+        let mut paths = HashSet::new();
+        collect_store_paths(
+            "--remap-path-prefix /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src=crates",
+            &mut paths,
+        );
+        assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src"));
+        assert!(!paths.iter().any(|p| p.contains("=crates")));
     }
 
     #[test]

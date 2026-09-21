@@ -1,0 +1,17 @@
+[package]
+name = "lib-lower"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# `lib-upper` is a regular consumer of `lib-lower`'s production API.
+# Pulling it back in as a dev-dep — to exercise the upper-level API
+# from this crate's integration tests — creates a dev-dep cycle that
+# cargo's planner resolves cleanly only because `Check{test:true}`
+# and `Check{test:false}` of the same lib are distinct units.  If
+# cargo-schnee collapses those two variants into one NixUnit, the
+# dev-dep edge from `lib-lower (test:true)` back to `lib-upper`
+# closes a cycle that breaks topological registration.
+[dev-dependencies]
+lib-upper = { path = "../lib-upper" }
