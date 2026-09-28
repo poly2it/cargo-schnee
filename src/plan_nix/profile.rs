@@ -126,8 +126,8 @@ impl UnitProfile {
 
 /// Decide for every unit whether rustc runs LTO, emits bitcode, or both.
 ///
-/// This is Cargo 0.95's private `core::compiler::lto::generate`, carried over
-/// unchanged. Cargo only computes the map inside `BuildRunner::compile` and
+/// This is `generate` and `calculate` from `src/cargo/core/compiler/lto.rs`
+/// of the `cargo` crate 0.95.0, carried over unchanged. Cargo only computes the map inside `BuildRunner::compile` and
 /// `BuildRunner::dry_run`, which consume the runner and drop the map, so a
 /// caller that only plans has no public way to read it.
 /// The `codegen_flags_match_cargo_*` tests compare the resulting flags with
@@ -242,13 +242,13 @@ mod tests {
     /// A workspace with one unit of each kind whose flags Cargo derives
     /// differently: `pmdep` is only a proc-macro dependency, `shared` is
     /// linked by the proc macro and by the binary and carries a
-    /// per-package override, `withbuild` has a build script, and `app`
-    /// links everything with LTO.
+    /// per-package override, `withbuild` has a build script, `app` links
+    /// everything with LTO, and `plugin` is a `cdylib` that runs LTO too.
     const FIXTURE: &[(&str, &str)] = &[
         (
             "Cargo.toml",
             r#"[workspace]
-members = ["app", "pm", "pmdep", "shared", "withbuild"]
+members = ["app", "plugin", "pm", "pmdep", "shared", "withbuild"]
 resolver = "2"
 
 [profile.release]
@@ -323,6 +323,24 @@ withbuild = { path = "../withbuild" }
             "app/src/main.rs",
             "fn main() { println!(\"{}\", pm::three!() + shared::m() + withbuild::k()); }\n",
         ),
+        (
+            "plugin/Cargo.toml",
+            r#"[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+shared = { path = "../shared" }
+"#,
+        ),
+        (
+            "plugin/src/lib.rs",
+            "#[no_mangle]\npub extern \"C\" fn plugin() -> u32 { shared::m() }\n",
+        ),
     ];
 
     /// `-C` keys whose values come from the profile or the LTO decision.
@@ -381,11 +399,11 @@ withbuild = { path = "../withbuild" }
             .arg(dir.join("target"))
             .current_dir(dir)
             .env("CARGO_HOME", home.path());
+        // `CARGO_PROFILE_*` stays, because the in-process planner reads it too
+        // and nixpkgs' hooks set `CARGO_PROFILE_RELEASE_STRIP=false`.
+        // cargo-schnee ignores `RUSTFLAGS`, so Cargo must not see them.
         for (k, _) in std::env::vars() {
-            if k.starts_with("CARGO_PROFILE_")
-                || k.contains("RUSTFLAGS")
-                || k == "CARGO_INCREMENTAL"
-            {
+            if k.contains("RUSTFLAGS") {
                 cmd.env_remove(k);
             }
         }
@@ -422,8 +440,13 @@ withbuild = { path = "../withbuild" }
         (rustc, scripts)
     }
 
+    /// `fresh_unit_graph` sets `CARGO_HOME` and the working directory of the
+    /// whole process, so two planners must not overlap.
+    static PLANNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn schnee_invocations(dir: &Path, profile: &str) -> (Invocations, ScriptEnvs) {
         let vendor = tempfile::tempdir().unwrap();
+        let guard = PLANNER.lock().unwrap_or_else(|e| e.into_inner());
         let (units, _, _) = fresh_unit_graph(
             dir,
             vendor.path(),
@@ -438,6 +461,7 @@ withbuild = { path = "../withbuild" }
             None,
         )
         .unwrap();
+        drop(guard);
         let key_to_idx: HashMap<String, usize> = units
             .iter()
             .enumerate()
@@ -503,7 +527,9 @@ withbuild = { path = "../withbuild" }
         let (cargo_rustc, cargo_scripts) = cargo_invocations(dir.path(), profile);
         let (schnee_rustc, schnee_scripts) = schnee_invocations(dir.path(), profile);
         assert!(
-            cargo_rustc.contains_key("pmdep lib") && cargo_rustc.contains_key("app bin"),
+            ["pmdep lib", "app bin", "plugin cdylib"]
+                .iter()
+                .all(|k| cargo_rustc.contains_key(*k)),
             "cargo -vv output was not parsed: {cargo_rustc:#?}"
         );
         assert_eq!(
