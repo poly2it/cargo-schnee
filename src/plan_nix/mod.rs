@@ -2662,6 +2662,29 @@ pub(crate) fn construct_aggregator_drv(
         .to_string_lossy()
         .to_string();
 
+    let json = aggregator_drv_json(
+        pname,
+        intent,
+        root_drvs,
+        system,
+        &bash_path,
+        &bash_store,
+        &coreutils_store,
+    )?;
+    nix_derivation_add(&json)
+}
+
+/// The derivation IR that `construct_aggregator_drv` registers, with the
+/// tool paths passed in so it can be built without probing `PATH`.
+fn aggregator_drv_json(
+    pname: &str,
+    intent: &str,
+    root_drvs: &[(String, String, UnitKind)],
+    system: &str,
+    bash_path: &str,
+    bash_store: &str,
+    coreutils_store: &str,
+) -> Result<serde_json::Value> {
     let mut input_drvs = serde_json::Map::new();
     let mut placeholders: Vec<String> = Vec::with_capacity(root_drvs.len());
     let mut target_names: Vec<String> = Vec::with_capacity(root_drvs.len());
@@ -2717,8 +2740,19 @@ pub(crate) fn construct_aggregator_drv(
         "rootNames".into(),
         serde_json::Value::String(target_names.join("\n")),
     );
+    // No substituter can hold a trace for a derivation whose inputs are
+    // this machine's unit derivations, so without these Nix asks every
+    // configured cache for one on every build and waits for a 404.
+    env.insert(
+        "preferLocalBuild".into(),
+        serde_json::Value::String("1".into()),
+    );
+    env.insert(
+        "allowSubstitutes".into(),
+        serde_json::Value::String("".into()),
+    );
 
-    let json = serde_json::json!({
+    Ok(serde_json::json!({
         "name": format!("{}-{}-aggregator", pname, intent),
         "system": system,
         "builder": bash_path,
@@ -2727,14 +2761,33 @@ pub(crate) fn construct_aggregator_drv(
         "inputDrvs": input_drvs,
         "inputSrcs": [coreutils_store, bash_store],
         "env": env,
-    });
-
-    nix_derivation_add(&json)
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregator_drv_is_built_locally_without_substitution() {
+        let roots = vec![(
+            "/nix/store/00000000000000000000000000000000-app.drv".to_string(),
+            "app".to_string(),
+            UnitKind::Compile,
+        )];
+        let json = aggregator_drv_json(
+            "app",
+            "build",
+            &roots,
+            "x86_64-linux",
+            "/nix/store/11111111111111111111111111111111-bash/bin/bash",
+            "/nix/store/11111111111111111111111111111111-bash",
+            "/nix/store/22222222222222222222222222222222-coreutils",
+        )
+        .unwrap();
+        assert_eq!(json["env"]["allowSubstitutes"], "");
+        assert_eq!(json["env"]["preferLocalBuild"], "1");
+    }
 
     #[test]
     fn chunk_round_robin_distributes_evenly() {
