@@ -408,6 +408,36 @@ impl NixUnit {
     }
 }
 
+/// Prefix pairs that map source paths in compiler diagnostics back to the
+/// checkout at `project_dir`. Each per-crate slice maps to its member
+/// directory, and the whole project-src tree at `src_store` maps to
+/// `project_dir`. The checkout path stays out of every derivation, so the
+/// derivations do not differ between machines.
+pub fn diagnostic_path_remaps(
+    units: &[NixUnit],
+    src_store: &str,
+    project_dir: &Path,
+) -> Vec<(String, String)> {
+    let slices: std::collections::BTreeMap<String, String> = units
+        .iter()
+        .filter(|u| u.is_local)
+        .filter_map(|u| {
+            let rel = u.sliced_crate_rel.as_ref()?;
+            Some((
+                format!("{}/", u.manifest_dir),
+                format!("{}/{}/", project_dir.display(), rel),
+            ))
+        })
+        .collect();
+    slices
+        .into_iter()
+        .chain(std::iter::once((
+            format!("{src_store}/"),
+            format!("{}/", project_dir.display()),
+        )))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------

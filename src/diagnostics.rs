@@ -11,9 +11,17 @@ struct CompilerMessage {
     rendered: Option<String>,
 }
 
+/// `(store prefix, checkout prefix)` pairs, each ending in `/`, that map the
+/// source paths rustc saw in the sandbox back to the user's checkout.
+pub type PathRemaps = [(String, String)];
+
 /// Remap Nix store source paths to local project paths in a string.
-fn remap_paths(text: &str, src_store_prefix: &str, project_dir_prefix: &str) -> String {
-    text.replace(src_store_prefix, project_dir_prefix)
+fn remap_paths(text: &str, remaps: &PathRemaps) -> String {
+    remaps
+        .iter()
+        .fold(text.to_string(), |acc, (store, checkout)| {
+            acc.replace(store.as_str(), checkout)
+        })
 }
 
 /// Process a line from nix-store --realise stderr.
@@ -21,12 +29,7 @@ fn remap_paths(text: &str, src_store_prefix: &str, project_dir_prefix: &str) -> 
 /// Only rustc JSON diagnostics (with a `rendered` field) are remapped and rendered.
 /// All other lines (build script output, non-JSON nix messages, etc.) are silently dropped.
 /// Returns `true` if the line was a JSON diagnostic (rendered or suppressed summary).
-pub fn emit_line(
-    shell: &mut Shell,
-    line: &str,
-    src_store_prefix: &str,
-    project_dir_prefix: &str,
-) -> bool {
+pub fn emit_line(shell: &mut Shell, line: &str, remaps: &PathRemaps) -> bool {
     // Check if this is valid JSON with a rendered field at all
     let Ok(msg) = serde_json::from_str::<CompilerMessage>(line) else {
         return false;
@@ -42,7 +45,7 @@ pub fn emit_line(
     {
         return true;
     }
-    let remapped = remap_paths(&rendered, src_store_prefix, project_dir_prefix);
+    let remapped = remap_paths(&rendered, remaps);
     // print_ansi_stderr handles ANSI → terminal color translation (or stripping if piped)
     let _ = shell.print_ansi_stderr(remapped.as_bytes());
     true
@@ -53,8 +56,7 @@ pub fn emit_line(
 pub fn replay_diagnostics_from_file(
     shell: &mut Shell,
     diagnostics_path: &std::path::Path,
-    src_store_prefix: &str,
-    project_dir_prefix: &str,
+    remaps: &PathRemaps,
 ) {
     let file = match std::fs::File::open(diagnostics_path) {
         Ok(f) => f,
@@ -64,7 +66,7 @@ pub fn replay_diagnostics_from_file(
     use std::io::BufRead;
     for line in reader.lines().map_while(Result::ok) {
         if !line.is_empty() {
-            emit_line(shell, &line, src_store_prefix, project_dir_prefix);
+            emit_line(shell, &line, remaps);
         }
     }
 }
@@ -73,28 +75,22 @@ pub fn replay_diagnostics_from_file(
 mod tests {
     use super::*;
 
+    fn remaps() -> Vec<(String, String)> {
+        vec![("/nix/store/src/".into(), "/home/user/".into())]
+    }
+
     #[test]
     fn emit_returns_true_for_diagnostic() {
         let json = r#"{"rendered":"warning: unused variable\n","message":"unused variable","level":"warning","code":null,"spans":[],"children":[]}"#;
         let mut shell = Shell::new();
-        assert!(emit_line(
-            &mut shell,
-            json,
-            "/nix/store/src/",
-            "/home/user/"
-        ));
+        assert!(emit_line(&mut shell, json, &remaps()));
     }
 
     #[test]
     fn emit_returns_true_for_artifact_json() {
         let json = r#"{"artifact":"/nix/store/foo","emit":"link"}"#;
         let mut shell = Shell::new();
-        assert!(emit_line(
-            &mut shell,
-            json,
-            "/nix/store/src/",
-            "/home/user/"
-        ));
+        assert!(emit_line(&mut shell, json, &remaps()));
     }
 
     #[test]
@@ -103,10 +99,9 @@ mod tests {
         assert!(!emit_line(
             &mut shell,
             "building '/nix/store/foo.drv'...",
-            "/nix/store/src/",
-            "/home/user/"
+            &remaps()
         ));
-        assert!(!emit_line(&mut shell, "", "/nix/store/src/", "/home/user/"));
+        assert!(!emit_line(&mut shell, "", &remaps()));
     }
 
     #[test]
@@ -114,28 +109,13 @@ mod tests {
         let mut shell = Shell::new();
 
         let json = r#"{"rendered":"aborting due to 3 previous errors\n"}"#;
-        assert!(emit_line(
-            &mut shell,
-            json,
-            "/nix/store/src/",
-            "/home/user/"
-        ));
+        assert!(emit_line(&mut shell, json, &remaps()));
 
         let json = r#"{"rendered":"warning: 2 warnings emitted\n"}"#;
-        assert!(emit_line(
-            &mut shell,
-            json,
-            "/nix/store/src/",
-            "/home/user/"
-        ));
+        assert!(emit_line(&mut shell, json, &remaps()));
 
         let json = r#"{"rendered":"warning: 1 warning emitted\n"}"#;
-        assert!(emit_line(
-            &mut shell,
-            json,
-            "/nix/store/src/",
-            "/home/user/"
-        ));
+        assert!(emit_line(&mut shell, json, &remaps()));
     }
 
     #[test]
@@ -143,8 +123,10 @@ mod tests {
         let text = "/nix/store/abc123-project-src/src/main.rs:5:1 warning: unused";
         let remapped = remap_paths(
             text,
-            "/nix/store/abc123-project-src/",
-            "/home/user/project/",
+            &[(
+                "/nix/store/abc123-project-src/".into(),
+                "/home/user/project/".into(),
+            )],
         );
         assert_eq!(
             remapped,
@@ -153,9 +135,26 @@ mod tests {
     }
 
     #[test]
+    fn remap_every_sliced_crate() {
+        let text = " --> /nix/store/aaa-warn-bin/src/main.rs:2:9\n \
+                    --> /nix/store/bbb-warn-lib/src/lib.rs:2:9";
+        let remapped = remap_paths(
+            text,
+            &[
+                ("/nix/store/aaa-warn-bin/".into(), "/ws/warn-bin/".into()),
+                ("/nix/store/bbb-warn-lib/".into(), "/ws/warn-lib/".into()),
+            ],
+        );
+        assert_eq!(
+            remapped,
+            " --> /ws/warn-bin/src/main.rs:2:9\n --> /ws/warn-lib/src/lib.rs:2:9"
+        );
+    }
+
+    #[test]
     fn remap_no_match() {
         let text = "error: some other message";
-        let remapped = remap_paths(text, "/nix/store/xyz/", "/home/user/project/");
+        let remapped = remap_paths(text, &remaps());
         assert_eq!(remapped, text);
     }
 }

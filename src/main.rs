@@ -2475,8 +2475,7 @@ fn run_build_pipeline(
     let gctx = GlobalContext::default()?;
     let mut progress = Progress::with_style("Building", ProgressStyle::Ratio, &gctx);
     let mut diag_shell = cargo::core::shell::Shell::new();
-    let src_store_prefix = format!("{}/", src_store);
-    let project_dir_prefix = format!("{}/", project_dir.display());
+    let path_remaps = plan_nix::diagnostic_path_remaps(&plan_units, &src_store, project_dir);
     let mut nix_error_lines: Vec<String> = Vec::new();
 
     for line in reader.lines().map_while(Result::ok) {
@@ -2581,12 +2580,7 @@ fn run_build_pipeline(
             progress.clear();
             // Nix prefixes "Last N log lines" with "> "; strip before checking
             let content = trimmed.strip_prefix("> ").unwrap_or(trimmed);
-            let was_diagnostic = diagnostics::emit_line(
-                &mut diag_shell,
-                content,
-                &src_store_prefix,
-                &project_dir_prefix,
-            );
+            let was_diagnostic = diagnostics::emit_line(&mut diag_shell, content, &path_remaps);
             if !was_diagnostic {
                 nix_error_lines.push(trimmed.to_string());
             }
@@ -2768,8 +2762,7 @@ fn run_build_pipeline(
                 diagnostics::replay_diagnostics_from_file(
                     &mut diag_shell,
                     &Path::new(&out_path).join("diagnostics"),
-                    &src_store_prefix,
-                    &project_dir_prefix,
+                    &path_remaps,
                 );
             }
         }

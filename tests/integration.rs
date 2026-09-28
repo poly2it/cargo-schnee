@@ -1437,3 +1437,24 @@ fn fixture_warnings_replay_once() {
     );
     let _ = std::fs::remove_dir_all(&project);
 }
+
+/// Warnings from per-crate source slices point at the member's directory in
+/// the checkout, not at the slice's store path.
+#[test]
+#[ignore]
+fn fixture_warnings_point_at_checkout() {
+    let project = fresh_fixture_copy("warnings-workspace");
+    let (_, stderr) = run_schnee_build(&project.join("Cargo.toml"));
+    for file in ["warn-lib/src/lib.rs:2:9", "warn-bin/src/main.rs:2:9"] {
+        let expected = format!("--> {}/{file}", project.display());
+        assert!(
+            stderr.contains(&expected),
+            "expected `{expected}` in stderr:\n{stderr}",
+        );
+    }
+    assert!(
+        !stderr.contains("--> /nix/store/"),
+        "a warning points into the store:\n{stderr}",
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
