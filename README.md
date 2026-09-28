@@ -1058,13 +1058,6 @@ cargo schnee build --write-profile-to profile.txt \
 # Verify in-process .drv path computation against nix derivation add.
 cargo schnee build --verify-drv-paths \
     --manifest-path examples/simple/Cargo.toml
-
-# Override the per-level worker count for derivation registration. Pass
-# `1` to reproduce the pre-Phase-4 serial path; defaults to the number
-# of available CPU cores capped per topological level by the level's
-# width.
-cargo schnee build --registration-jobs 1 \
-    --manifest-path examples/simple/Cargo.toml
 ```
 
 ### Pre-computed unit graphs
@@ -1114,6 +1107,5 @@ a stale or wrong-input graph is silently ignored rather than served.
 | `CARGO_TARGET_<TRIPLE>_LINKER` | Cross-linker for the given target triple. Used in derivation builder scripts. |
 | `CARGO_TARGET_<TRIPLE>_RUNNER` | Runner for cross-compiled binaries, such as `wine`. Required by `run`, `test`, and `bench` on cross targets. |
 | `CARGO_SCHNEE_UNIT_GRAPH` | Path (file or directory containing `graph.json`) to a pre-computed unit-graph entry from `cargo-schnee compute-graph` or `lib.unitGraph`. cargo-schnee validates the embedded key against the current invocation's resolution inputs and falls back to a fresh bootstrap on mismatch. |
-| `CARGO_SCHNEE_REGISTRATION_JOBS` | Worker count for parallel derivation registration. The `--registration-jobs` flag takes precedence; the env var is for callers that can't pass cargo-schnee args through (e.g. consumers of `lib.buildPackage`). |
 | `CARGO_SCHNEE_TRACE` | Path to write a `chrome://tracing` JSON file capturing the planner's internal phases (`extract_units`, `query_closures`, `compute_topo_levels`, `register_derivations`). Disabled when unset. |
 | `SCHNEE_LOG` | Tracing-subscriber filter, same syntax as `RUST_LOG`. Defaults to `cargo_schnee=warn` (verbosity bumps with `-v`/`-vv`/`-vvv`). |

@@ -863,7 +863,7 @@ fn check_system_libraries(
 /// Returns `(root_drv_path, units_for_caching)`.
 /// Per-unit data needed for derivation registration in a topological
 /// level. Computed once per level so the batched validity probe and the
-/// possibly-parallel writes both work from the same struct.
+/// registration writes both work from the same struct.
 struct LevelUnit {
     /// Index into the outer `nix_units` slice.
     i: usize,
@@ -893,9 +893,9 @@ fn ensure_path_match(observed: &str, unit: &LevelUnit) -> Result<()> {
 /// daemon, with one reconnect attempt on transient failure, falling
 /// through to `nix derivation add` (CLI) when the daemon is unreachable.
 ///
-/// `conn` reflects the *connection state for the current chunk*: a
-/// successful reconnect updates it in place; a permanent failure clears
-/// it so subsequent calls skip the daemon path entirely. Either way the
+/// `conn` is the planner's connection. A successful reconnect updates it
+/// in place, and a permanent failure clears it so subsequent calls skip
+/// the daemon path entirely. Either way the
 /// returned path is verified against the in-process computation.
 fn register_unit(conn: &mut Option<NixDaemonConn>, unit: &LevelUnit) -> Result<String> {
     let refs: Vec<&str> = unit.refs.iter().map(|s| s.as_str()).collect();
@@ -1771,12 +1771,6 @@ pub fn run_plan_nix(
     // before the driver invocation; non-matching units are byte-identical
     // to a run without rules.
     unit_setup: &[UnitSetupRule],
-    // Number of parallel daemon connections to use for derivation
-    // registration. `None` defaults to the number of available CPU
-    // cores; `Some(1)` reproduces the pre-parallel behaviour. Capped
-    // per topo level by the level's width so registration of small
-    // levels does not over-allocate connections.
-    registration_jobs: Option<usize>,
     // Mirror of `cargo --all-targets`: when true, plan tests, examples
     // and benches alongside the default lib + bins.  Used by
     // `cargo schnee clippy --all-targets` so lint coverage extends to
@@ -2328,26 +2322,13 @@ pub fn run_plan_nix(
     let mut cache_hits = 0usize;
     let mut cache_misses = 0usize;
 
-    // Cap on how many daemon connections to use in parallel for cache-miss
-    // registration. Honoured per level (capped further by the level's
-    // miss count), so small levels do not over-allocate. `verify_drv_paths`
-    // forces serial execution because the verify path always re-adds via
-    // the CLI to compare paths.
-    let parallel_jobs = if verify_drv_paths {
-        1
-    } else {
-        let cpu = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        std::cmp::max(1, registration_jobs.unwrap_or(cpu))
-    };
+    // Units within a level are constructed on one thread per core.
+    let construct_jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
-    let _register_span = tracing::info_span!(
-        "register_derivations",
-        levels = topo_levels.len(),
-        parallel_jobs = parallel_jobs,
-    )
-    .entered();
+    let _register_span =
+        tracing::info_span!("register_derivations", levels = topo_levels.len()).entered();
 
     // Changes 1 and 2: slice each local compile/test/doc unit's source — and each
     // vendored dep's units — to their own per-crate NAR (see
@@ -2448,8 +2429,8 @@ pub fn run_plan_nix(
             })
         };
 
-        let level_units: Vec<LevelUnit> = if parallel_jobs > 1 && level.len() > 1 {
-            let n_workers = std::cmp::min(parallel_jobs, level.len());
+        let level_units: Vec<LevelUnit> = if construct_jobs > 1 && level.len() > 1 {
+            let n_workers = std::cmp::min(construct_jobs, level.len());
             let chunks = chunk_round_robin(level.clone(), n_workers);
             std::thread::scope(|s| -> Result<Vec<LevelUnit>> {
                 let handles: Vec<_> = chunks
@@ -2520,6 +2501,9 @@ pub fn run_plan_nix(
     // `nix_units[.].drv_path` were already seeded with the computed
     // paths in phase 1, and `register_unit` verifies the daemon returns
     // exactly those paths, so registration is pure side effect here.
+    // Registration runs serially over the planner's one connection. The
+    // daemon serialises store writes on SQLite's write lock, and parallel
+    // connections measured up to three times slower on rust-analyzer.
     for (level_idx, level_units) in levels_units.into_iter().enumerate() {
         let width = level_units.len();
         let _level_span =
@@ -2556,52 +2540,10 @@ pub fn run_plan_nix(
             .collect();
         cache_hits += width - misses.len();
 
-        if misses.is_empty() {
-            continue;
-        }
-
-        let n_workers = std::cmp::min(parallel_jobs, misses.len());
         cache_misses += misses.len();
-
-        if n_workers <= 1 {
-            // Serial path: reuse the daemon connection across levels.
-            for unit in misses {
-                let path = register_unit(&mut daemon, &unit)?;
-                info!("Added {} -> {}", unit.unit_key, path);
-            }
-        } else {
-            // Parallel path: round-robin distribute misses across workers,
-            // each spawning a fresh daemon connection inside its scope.
-            // Per-worker connections trade ~2 ms × n_workers of handshake
-            // for the win of overlapping daemon writes; on the Just bench
-            // that is roughly 8 ms vs ~3.6 s of serial registration.
-            let _s = tracing::info_span!(
-                "parallel_register",
-                workers = n_workers,
-                misses = misses.len(),
-            )
-            .entered();
-            let chunks = chunk_round_robin(misses, n_workers);
-            std::thread::scope(|s| -> Result<()> {
-                let handles: Vec<_> = chunks
-                    .into_iter()
-                    .map(|chunk| {
-                        s.spawn(move || -> Result<()> {
-                            let mut conn = NixDaemonConn::connect().ok();
-                            for unit in chunk {
-                                let path = register_unit(&mut conn, &unit)?;
-                                info!("Added {} -> {}", unit.unit_key, path);
-                            }
-                            Ok(())
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    h.join()
-                        .map_err(|_| anyhow::anyhow!("registration worker panicked"))??;
-                }
-                Ok(())
-            })?;
+        for unit in misses {
+            let path = register_unit(&mut daemon, &unit)?;
+            info!("Added {} -> {}", unit.unit_key, path);
         }
     }
     drop(_register_span);

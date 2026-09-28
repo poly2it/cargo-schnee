@@ -51,14 +51,6 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     verify_drv_paths: bool,
 
-    /// Number of parallel daemon connections to use for derivation
-    /// registration.  Defaults to the number of available CPU cores,
-    /// capped per topo level by the level's width.  Set to `1` to
-    /// reproduce the pre-parallel behaviour for diagnosing
-    /// non-determinism.
-    #[arg(long, global = true)]
-    registration_jobs: Option<usize>,
-
     /// Plan and register derivations, then write the resulting root drv
     /// paths (one per line) to the given file and exit without realising
     /// anything.  Used by Nix-side helpers (`lib.buildPackage` etc.) to
@@ -2354,11 +2346,6 @@ fn run_build_pipeline(
     // Empty for non-clippy commands and ignored for dependency units so
     // their per-unit derivations stay byte-shared with regular runs.
     clippy_lint_args: &[String],
-    // Worker count for parallel derivation registration. `None` defaults
-    // to the number of available CPU cores; `Some(1)` reproduces the
-    // pre-parallel behaviour. Capped per level by the level's width
-    // inside `run_plan_nix`.
-    registration_jobs: Option<usize>,
     // When `Some(path)`, write the root drv paths (one per line) to
     // `path` after registration completes and return early without
     // realising anything.  See `SchneeArgs::plan_only`.
@@ -2596,7 +2583,6 @@ fn run_build_pipeline(
         clippy_lint_args,
         &path_prefix_remaps,
         &unit_setup,
-        registration_jobs,
         all_targets,
         resolution,
     )?;
@@ -3193,16 +3179,6 @@ fn main() -> Result<()> {
     let verbose = args.verbose;
     let write_profile_to = args.write_profile_to;
     let verify_drv_paths = args.verify_drv_paths;
-    // CLI flag wins over env var; the env var is so callers that can't
-    // pass cargo-schnee args through (e.g. `lib.buildPackage` consumers
-    // who'd otherwise need their own `--registration-jobs` plumbing) can
-    // still override the default. Same env-var precedence pattern as
-    // `CARGO_SCHNEE_TRACE` and `CARGO_SCHNEE_UNIT_GRAPH`.
-    let registration_jobs = args.registration_jobs.or_else(|| {
-        std::env::var("CARGO_SCHNEE_REGISTRATION_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-    });
     let plan_only = args.plan_only.clone();
     let plan_only_ref = plan_only.as_deref();
     let plan_aggregator_out = args.plan_aggregator_out.clone();
@@ -3240,7 +3216,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3276,7 +3251,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3314,7 +3288,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3396,7 +3369,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3467,7 +3439,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3570,7 +3541,6 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 &[],
-                registration_jobs,
                 false,
                 None,
             )?;
@@ -3627,7 +3597,6 @@ fn main() -> Result<()> {
                 false,
                 true,
                 &lint_args,
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 all_targets,
@@ -3668,7 +3637,6 @@ fn main() -> Result<()> {
                 document_private_items,
                 false,
                 &[],
-                registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
                 false,
@@ -3764,7 +3732,6 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 &[],
-                registration_jobs,
                 false,
                 None,
             )?;
