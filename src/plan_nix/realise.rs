@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
 
 /// Output paths of the local units whose compiler diagnostics a build
-/// shows, in plan order. A unit without a build trace entry is left out.
+/// shows, in plan order. A unit without a build trace entry is left out,
+/// with one warning per call that counts the units left out.
 ///
 /// Errors when the daemon cannot be reached or keys its build trace by a
 /// hash modulo rather than by derivation path, as daemons from before the
@@ -32,18 +33,67 @@ pub fn realise_local_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
         .iter()
         .filter_map(|u| Some((u.drv_path.as_deref()?, u.drv_json.as_ref()?)))
         .collect();
-    let mut trace = BuildTrace {
-        conn: &mut conn,
-        jsons,
-        outputs: HashMap::new(),
-    };
-    let mut out = Vec::new();
-    for drv_path in local_diagnostic_drv_paths(units) {
-        if let Some(path) = trace.output(drv_path)? {
-            out.push(path);
-        }
+    let (out, miss) = local_outputs(local_diagnostic_drv_paths(units), jsons, |key| {
+        conn.query_realisation(key, "out")
+    })?;
+    if let Some(miss) = miss {
+        tracing::warn!("{miss}");
     }
     Ok(out)
+}
+
+/// Local units left without a build trace entry. The build has just
+/// succeeded, so every unit's resolved derivation has one, and a miss means
+/// this module resolves differently from Nix.
+#[derive(Debug)]
+struct TraceMiss {
+    /// Local units whose diagnostics are not replayed.
+    units: usize,
+    /// The first derivation whose own lookup missed.
+    drv_path: String,
+    /// The path that derivation was looked up as.
+    key: String,
+}
+
+impl std::fmt::Display for TraceMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Not replaying the compiler diagnostics of {} local unit(s): no build trace \
+             entry for {}, looked up as {}. cargo-schnee's derivation resolution no \
+             longer matches Nix's.",
+            self.units, self.drv_path, self.key,
+        )
+    }
+}
+
+/// [`realise_local_outputs`] with the build trace lookup supplied by
+/// `query`, which takes the derivation path the trace is keyed by.
+fn local_outputs<'a>(
+    local: impl Iterator<Item = &'a str>,
+    jsons: HashMap<&'a str, &'a serde_json::Value>,
+    query: impl FnMut(&str) -> Result<Option<String>>,
+) -> Result<(Vec<String>, Option<TraceMiss>)> {
+    let mut trace = BuildTrace {
+        query,
+        jsons,
+        outputs: HashMap::new(),
+        first_miss: None,
+    };
+    let mut out = Vec::new();
+    let mut missed = 0usize;
+    for drv_path in local {
+        match trace.output(drv_path)? {
+            Some(path) => out.push(path),
+            None => missed += 1,
+        }
+    }
+    let miss = trace.first_miss.map(|(drv_path, key)| TraceMiss {
+        units: missed,
+        drv_path,
+        key,
+    });
+    Ok((out, miss))
 }
 
 /// Derivation paths of local units whose outputs carry a `diagnostics` file.
@@ -64,15 +114,18 @@ fn local_diagnostic_drv_paths(units: &[NixUnit]) -> impl Iterator<Item = &str> {
         .filter_map(|u| u.drv_path.as_deref())
 }
 
-struct BuildTrace<'a> {
-    conn: &'a mut NixDaemonConn,
+struct BuildTrace<'a, Q> {
+    query: Q,
     jsons: HashMap<&'a str, &'a serde_json::Value>,
     /// Output path per registered derivation path, `None` when a
     /// derivation or one of its inputs has no build trace entry.
     outputs: HashMap<String, Option<String>>,
+    /// The first derivation whose own lookup missed, with the path it was
+    /// looked up as.
+    first_miss: Option<(String, String)>,
 }
 
-impl BuildTrace<'_> {
+impl<Q: FnMut(&str) -> Result<Option<String>>> BuildTrace<'_, Q> {
     fn output(&mut self, drv_path: &str) -> Result<Option<String>> {
         if let Some(known) = self.outputs.get(drv_path) {
             return Ok(known.clone());
@@ -93,9 +146,9 @@ impl BuildTrace<'_> {
         } else {
             resolved_drv_path(drv_path, json, &inputs)?
         };
-        let path = self.conn.query_realisation(&key, "out")?;
-        if path.is_none() {
-            tracing::debug!("No build trace entry for {} (from {})", key, drv_path);
+        let path = (self.query)(&key)?;
+        if path.is_none() && self.first_miss.is_none() {
+            self.first_miss = Some((drv_path.to_string(), key));
         }
         Ok(self.remember(drv_path, path))
     }
@@ -261,6 +314,52 @@ mod tests {
             );
         }
         assert!(resolved["inputDrvs"].as_object().unwrap().is_empty());
+    }
+
+    /// Runs [`local_outputs`] for the captured `warn-bin` unit against a
+    /// build trace that holds exactly what Nix recorded.
+    fn replay_captured(json: &serde_json::Value) -> (Vec<String>, Option<TraceMiss>) {
+        let c = captured();
+        let (lib_drv, lib_out) = c.inputs.iter().next().unwrap();
+        let lib_json = serde_json::json!({"inputDrvs": {}});
+        let jsons = HashMap::from([(lib_drv.as_str(), &lib_json), (c.drv_path.as_str(), json)]);
+        let trace = HashMap::from([
+            (lib_drv.clone(), lib_out.clone()),
+            (
+                c.resolved_drv_path.clone(),
+                "/nix/store/x-warn-bin".to_string(),
+            ),
+        ]);
+
+        local_outputs(
+            [lib_drv.as_str(), c.drv_path.as_str()].into_iter(),
+            jsons,
+            |key| Ok(trace.get(key).cloned()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn matching_resolution_reports_no_miss() {
+        let (out, miss) = replay_captured(&captured().json);
+        assert_eq!(out.len(), 2);
+        assert!(miss.is_none(), "unexpected miss: {miss:?}");
+    }
+
+    #[test]
+    fn drifted_resolution_reports_the_miss() {
+        let c = captured();
+        let mut json = c.json.clone();
+        json["env"]["drifted"] = "1".into();
+        let (out, miss) = replay_captured(&json);
+        assert_eq!(out.len(), 1);
+        let miss = miss.expect("a drifted resolution must report a miss");
+        assert_eq!(miss.units, 1);
+        assert_eq!(miss.drv_path, c.drv_path);
+        assert_ne!(miss.key, c.resolved_drv_path);
+        let warning = miss.to_string();
+        assert!(warning.contains("of 1 local unit(s)"), "{warning}");
+        assert!(warning.contains(&c.drv_path), "{warning}");
     }
 
     #[test]
