@@ -1111,8 +1111,10 @@ fn add_project_source_to_store(
     project_dir: &Path,
     want_skeleton: bool,
 ) -> Result<(String, Option<String>)> {
+    let _span = tracing::info_span!("add_project_source").entered();
     // Collect allowed files via git2
-    let mut allowed_files = collect_git_files(project_dir)?;
+    let mut allowed_files =
+        tracing::info_span!("collect_git_files").in_scope(|| collect_git_files(project_dir))?;
 
     // Include extra gitignored files specified in [*.metadata.schnee.extra-includes]
     let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
@@ -1204,16 +1206,31 @@ fn add_project_source_to_store(
         && extra_outside.is_empty()
         && let Some(ref files) = allowed_files
     {
-        match nar::serialize_nar(project_dir, Some(files)) {
+        match tracing::info_span!("serialize_project_nar")
+            .in_scope(|| nar::serialize_nar(project_dir, Some(files)))
+        {
             Ok(nar_data) => {
-                let store_path = nar::compute_nar_store_path("project-src", &nar_data);
+                let store_path = tracing::info_span!("hash_project_nar")
+                    .in_scope(|| nar::compute_nar_store_path("project-src", &nar_data));
                 // A collected path can outlive its store registration on
                 // disk, so only the store can say whether it is reusable.
                 if plan_nix::store_paths::is_valid_store_path(&store_path).unwrap_or(false) {
                     tracing::info!("Source store path is valid: {}", store_path);
                     return Ok((store_path, skeleton));
                 }
-                tracing::info!("Source store path miss, falling back to subprocess");
+                // The copy below follows symlinks and creates the parents of
+                // files it then skips, and the filtered NAR does neither. The
+                // two trees agree when every allowed file is a regular file,
+                // so the NAR can go to the store without the copy.
+                if allowed_files_are_plain(project_dir, files) {
+                    match tracing::info_span!("store_add_project")
+                        .in_scope(|| plan_nix::add_source_nar("project-src", &nar_data))
+                    {
+                        Ok(p) => return Ok((p, skeleton)),
+                        Err(e) => tracing::info!("Daemon add of project source failed: {}", e),
+                    }
+                }
+                tracing::info!("Source store path miss, falling back to a copy");
             }
             Err(e) => {
                 tracing::info!(
@@ -1224,23 +1241,14 @@ fn add_project_source_to_store(
         }
     }
 
+    let copy_span = tracing::info_span!("copy_project_source").entered();
     // Copy project files to temp dir
     let temp = tempfile::tempdir().context("Failed to create temp dir for source copy")?;
     let dest = temp.path().join("project-src");
 
     match &allowed_files {
         Some(files) => {
-            for file in files {
-                let src_path = project_dir.join(file);
-                let dest_path = dest.join(file);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if src_path.is_file() {
-                    std::fs::copy(&src_path, &dest_path)
-                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-                }
-            }
+            copy_allowed_files(project_dir, &dest, files)?;
             tracing::info!("Source copy: {} files via git2", files.len());
         }
         None => {
@@ -1279,7 +1287,10 @@ fn add_project_source_to_store(
         rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
     }
 
-    Ok((add_to_nix_store(&dest.to_string_lossy())?, skeleton))
+    drop(copy_span);
+    let added = tracing::info_span!("store_add_project")
+        .in_scope(|| plan_nix::add_source_to_store(&dest.to_string_lossy()))?;
+    Ok((added, skeleton))
 }
 
 /// Add the project's skeleton to the store and return its path. The
@@ -1334,6 +1345,33 @@ fn write_skeleton(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) -> 
         }
     }
     Ok(())
+}
+
+/// Copy `files`, relative to `project_dir`, into `dest`. A file that is not
+/// a regular file after following symlinks is skipped, but its parent
+/// directories are still created.
+fn copy_allowed_files(project_dir: &Path, dest: &Path, files: &HashSet<PathBuf>) -> Result<()> {
+    for file in files {
+        let src_path = project_dir.join(file);
+        let dest_path = dest.join(file);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if src_path.is_file() {
+            std::fs::copy(&src_path, &dest_path)
+                .with_context(|| format!("Failed to copy {}", src_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether every one of `files` is a regular file and not a symlink. Only
+/// then does the NAR that `nar::serialize_nar` writes for `files` match the
+/// tree `copy_allowed_files` builds.
+fn allowed_files_are_plain(project_dir: &Path, files: &HashSet<PathBuf>) -> bool {
+    files
+        .iter()
+        .all(|f| std::fs::symlink_metadata(project_dir.join(f)).is_ok_and(|m| m.is_file()))
 }
 
 /// Collect git-tracked + untracked-but-not-ignored files.
@@ -3876,6 +3914,46 @@ mod tests {
         );
         assert_eq!(nix_config(None, extra), extra);
         assert_eq!(nix_config(Some(std::ffi::OsStr::new("")), extra), extra);
+    }
+
+    /// A project with nested and executable allowed files beside a file the
+    /// allowed set leaves out.
+    fn plain_project() -> (tempfile::TempDir, HashSet<PathBuf>) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(root.join("ignored.log"), "noise\n").unwrap();
+        let files = ["Cargo.toml", "crates/a/src/lib.rs", "run.sh"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        (tmp, files)
+    }
+
+    #[test]
+    fn plain_allowed_files_serialise_like_their_copy() {
+        let (tmp, files) = plain_project();
+        assert!(allowed_files_are_plain(tmp.path(), &files));
+        let copy = tempfile::tempdir().unwrap();
+        copy_allowed_files(tmp.path(), copy.path(), &files).unwrap();
+        assert_eq!(
+            nar::serialize_nar(tmp.path(), Some(&files)).unwrap(),
+            nar::serialize_nar(copy.path(), None).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_symlinked_allowed_file_is_not_plain() {
+        let (tmp, mut files) = plain_project();
+        std::os::unix::fs::symlink("Cargo.toml", tmp.path().join("link.toml")).unwrap();
+        files.insert(PathBuf::from("link.toml"));
+        assert!(!allowed_files_are_plain(tmp.path(), &files));
     }
 
     /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the

@@ -130,7 +130,8 @@ fn nar_serialize_path(
         #[cfg(unix)]
         if !blank {
             use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o111 != 0 {
+            // Nix marks a file executable by the owner's execute bit alone.
+            if meta.permissions().mode() & 0o100 != 0 {
                 nar_string(buf, "executable");
                 nar_string(buf, "");
             }
@@ -249,6 +250,21 @@ pub const SKELETON_NAME: &str = "project-src-skeleton";
 mod tests {
     use super::*;
     use crate::nix_encoding::NIX_BASE32;
+
+    #[test]
+    fn only_the_owner_execute_bit_marks_a_file_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let executable = |mode: u32| {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            let nar = serialize_nar(&file, None).unwrap();
+            nar.windows(10).any(|w| w == b"executable")
+        };
+        assert!(executable(0o744));
+        assert!(!executable(0o654));
+    }
 
     #[test]
     fn nar_string_length_and_padding() {

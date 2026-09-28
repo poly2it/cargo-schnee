@@ -946,6 +946,60 @@ fn register_unit(conn: &mut Option<NixDaemonConn>, unit: &LevelUnit) -> Result<S
     Ok(p)
 }
 
+/// Make the store hold `nar` as the source path `name`, the path
+/// `nix-store --add` gives the same tree, over a fresh daemon connection.
+pub(crate) fn add_source_nar(name: &str, nar: &[u8]) -> Result<String> {
+    ensure_source_nar(&mut NixDaemonConn::connect()?, name, nar)
+}
+
+/// Add the source tree at `path` to the store as `nix-store --add` does,
+/// over a fresh daemon connection. See [`add_source_dir`].
+pub(crate) fn add_source_to_store(path: &str) -> Result<String> {
+    add_source_dir(&mut NixDaemonConn::connect().ok(), path)
+}
+
+/// Make the store hold `nar` as the source path `name`. A path the store
+/// already holds costs one validity query, and a new one goes to the
+/// daemon without a `nix-store` process that walks and hashes the tree
+/// again.
+fn ensure_source_nar(conn: &mut NixDaemonConn, name: &str, nar: &[u8]) -> Result<String> {
+    let expected = crate::nar::compute_nar_store_path(name, nar);
+    if conn
+        .query_valid_paths(&[expected.as_str()])?
+        .contains(&expected)
+    {
+        return Ok(expected);
+    }
+    let added = conn.add_nar_to_store(name, nar)?;
+    anyhow::ensure!(
+        added == expected,
+        "daemon added {name} as {added}, expected {expected}"
+    );
+    Ok(added)
+}
+
+/// Add the source tree at `path` to the store under the name of its last
+/// component, with the store path `nix-store --add` gives it, through
+/// [`ensure_source_nar`]. The tree must hold no symlinks, because the
+/// serialiser skips them. Without a daemon, or when the daemon fails, it
+/// falls back to `nix-store --add`, and a failed connection is replaced so
+/// later requests on `conn` start clean.
+fn add_source_dir(conn: &mut Option<NixDaemonConn>, path: &str) -> Result<String> {
+    let Some(c) = conn.as_mut() else {
+        return crate::add_to_nix_store(path);
+    };
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("source tree {path} has no usable name"))?;
+    let nar = crate::nar::serialize_nar(Path::new(path), None)?;
+    ensure_source_nar(c, name, &nar).or_else(|e| {
+        info!("Daemon add of {} failed: {}, falling back to CLI", path, e);
+        *conn = NixDaemonConn::connect().ok();
+        crate::add_to_nix_store(path)
+    })
+}
+
 /// Distribute `units` round-robin across `n` chunks. Returns exactly
 /// `n` Vecs, possibly empty for over-provisioned cases. Round-robin
 /// keeps per-chunk wall time roughly even across workers when unit
@@ -2337,9 +2391,12 @@ pub fn run_plan_nix(
     // this runs against the live daemon; in the planner derivation it uses
     // recursive-nix.
     let vendor_str = vendor_dir.to_string_lossy().to_string();
+    let slice_span = tracing::info_span!("slice_sources").entered();
     let unit_src_store = assign_per_crate_src_stores(&mut nix_units, &src_str, &vendor_str, |p| {
-        crate::add_to_nix_store(p)
+        let _s = tracing::info_span!("add_slice", path = p).entered();
+        add_source_dir(&mut daemon, p)
     })?;
+    drop(slice_span);
 
     // Phase 1: construct every unit's derivation JSON, ATerm bytes, and
     // `.drv` store path, level by level. Paths are computed client-side,
@@ -3071,5 +3128,63 @@ mod narrow_tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("selects nothing to build"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod add_source_tests {
+    use super::daemon::fake::{self, Request};
+    use super::*;
+
+    fn tree() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("my-crate");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"my-crate\"\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        (tmp, path)
+    }
+
+    #[test]
+    fn add_source_dir_skips_a_tree_the_store_holds() {
+        let (_tmp, path) = tree();
+        let nar = crate::nar::serialize_nar(Path::new(&path), None).unwrap();
+        let expected = crate::nar::compute_nar_store_path("my-crate", &nar);
+        let (conn, handle) = fake::connect(HashSet::from([expected.clone()]));
+        let mut conn = Some(conn);
+
+        assert_eq!(add_source_dir(&mut conn, &path).unwrap(), expected);
+
+        drop(conn);
+        assert_eq!(
+            handle.join().unwrap(),
+            vec![Request::QueryValidPaths(vec![expected])]
+        );
+    }
+
+    #[test]
+    fn add_source_dir_sends_a_new_tree_as_a_source_nar() {
+        let (_tmp, path) = tree();
+        let nar = crate::nar::serialize_nar(Path::new(&path), None).unwrap();
+        let expected = crate::nar::compute_nar_store_path("my-crate", &nar);
+        let (conn, handle) = fake::connect(HashSet::new());
+        let mut conn = Some(conn);
+
+        assert_eq!(add_source_dir(&mut conn, &path).unwrap(), expected);
+
+        drop(conn);
+        assert_eq!(
+            handle.join().unwrap(),
+            vec![
+                Request::QueryValidPaths(vec![expected]),
+                Request::AddToStore {
+                    name: "my-crate".into(),
+                    method: "fixed:r:sha256".into(),
+                    references: vec![],
+                    nar,
+                },
+            ]
+        );
     }
 }

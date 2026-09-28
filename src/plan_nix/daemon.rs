@@ -9,6 +9,7 @@ const STDERR_ERROR: u64 = 0x63787470;
 
 // Worker protocol opcodes used in this module. Extracted from the upstream
 // `nix/src/libstore/worker-protocol.hh` enum.
+const WOP_ADD_TO_STORE: u64 = 7;
 const WOP_ADD_TEXT_TO_STORE: u64 = 8;
 const WOP_QUERY_PATH_INFO: u64 = 26;
 const WOP_QUERY_VALID_PATHS: u64 = 31;
@@ -67,6 +68,11 @@ impl NixDaemonConn {
                 socket_path
             )
         })?;
+        Self::from_stream(stream)
+    }
+
+    /// Perform the handshake on an already connected `stream`.
+    fn from_stream(stream: std::os::unix::net::UnixStream) -> Result<Self> {
         let timeout = Some(std::time::Duration::from_secs(30));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
@@ -197,6 +203,40 @@ impl NixDaemonConn {
 
         self.process_stderr()?;
         self.read_string()
+    }
+
+    /// Add a NAR-serialised tree to the store as a `source` path with
+    /// `wopAddToStore`, the way `nix-store --add` names it. `nar` goes over
+    /// the wire in frames, so the daemon hashes and restores it without a
+    /// copy on disk. Returns the resulting store path.
+    pub(super) fn add_nar_to_store(&mut self, name: &str, nar: &[u8]) -> Result<String> {
+        use std::io::Write;
+        if self.negotiated_protocol < ((1 << 8) | 25) {
+            anyhow::bail!("Nix daemon protocol is older than 1.25, which framed adds need");
+        }
+        self.write_u64(WOP_ADD_TO_STORE)?;
+        self.write_string(name)?;
+        self.write_string("fixed:r:sha256")?;
+        self.write_string_list(&[])?;
+        self.write_u64(0)?; // repair = false
+        for frame in nar.chunks(64 * 1024) {
+            self.write_u64(frame.len() as u64)?;
+            self.writer.write_all(frame)?;
+        }
+        self.write_u64(0)?;
+        self.flush()?;
+
+        self.process_stderr()?;
+        let path = self.read_string()?;
+        let _deriver = self.read_string()?;
+        let _nar_hash = self.read_string()?;
+        let _references = self.read_string_list()?;
+        let _registration_time = self.read_u64()?;
+        let _nar_size = self.read_u64()?;
+        let _ultimate = self.read_u64()?;
+        let _sigs = self.read_string_list()?;
+        let _ca = self.read_string()?;
+        Ok(path)
     }
 
     /// Direct references of a single valid store path, via
@@ -458,5 +498,171 @@ mod tests {
         let err = conn.process_stderr().unwrap_err().to_string();
         assert!(err.contains("is not valid"), "{err}");
         assert_eq!(conn.read_u64().unwrap(), 42, "the stream lost its framing");
+    }
+}
+
+/// An in-process stand-in for the Nix daemon on one end of a socket pair.
+/// It speaks the handshake, `wopQueryValidPaths` and `wopAddToStore`, and
+/// records every request it serves.
+#[cfg(test)]
+pub(super) mod fake {
+    use super::*;
+    use std::collections::HashSet;
+    use std::io::{BufReader, BufWriter, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    #[derive(Debug, PartialEq)]
+    pub(in crate::plan_nix) enum Request {
+        QueryValidPaths(Vec<String>),
+        AddToStore {
+            name: String,
+            method: String,
+            references: Vec<String>,
+            nar: Vec<u8>,
+        },
+    }
+
+    /// Connect to a fake daemon that reports `valid` as the valid paths and
+    /// adds a tree under the path `nix-store --add` would give it. The
+    /// handle yields the requests once the connection is dropped.
+    pub(in crate::plan_nix) fn connect(
+        valid: HashSet<String>,
+    ) -> (NixDaemonConn, std::thread::JoinHandle<Vec<Request>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || serve(server, &valid));
+        (NixDaemonConn::from_stream(client).unwrap(), handle)
+    }
+
+    struct Wire {
+        reader: BufReader<UnixStream>,
+        writer: BufWriter<UnixStream>,
+    }
+
+    impl Wire {
+        fn read_u64(&mut self) -> Option<u64> {
+            let mut buf = [0u8; 8];
+            self.reader.read_exact(&mut buf).ok()?;
+            Some(u64::from_le_bytes(buf))
+        }
+
+        fn read_bytes(&mut self) -> Option<Vec<u8>> {
+            let len = self.read_u64()? as usize;
+            let mut buf = vec![0u8; len.div_ceil(8) * 8];
+            self.reader.read_exact(&mut buf).ok()?;
+            buf.truncate(len);
+            Some(buf)
+        }
+
+        fn read_string(&mut self) -> Option<String> {
+            String::from_utf8(self.read_bytes()?).ok()
+        }
+
+        fn read_string_list(&mut self) -> Option<Vec<String>> {
+            let n = self.read_u64()?;
+            (0..n).map(|_| self.read_string()).collect()
+        }
+
+        fn read_frames(&mut self) -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            loop {
+                let len = self.read_u64()? as usize;
+                if len == 0 {
+                    return Some(out);
+                }
+                let start = out.len();
+                out.resize(start + len, 0);
+                self.reader.read_exact(&mut out[start..]).ok()?;
+            }
+        }
+
+        fn write_u64(&mut self, v: u64) {
+            self.writer.write_all(&v.to_le_bytes()).unwrap();
+        }
+
+        fn write_string(&mut self, s: &str) {
+            self.write_u64(s.len() as u64);
+            self.writer.write_all(s.as_bytes()).unwrap();
+            let padding = (8 - s.len() % 8) % 8;
+            self.writer.write_all(&[0u8; 8][..padding]).unwrap();
+        }
+
+        fn write_string_list(&mut self, list: &[String]) {
+            self.write_u64(list.len() as u64);
+            for s in list {
+                self.write_string(s);
+            }
+        }
+    }
+
+    fn serve(stream: UnixStream, valid: &HashSet<String>) -> Vec<Request> {
+        let mut wire = Wire {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            writer: BufWriter::new(stream),
+        };
+        let mut requests = Vec::new();
+        if wire.read_u64() != Some(WORKER_MAGIC_1) {
+            return requests;
+        }
+        wire.write_u64(WORKER_MAGIC_2);
+        wire.write_u64((1 << 8) | 37);
+        wire.writer.flush().unwrap();
+        // Client version, CPU affinity and reserve space.
+        for _ in 0..3 {
+            wire.read_u64();
+        }
+        wire.write_string("fake");
+        wire.write_u64(1);
+        wire.write_u64(STDERR_LAST);
+        wire.writer.flush().unwrap();
+
+        while let Some(op) = wire.read_u64() {
+            match op {
+                WOP_QUERY_VALID_PATHS => {
+                    let Some(paths) = wire.read_string_list() else {
+                        break;
+                    };
+                    wire.read_u64();
+                    let reply: Vec<String> = paths
+                        .iter()
+                        .filter(|p| valid.contains(*p))
+                        .cloned()
+                        .collect();
+                    wire.write_u64(STDERR_LAST);
+                    wire.write_string_list(&reply);
+                    requests.push(Request::QueryValidPaths(paths));
+                }
+                WOP_ADD_TO_STORE => {
+                    let (Some(name), Some(method), Some(references)) = (
+                        wire.read_string(),
+                        wire.read_string(),
+                        wire.read_string_list(),
+                    ) else {
+                        break;
+                    };
+                    wire.read_u64();
+                    let Some(nar) = wire.read_frames() else { break };
+                    let path = crate::nar::compute_nar_store_path(&name, &nar);
+                    wire.write_u64(STDERR_LAST);
+                    wire.write_string(&path);
+                    wire.write_string("");
+                    wire.write_string("");
+                    wire.write_string_list(&[]);
+                    wire.write_u64(0);
+                    wire.write_u64(nar.len() as u64);
+                    wire.write_u64(0);
+                    wire.write_string_list(&[]);
+                    wire.write_string("");
+                    requests.push(Request::AddToStore {
+                        name,
+                        method,
+                        references,
+                        nar,
+                    });
+                }
+                _ => panic!("unexpected opcode {op}"),
+            }
+            wire.writer.flush().unwrap();
+        }
+        requests
     }
 }
