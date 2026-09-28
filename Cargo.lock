@@ -408,6 +408,7 @@ dependencies = [
  "fs2",
  "git2",
  "glob",
+ "libc",
  "proptest",
  "serde",
  "serde_json",

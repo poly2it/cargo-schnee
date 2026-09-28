@@ -378,6 +378,28 @@ implements cargo's
 [links](https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key)
 mechanism.
 
+#### Job server
+
+Under Cargo, every `rustc` shares one GNU make job server, so the codegen
+threads of all concurrent compilations together stay at the core count. A Nix
+builder has no job server, and each `rustc` then starts as many codegen
+threads as it has codegen units. Derivations that run codegen therefore set
+`__jobserver = "1"`. A Nix with the `jobserver` experimental feature gives such
+a builder a job server that every opted-in build on the machine shares, and
+`rustc` finds it in `CARGO_MAKEFLAGS`.
+
+`Compile`, `TestCompile` and `BuildScriptCompile` derivations set the
+attribute. `Check` and `Doc` derivations run no codegen and do not. A
+`BuildScriptRun` derivation sets it when the build script depends on
+`jobserver`, `cmake` or `autotools`, directly or transitively. `cc` with its
+`parallel` feature reads the job server through `jobserver`, and `cmake` and
+`autotools` pass `CARGO_MAKEFLAGS` on to `make` as `MAKEFLAGS`. The job server
+uses the `fifo:` form, which needs GNU make 4.4 or later.
+
+The attribute does not depend on the daemon, so a unit has the same derivation
+path on every machine. A Nix without the feature exports it as the environment
+variable `__jobserver` and otherwise ignores it.
+
 ### Derivation registration
 
 Once the derivation JSON for each `NixUnit` has been constructed, it must be

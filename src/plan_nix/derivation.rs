@@ -47,6 +47,46 @@ fn linked_build_script_keys<'a>(
         .collect()
 }
 
+/// Packages whose presence among a build script's dependencies shows that
+/// running the script spawns work that honours a job server.  A crate that
+/// reads `CARGO_MAKEFLAGS` itself, such as `cc` with its `parallel` feature,
+/// does so through `jobserver`.  `cmake` and `autotools` hand
+/// `CARGO_MAKEFLAGS` to the `make` they run without that crate.
+const JOBSERVER_BUILD_DEPS: &[&str] = &["autotools", "cmake", "jobserver"];
+
+/// Whether `unit`'s derivation sets `__jobserver`, which makes a Nix with
+/// the `jobserver` experimental feature hand the builder a job server shared
+/// by all builds on the machine in `CARGO_MAKEFLAGS`.
+///
+/// rustc takes a token for each codegen unit it optimises beyond the first,
+/// so every unit that runs codegen opts in.  Check units emit metadata only
+/// and rustdoc runs no codegen, so neither would ever take a token.  A build
+/// script run opts in only when its dependencies show it spawns work that
+/// takes tokens, because the script binary itself never does.
+fn joins_jobserver(unit: &NixUnit, units: &[NixUnit], key_to_idx: &HashMap<String, usize>) -> bool {
+    match unit.kind {
+        UnitKind::Compile | UnitKind::TestCompile | UnitKind::BuildScriptCompile => true,
+        UnitKind::Check | UnitKind::Doc => false,
+        UnitKind::BuildScriptRun => unit
+            .build_script_compile_key
+            .as_ref()
+            .and_then(|key| key_to_idx.get(key))
+            .is_some_and(|&idx| {
+                units[idx]
+                    .all_dep_keys
+                    .iter()
+                    .filter_map(|dep_key| key_to_idx.get(dep_key))
+                    .any(|&dep_idx| is_jobserver_build_dep(&units[dep_idx]))
+            }),
+    }
+}
+
+fn is_jobserver_build_dep(unit: &NixUnit) -> bool {
+    unit.cargo_envs
+        .iter()
+        .any(|(k, v)| k == "CARGO_PKG_NAME" && JOBSERVER_BUILD_DEPS.contains(&v.as_str()))
+}
+
 /// Build the derivation JSON for a single unit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn construct_derivation(
@@ -193,6 +233,13 @@ pub(super) fn construct_derivation(
         "allowSubstitutes".into(),
         serde_json::Value::String("".into()),
     );
+    // Set on every machine, so that a unit keeps one derivation path whether
+    // or not the daemon that builds it knows the attribute.  A Nix without
+    // the `jobserver` experimental feature passes it through as a plain
+    // environment variable.
+    if joins_jobserver(unit, units, key_to_idx) {
+        env.insert("__jobserver".into(), serde_json::Value::String("1".into()));
+    }
 
     // inputDrvs
     let mut input_drvs = serde_json::Map::new();
@@ -1972,5 +2019,236 @@ mod tests {
             linked_build_script_keys(&units[0], &units, &key_to_idx),
             vec!["sys-host-bs", "sys-target-bs"]
         );
+    }
+
+    // -- job server opt-in tests ------------------------------------------------
+
+    const BS_COMPILE_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv";
+
+    fn jobserver_attr(units: &[NixUnit], idx: usize) -> Option<String> {
+        let key_to_idx: HashMap<String, usize> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::BuildScriptCompile)
+            .map(|u| (u.key.clone(), BS_COMPILE_DRV.to_string()))
+            .collect();
+        let drv = construct_derivation(
+            units,
+            idx,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/bash/bin/bash",
+            "/nix/store/bash",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/cc/bin",
+            &[],
+            "x86_64-linux",
+            &[],
+            &None,
+            "",
+            &[],
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            SRC_STORE,
+            false,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        drv["env"]["__jobserver"].as_str().map(str::to_string)
+    }
+
+    fn unit_of_kind(name: &str, kind: UnitKind) -> NixUnit {
+        let mut unit = make_doc_unit(name, &[], &[], true);
+        unit.key = name.to_string();
+        unit.kind = kind;
+        unit
+    }
+
+    /// A build script's compile and run units, preceded by one dependency of
+    /// the script for each package in `build_deps`.
+    fn build_script_units(build_deps: &[&str]) -> Vec<NixUnit> {
+        let mut units: Vec<NixUnit> = build_deps
+            .iter()
+            .map(|dep| unit_of_kind(dep, UnitKind::Compile))
+            .collect();
+        let mut bs_compile = unit_of_kind("my-lib-bsc", UnitKind::BuildScriptCompile);
+        bs_compile.crate_types = vec!["bin".into()];
+        bs_compile.all_dep_keys = build_deps.iter().map(|dep| dep.to_string()).collect();
+        let mut run = unit_of_kind("my-lib-bsr", UnitKind::BuildScriptRun);
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        units.push(bs_compile);
+        units.push(run);
+        units
+    }
+
+    #[test]
+    fn codegen_units_opt_into_jobserver() {
+        for kind in [
+            UnitKind::Compile,
+            UnitKind::TestCompile,
+            UnitKind::BuildScriptCompile,
+        ] {
+            let units = vec![unit_of_kind("my-lib", kind)];
+            assert_eq!(jobserver_attr(&units, 0).as_deref(), Some("1"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn units_without_codegen_stay_out_of_jobserver() {
+        for kind in [UnitKind::Check, UnitKind::Doc] {
+            let units = vec![unit_of_kind("my-lib", kind)];
+            assert_eq!(jobserver_attr(&units, 0), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn build_script_run_opts_in_through_its_dependencies() {
+        for dep in ["jobserver", "cmake", "autotools"] {
+            let units = build_script_units(&["cc", dep]);
+            let run = units.len() - 1;
+            assert_eq!(jobserver_attr(&units, run).as_deref(), Some("1"), "{dep}");
+        }
+    }
+
+    /// `cc` without its `parallel` feature compiles one object at a time and
+    /// never reads the job server.
+    #[test]
+    fn build_script_run_without_jobserver_dependency_stays_out() {
+        for deps in [&[][..], &["cc"][..]] {
+            let units = build_script_units(deps);
+            let run = units.len() - 1;
+            assert_eq!(jobserver_attr(&units, run), None, "{deps:?}");
+        }
+    }
+
+    fn find_on_path(name: &str) -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("{name} is not on PATH"))
+    }
+
+    /// Runs a generated compile script with a real rustc against a job server
+    /// FIFO in the form N3 passes, and watches the FIFO with inotify.  rustc
+    /// reads a token for its second codegen unit, so a read proves rustc
+    /// joined the pool, and the byte count afterwards proves it gave every
+    /// token back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compile_script_rustc_takes_tokens_from_jobserver() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const TOKENS: &[u8] = b"++++";
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        let body: String = (0..64)
+            .map(|i| {
+                format!(
+                    "pub mod m{i} {{ pub fn f(x: u64) -> u64 {{ (0..x).map(|v| v.wrapping_mul({i})).sum() }} }}\n"
+                )
+            })
+            .collect();
+        std::fs::write(&src, body).unwrap();
+
+        let fifo = dir.path().join("jobserver");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        // Holding a read-write descriptor keeps the tokens in the FIFO while
+        // no other process has it open.
+        let mut pool = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        std::io::Write::write_all(&mut pool, TOKENS).unwrap();
+
+        let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(inotify >= 0);
+        assert!(unsafe { libc::inotify_add_watch(inotify, fifo_c.as_ptr(), libc::IN_ACCESS) } >= 0);
+
+        let rustc = find_on_path("rustc");
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        let sysroot = String::from_utf8(sysroot.stdout).unwrap();
+        let coreutils = find_on_path("cat").parent().unwrap().to_path_buf();
+
+        let mut unit = unit_of_kind("pool-probe", UnitKind::Compile);
+        unit.source_file = src.to_string_lossy().into_owned();
+        unit.manifest_dir = dir.path().to_string_lossy().into_owned();
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("pool-probe".to_string(), 0_usize)]);
+        let script = build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            rustc.to_str().unwrap(),
+            "",
+            sysroot.trim(),
+            coreutils.to_str().unwrap(),
+            "/nix/store/cc/bin",
+            &ProfileConfig::dev(),
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let status = Command::new(find_on_path("bash"))
+            .arg("-c")
+            .arg(&script)
+            .env("out", &out)
+            .env(
+                "CARGO_MAKEFLAGS",
+                format!("--jobserver-auth=fifo:{}", fifo.display()),
+            )
+            .status()
+            .unwrap();
+        let diagnostics = std::fs::read_to_string(out.join("diagnostics")).unwrap_or_default();
+        assert!(status.success(), "rustc failed:\n{diagnostics}");
+        assert!(
+            !diagnostics.contains("jobserver"),
+            "rustc rejected the job server:\n{diagnostics}"
+        );
+
+        let mut events = [0_u8; 4096];
+        let n = unsafe { libc::read(inotify, events.as_mut_ptr().cast(), events.len()) };
+        unsafe { libc::close(inotify) };
+        assert!(n > 0, "rustc never read a token from the job server");
+
+        let mut returned = Vec::new();
+        let _ = pool.read_to_end(&mut returned);
+        assert_eq!(returned, TOKENS, "rustc kept or forged tokens");
     }
 }

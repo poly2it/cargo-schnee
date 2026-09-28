@@ -33,6 +33,7 @@ fs2 = "0.4"
 
 [dev-dependencies]
 proptest = "1"
+libc = "0.2"
 
 [workspace]
 exclude = ["tests/fixtures/*", "examples/simple", "examples/cross", "examples/cross-windows", "examples/build-package", "examples/build-package-cross", "examples/build-package-cross-windows"]
