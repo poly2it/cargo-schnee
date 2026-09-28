@@ -2034,6 +2034,20 @@ fn schnee_manifest_symlink(store_manifest_dir: &str, project_manifest_dir: &str)
     tmp_path
 }
 
+/// The `NIX_CONFIG` for a spawned Nix command: the caller's `NIX_CONFIG`
+/// followed by `extra` on a line of its own. Replacing the caller's value
+/// would drop settings such as `log-profiling` or `max-jobs` that the
+/// caller set for the whole build.
+fn nix_config(caller: Option<&std::ffi::OsStr>, extra: &str) -> std::ffi::OsString {
+    let mut config = std::ffi::OsString::new();
+    if let Some(caller) = caller.filter(|c| !c.is_empty()) {
+        config.push(caller);
+        config.push("\n");
+    }
+    config.push(extra);
+    config
+}
+
 /// One root unit of a finished build, as the subcommands consume it.
 struct RootUnit {
     drv_path: String,
@@ -2433,7 +2447,10 @@ fn run_build_pipeline(
     let mut child = cmd
         .env(
             "NIX_CONFIG",
-            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            nix_config(
+                std::env::var_os("NIX_CONFIG").as_deref(),
+                "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            ),
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2756,7 +2773,13 @@ fn run_build_pipeline(
             let resolve_output = Command::new("nix-store")
                 .arg("--realise")
                 .args(&cached_local_drvs)
-                .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+                .env(
+                    "NIX_CONFIG",
+                    nix_config(
+                        std::env::var_os("NIX_CONFIG").as_deref(),
+                        "extra-experimental-features = ca-derivations",
+                    ),
+                )
                 .output();
             if let Ok(output) = resolve_output {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3483,7 +3506,13 @@ fn main() -> Result<()> {
                     }
                 }
                 let output = cmd
-                    .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+                    .env(
+                        "NIX_CONFIG",
+                        nix_config(
+                            std::env::var_os("NIX_CONFIG").as_deref(),
+                            "extra-experimental-features = ca-derivations",
+                        ),
+                    )
                     .output()
                     .context("Failed to resolve doc derivation outputs")?;
                 String::from_utf8_lossy(&output.stdout)
@@ -3684,6 +3713,20 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nix_config_keeps_the_callers_settings() {
+        let extra = "extra-experimental-features = ca-derivations";
+        assert_eq!(
+            nix_config(
+                Some(std::ffi::OsStr::new("log-profiling = true\nmax-jobs = 4")),
+                extra
+            ),
+            "log-profiling = true\nmax-jobs = 4\nextra-experimental-features = ca-derivations"
+        );
+        assert_eq!(nix_config(None, extra), extra);
+        assert_eq!(nix_config(Some(std::ffi::OsStr::new("")), extra), extra);
+    }
 
     /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the
     /// manifest path.
