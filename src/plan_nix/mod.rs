@@ -10,6 +10,7 @@ mod aterm;
 mod daemon;
 mod derivation;
 mod derivation_format;
+mod realise;
 mod unit_graph;
 pub(crate) mod util;
 
@@ -19,6 +20,7 @@ use derivation::{
     construct_derivation, downstream_placeholder, nix_derivation_add, nix_store_closure,
     self_placeholder,
 };
+pub use realise::realise_local_outputs;
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_bash, which_clippy_driver, which_command_no_deref,
@@ -353,12 +355,17 @@ pub struct NixUnit {
     pub(crate) sliced_crate_rel: Option<String>,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
+    /// The derivation registered at `drv_path`, kept so that
+    /// `realise_local_outputs` can resolve it after the build.
+    #[serde(skip)]
+    pub(crate) drv_json: Option<serde_json::Value>,
 }
 
 impl NixUnit {
     /// Clear the drv_path (for cache serialization — drv_paths are recomputed each run).
     pub fn clear_drv_path(&mut self) {
         self.drv_path = None;
+        self.drv_json = None;
     }
 
     /// Compute the output filename that rustc will produce for this unit.
@@ -404,26 +411,6 @@ impl NixUnit {
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
-
-/// Return drv_paths for local Compile and BuildScriptCompile units.
-/// Used to replay cached diagnostics after a warm build.
-pub fn local_compile_drv_paths(units: &[NixUnit]) -> Vec<&str> {
-    units
-        .iter()
-        .filter(|u| {
-            u.is_local
-                && matches!(
-                    u.kind,
-                    UnitKind::Compile
-                        | UnitKind::Check
-                        | UnitKind::Doc
-                        | UnitKind::TestCompile
-                        | UnitKind::BuildScriptCompile
-                )
-        })
-        .filter_map(|u| u.drv_path.as_deref())
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // Declared feature-resolution scope
@@ -1304,6 +1291,7 @@ mod slice_tests {
             self_contained_build_script: false,
             sliced_crate_rel: None,
             drv_path: None,
+            drv_json: None,
         }
     }
 
@@ -1545,6 +1533,7 @@ mod unit_setup_tests {
             self_contained_build_script: false,
             sliced_crate_rel: None,
             drv_path: None,
+            drv_json: None,
         }
     }
 
@@ -2471,6 +2460,7 @@ pub fn run_plan_nix(
         for u in &level_units {
             dep_drv_map.insert(u.unit_key.clone(), u.drv_path.clone());
             nix_units[u.i].drv_path = Some(u.drv_path.clone());
+            nix_units[u.i].drv_json = Some(u.json.clone());
         }
         levels_units.push(level_units);
     }
@@ -3016,6 +3006,7 @@ mod narrow_tests {
             self_contained_build_script: false,
             sliced_crate_rel: None,
             drv_path: None,
+            drv_json: None,
         }
     }
 

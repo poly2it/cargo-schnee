@@ -12,6 +12,12 @@ const STDERR_ERROR: u64 = 0x63787470;
 const WOP_ADD_TEXT_TO_STORE: u64 = 8;
 const WOP_QUERY_PATH_INFO: u64 = 26;
 const WOP_QUERY_VALID_PATHS: u64 = 31;
+const WOP_QUERY_REALISATION: u64 = 43;
+
+/// Protocol feature under which `wopQueryRealisation` takes a derivation
+/// path and an output name, the build trace key since Nix's build-trace
+/// rework. Daemons without it key realisations by a hash modulo instead.
+const FEATURE_REALISATION_WITH_PATH: &str = "realisation-with-path-not-hash";
 
 pub(super) struct NixDaemonConn {
     /// Buffered halves of one `UnixStream` (`try_clone`d fd). The worker
@@ -28,6 +34,9 @@ pub(super) struct NixDaemonConn {
     /// version onwards; consumers consult this rather than recomputing
     /// the min(client, daemon) at the call site.
     negotiated_protocol: u64,
+    /// Protocol features both sides offered, exchanged from protocol
+    /// 1.38 onwards.
+    features: std::collections::HashSet<String>,
 }
 
 impl NixDaemonConn {
@@ -66,6 +75,7 @@ impl NixDaemonConn {
             reader: std::io::BufReader::new(read_half),
             writer: std::io::BufWriter::new(stream),
             negotiated_protocol: 0,
+            features: std::collections::HashSet::new(),
         };
         conn.handshake()?;
         Ok(conn)
@@ -91,8 +101,7 @@ impl NixDaemonConn {
         let minor = proto_version & 0xff;
         debug!("Nix daemon protocol version: {}.{}", major, minor);
 
-        // Send client version (1.37)
-        let client_version: u64 = (1 << 8) | 37;
+        let client_version: u64 = (1 << 8) | 38;
         self.write_u64(client_version)?;
 
         let version = std::cmp::min(proto_version, client_version);
@@ -102,6 +111,16 @@ impl NixDaemonConn {
             version >> 8,
             version & 0xff
         );
+
+        if version >= (1 << 8) | 38 {
+            self.write_string_list(&[FEATURE_REALISATION_WITH_PATH])?;
+            self.flush()?;
+            let offered = self.read_string_list()?;
+            self.features = offered
+                .into_iter()
+                .filter(|f| f == FEATURE_REALISATION_WITH_PATH)
+                .collect();
+        }
 
         // Protocol >= 1.14: send obsolete CPU affinity
         if version >= (1 << 8) | 14 {
@@ -208,6 +227,41 @@ impl NixDaemonConn {
             let _ca = self.read_string()?;
         }
         Ok(references)
+    }
+
+    /// Whether the daemon keys build trace entries by derivation path, so
+    /// that [`Self::query_realisation`] can be used.
+    pub(super) fn has_path_keyed_build_trace(&self) -> bool {
+        self.features.contains(FEATURE_REALISATION_WITH_PATH)
+    }
+
+    /// Output path the build trace records for `output` of `drv_path`,
+    /// via `wopQueryRealisation`. `None` when the daemon has no entry.
+    pub(super) fn query_realisation(
+        &mut self,
+        drv_path: &str,
+        output: &str,
+    ) -> Result<Option<String>> {
+        anyhow::ensure!(
+            self.has_path_keyed_build_trace(),
+            "the Nix daemon lacks the '{}' protocol feature",
+            FEATURE_REALISATION_WITH_PATH,
+        );
+        self.write_u64(WOP_QUERY_REALISATION)?;
+        self.write_string(drv_path)?;
+        self.write_string(output)?;
+        self.flush()?;
+
+        self.process_stderr()?;
+        match self.read_u64()? {
+            0 => Ok(None),
+            1 => {
+                let out_path = self.read_string()?;
+                let _signatures = self.read_string_list()?;
+                Ok(Some(out_path))
+            }
+            tag => anyhow::bail!("Invalid optional build trace tag from the Nix daemon: {tag}"),
+        }
     }
 
     /// Transitive closure of `root` (root included), computed by BFS

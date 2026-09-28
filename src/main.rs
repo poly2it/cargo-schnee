@@ -2759,41 +2759,21 @@ fn run_build_pipeline(
     }
     let copy_duration = copy_start.elapsed();
 
-    // Replay cached diagnostics
-    {
-        let built_set: HashSet<&str> = building_events
-            .iter()
-            .map(|(_, drv)| drv.as_str())
-            .collect();
-        let cached_local_drvs: Vec<&str> = plan_nix::local_compile_drv_paths(&plan_units)
-            .into_iter()
-            .filter(|drv| !built_set.contains(drv))
-            .collect();
-        if !cached_local_drvs.is_empty() {
-            let resolve_output = Command::new("nix-store")
-                .arg("--realise")
-                .args(&cached_local_drvs)
-                .env(
-                    "NIX_CONFIG",
-                    nix_config(
-                        std::env::var_os("NIX_CONFIG").as_deref(),
-                        "extra-experimental-features = ca-derivations",
-                    ),
-                )
-                .output();
-            if let Ok(output) = resolve_output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for out_path in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    let diag_path = Path::new(out_path).join("diagnostics");
-                    diagnostics::replay_diagnostics_from_file(
-                        &mut diag_shell,
-                        &diag_path,
-                        &src_store_prefix,
-                        &project_dir_prefix,
-                    );
-                }
+    // `nix build` shows no log of a successful build, so the diagnostics of
+    // every local unit are replayed here, whether it was built in this run or
+    // not. Each appears exactly once.
+    match plan_nix::realise_local_outputs(&plan_units) {
+        Ok(out_paths) => {
+            for out_path in out_paths {
+                diagnostics::replay_diagnostics_from_file(
+                    &mut diag_shell,
+                    &Path::new(&out_path).join("diagnostics"),
+                    &src_store_prefix,
+                    &project_dir_prefix,
+                );
             }
         }
+        Err(e) => tracing::warn!("Not replaying compiler diagnostics: {e:#}"),
     }
 
     let elapsed = start_time.elapsed();

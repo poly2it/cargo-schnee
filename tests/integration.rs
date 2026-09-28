@@ -1328,3 +1328,112 @@ fn registration_jobs_serial_matches_parallel() {
         "serial vs parallel registration produced different drv sets",
     );
 }
+
+/// Copy `fixtures/<name>` into a fresh git repository under the test target
+/// directory, so its sources are new to the store and every unit is cold.
+fn fresh_fixture_copy(name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{nanos}"));
+    let status = Command::new("cp")
+        .arg("-r")
+        .arg(&src)
+        .arg(&dest)
+        .status()
+        .expect("Failed to run cp");
+    assert!(status.success(), "copying {} failed", src.display());
+    let _ = std::fs::remove_dir_all(dest.join("target"));
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&dest)
+        .status()
+        .expect("Failed to run git init");
+    assert!(status.success(), "git init failed in {}", dest.display());
+    dest
+}
+
+/// Every local crate's warnings appear exactly once, on the build that
+/// compiles it and on a later build that finds it built. `warn-lib` has no
+/// input derivations and `warn-bin` depends on it, so both the unresolved and
+/// the resolved build trace lookups are covered. The replay reads the build
+/// trace over the daemon connection and never spawns `nix-store --realise`.
+#[test]
+#[ignore]
+fn fixture_warnings_replay_once() {
+    let project = fresh_fixture_copy("warnings-workspace");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for member in ["warn-lib/src/lib.rs", "warn-bin/src/main.rs"] {
+        let path = project.join(member);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("\npub const SALT: u128 = {nanos};\n"));
+        std::fs::write(&path, text).unwrap();
+    }
+
+    let real_nix_store = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v nix-store"])
+            .output()
+            .expect("Failed to locate nix-store")
+            .stdout,
+    )
+    .unwrap();
+    let wrapper_dir = project.join(".nix-store-wrapper");
+    let log = wrapper_dir.join("calls");
+    std::fs::create_dir_all(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("nix-store");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_nix_store.trim(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let manifest = project.join("Cargo.toml");
+    for build in ["cold", "warm"] {
+        let output = Command::new(cargo_schnee_bin())
+            .args(["schnee", "build", "--manifest-path"])
+            .arg(&manifest)
+            .env("PATH", &path)
+            .output()
+            .expect("Failed to execute cargo-schnee");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{build} build failed:\n{stderr}");
+        for warning in [
+            "unused variable: `unused_in_lib`",
+            "unused variable: `unused_in_bin`",
+        ] {
+            assert_eq!(
+                stderr.matches(warning).count(),
+                1,
+                "expected `{warning}` once on the {build} build:\n{stderr}",
+            );
+        }
+    }
+
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.contains("--realise")),
+        "cargo-schnee spawned nix-store --realise:\n{calls}",
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}

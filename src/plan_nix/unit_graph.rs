@@ -453,6 +453,7 @@ pub(super) fn extract_units_from_bcx(
             self_contained_build_script: package_self_contained_build_script(&unit.pkg),
             sliced_crate_rel: None,
             drv_path: None,
+            drv_json: None,
         });
     }
 
@@ -1383,6 +1384,7 @@ mod tests {
             self_contained_build_script: false,
             sliced_crate_rel: None,
             drv_path: None,
+            drv_json: None,
         }
     }
 
