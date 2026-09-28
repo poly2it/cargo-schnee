@@ -1437,7 +1437,17 @@ fn intent_label(user_intent: &UserIntent) -> &'static str {
 /// what `construct_derivation` emits from the same unit.  It is deliberately
 /// not `CARGO_PKG_VERSION`, which is pinned at `0.1.0` and so can never
 /// distinguish two builds of the binary.
-const PLAN_SCHEMA_VERSION: u32 = 1;
+const PLAN_SCHEMA_VERSION: u32 = 2;
+
+/// The Cargo profile a command selects: `--release`, then `--profile`, then
+/// `dev`.
+fn profile_name(release: bool, profile: &Option<String>) -> String {
+    if release {
+        "release".into()
+    } else {
+        profile.clone().unwrap_or_else(|| "dev".into())
+    }
+}
 
 /// Compose the unit-graph cache key.  Single point of truth shared by
 /// `run_build_pipeline` and `compute-graph`, so the graph files written
@@ -2149,21 +2159,7 @@ fn run_build_pipeline(
         .transpose()?;
     let resolution = resolution.as_ref();
 
-    let profile = if release {
-        plan_nix::ProfileConfig::release()
-    } else if let Some(p) = profile_opt {
-        match p.as_str() {
-            "dev" => plan_nix::ProfileConfig::dev(),
-            "release" => plan_nix::ProfileConfig::release(),
-            _ => plan_nix::ProfileConfig {
-                name: p.clone(),
-                opt_level: "0",
-                debug_info: true,
-            },
-        }
-    } else {
-        plan_nix::ProfileConfig::dev()
-    };
+    let profile = profile_name(release, profile_opt);
 
     let target_config = match target {
         Some(t) => plan_nix::TargetConfig::with_target(t),
@@ -2225,7 +2221,7 @@ fn run_build_pipeline(
         &lockfile_hash,
         &manifest_hash,
         &targets_hash,
-        &profile.name,
+        &profile,
         &target_config.target_triple,
         &user_intent,
         packages,
@@ -2652,11 +2648,7 @@ fn run_build_pipeline(
 
     // Copy outputs to target/<profile>/
     let copy_start = Instant::now();
-    let profile_dir = if profile.name == "dev" {
-        "debug"
-    } else {
-        &profile.name
-    };
+    let profile_dir = if profile == "dev" { "debug" } else { &profile };
     let target_debug = if target_config.is_cross() {
         project_dir
             .join("target")
@@ -2771,10 +2763,10 @@ fn run_build_pipeline(
     }
 
     let elapsed = start_time.elapsed();
-    let profile_desc = match profile.name.as_str() {
+    let profile_desc = match profile.as_str() {
         "dev" => "`dev` profile [unoptimized + debuginfo]".to_string(),
         "release" => "`release` profile [optimized]".to_string(),
-        _ => format!("`{}` profile", profile.name),
+        _ => format!("`{}` profile", profile),
     };
     shell::status(
         "Finished",
@@ -3289,21 +3281,7 @@ fn main() -> Result<()> {
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory"))?;
 
-            let profile_cfg = if release {
-                plan_nix::ProfileConfig::release()
-            } else if let Some(p) = profile {
-                match p.as_str() {
-                    "dev" => plan_nix::ProfileConfig::dev(),
-                    "release" => plan_nix::ProfileConfig::release(),
-                    _ => plan_nix::ProfileConfig {
-                        name: p.clone(),
-                        opt_level: "0",
-                        debug_info: true,
-                    },
-                }
-            } else {
-                plan_nix::ProfileConfig::dev()
-            };
+            let profile_cfg = profile_name(release, profile);
 
             let target_config = match target {
                 Some(t) => plan_nix::TargetConfig::with_target(t),
@@ -3517,7 +3495,6 @@ fn main() -> Result<()> {
             ref vendor_dir,
         } => {
             let mut closure_cache = HashMap::new();
-            let default_profile = plan_nix::ProfileConfig::dev();
             let default_target = plan_nix::TargetConfig::native();
             let (root_drvs, _, _, _) = plan_nix::run_plan_nix(
                 src,
@@ -3527,7 +3504,7 @@ fn main() -> Result<()> {
                 None,
                 None,
                 None,
-                &default_profile,
+                "dev",
                 &default_target,
                 UserIntent::Build,
                 &[],
@@ -3569,21 +3546,7 @@ fn main() -> Result<()> {
             let project_dir = project_dir_buf.as_path();
 
             // Profile / target resolution mirrors `run_build_pipeline`.
-            let profile_cfg = if release {
-                plan_nix::ProfileConfig::release()
-            } else if let Some(p) = profile {
-                match p.as_str() {
-                    "dev" => plan_nix::ProfileConfig::dev(),
-                    "release" => plan_nix::ProfileConfig::release(),
-                    _ => plan_nix::ProfileConfig {
-                        name: p.clone(),
-                        opt_level: "0",
-                        debug_info: true,
-                    },
-                }
-            } else {
-                plan_nix::ProfileConfig::dev()
-            };
+            let profile_cfg = profile_name(release, profile);
             let target_config = match target {
                 Some(t) => plan_nix::TargetConfig::with_target(t),
                 None => plan_nix::TargetConfig::native(),
@@ -3622,7 +3585,7 @@ fn main() -> Result<()> {
                 &lockfile_hash,
                 &manifest_hash,
                 &targets_hash,
-                &profile_cfg.name,
+                &profile_cfg,
                 &target_config.target_triple,
                 &user_intent,
                 package,

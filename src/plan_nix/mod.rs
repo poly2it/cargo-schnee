@@ -10,6 +10,7 @@ mod aterm;
 mod daemon;
 mod derivation;
 mod derivation_format;
+mod profile;
 mod realise;
 mod unit_graph;
 pub(crate) mod util;
@@ -40,29 +41,6 @@ use tracing::info;
 // ---------------------------------------------------------------------------
 // Build configuration
 // ---------------------------------------------------------------------------
-
-pub struct ProfileConfig {
-    pub name: String,
-    pub opt_level: &'static str,
-    pub debug_info: bool,
-}
-
-impl ProfileConfig {
-    pub fn dev() -> Self {
-        Self {
-            name: "dev".into(),
-            opt_level: "0",
-            debug_info: true,
-        }
-    }
-    pub fn release() -> Self {
-        Self {
-            name: "release".into(),
-            opt_level: "3",
-            debug_info: false,
-        }
-    }
-}
 
 pub struct TargetConfig {
     pub host_triple: String,
@@ -353,6 +331,8 @@ pub struct NixUnit {
     /// non-sliced units and vendored crates.
     #[serde(default)]
     pub(crate) sliced_crate_rel: Option<String>,
+    /// Codegen settings Cargo resolved for this unit.
+    pub(crate) profile: profile::UnitProfile,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
     /// The derivation registered at `drv_path`, kept so that
@@ -1034,7 +1014,7 @@ fn git_source_overrides(lock_text: &str) -> String {
 pub fn fresh_unit_graph(
     src: &Path,
     vendor_dir: &Path,
-    profile: &ProfileConfig,
+    profile_name: &str,
     target: &TargetConfig,
     user_intent: UserIntent,
     packages: &[String],
@@ -1103,11 +1083,8 @@ pub fn fresh_unit_graph(
 
     let ws = Workspace::new(&manifest_path, &gctx)?;
     let mut options = CompileOptions::new(&gctx, user_intent)?;
-    // Set profile if not dev
-    if profile.name != "dev" {
-        options.build_config.requested_profile =
-            cargo::util::interning::InternedString::new(&profile.name);
-    }
+    options.build_config.requested_profile =
+        cargo::util::interning::InternedString::new(profile_name);
     // Set cross-compilation target if specified
     if target.is_cross() {
         options.build_config.requested_kinds = vec![cargo::core::compiler::CompileKind::Target(
@@ -1320,6 +1297,7 @@ mod slice_tests {
             compile_test: false,
             self_contained_build_script: false,
             sliced_crate_rel: None,
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1562,6 +1540,7 @@ mod unit_setup_tests {
             compile_test: false,
             self_contained_build_script: false,
             sliced_crate_rel: None,
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1761,7 +1740,7 @@ pub fn run_plan_nix(
     cached_units: Option<(String, Vec<NixUnit>)>,
     cached_cfg_envs: Option<Vec<(String, String)>>,
     cached_host_cfg_envs: Option<Vec<(String, String)>>,
-    profile: &ProfileConfig,
+    profile_name: &str,
     target: &TargetConfig,
     user_intent: UserIntent,
     packages: &[String],
@@ -1858,7 +1837,7 @@ pub fn run_plan_nix(
             fresh_unit_graph(
                 src,
                 vendor_dir,
-                profile,
+                profile_name,
                 target,
                 user_intent,
                 packages,
@@ -2424,7 +2403,6 @@ pub fn run_plan_nix(
                 &pkg_config_bin,
                 &pkg_config_path_env,
                 &sys_build_closure,
-                profile,
                 target,
                 &cfg_envs,
                 &host_cfg_envs,
@@ -3044,6 +3022,7 @@ mod narrow_tests {
             compile_test: false,
             self_contained_build_script: false,
             sliced_crate_rel: None,
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }

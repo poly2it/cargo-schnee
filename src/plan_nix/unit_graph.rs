@@ -1,3 +1,4 @@
+use super::profile::{UnitProfile, lto_modes};
 use super::util::sanitize_drv_name;
 use super::{NixUnit, UnitKind};
 use anyhow::Result;
@@ -42,7 +43,18 @@ pub(super) fn extract_units_from_bcx(
         })
         .cloned()
         .collect();
-    all_units.sort_by_key(unit_sort_key);
+    let lto = lto_modes(bcx)?;
+    let profiles = all_units
+        .iter()
+        .map(|u| match lto.get(u) {
+            Some(&mode) => Ok((u.clone(), UnitProfile::new(bcx, u, mode))),
+            None => Err(anyhow::anyhow!(
+                "Cargo computed no LTO mode for {}",
+                u.pkg.name()
+            )),
+        })
+        .collect::<Result<HashMap<Unit, UnitProfile>>>()?;
+    all_units.sort_by_cached_key(|u| compilation_identity(u, &profiles[u]));
 
     // Group units by their "compilation identity" (what affects rustc output).
     // Cargo can produce multiple Unit entries with the same identity but different
@@ -55,7 +67,7 @@ pub(super) fn extract_units_from_bcx(
     let mut identity_all_units: HashMap<String, Vec<Unit>> = HashMap::new();
 
     for unit in &all_units {
-        let identity = compilation_identity(unit);
+        let identity = compilation_identity(unit, &profiles[unit]);
         identity_all_units
             .entry(identity.clone())
             .or_default()
@@ -64,7 +76,7 @@ pub(super) fn extract_units_from_bcx(
             // Duplicate — map to the same key as the existing unit
             key_map.insert(unit.clone(), existing_key.clone());
         } else {
-            let key = make_unit_key(unit);
+            let key = make_unit_key(unit, &profiles[unit]);
             identity_to_key.insert(identity, key.clone());
             key_map.insert(unit.clone(), key.clone());
             if deduped_set.insert(key) {
@@ -86,7 +98,8 @@ pub(super) fn extract_units_from_bcx(
 
     for unit in &topo_units {
         let key = key_map[unit].clone();
-        let identity = compilation_identity(unit);
+        let profile = profiles[unit].clone();
+        let identity = compilation_identity(unit, &profile);
 
         // Determine unit kind
         let kind = if unit.mode == CompileMode::RunCustomBuild {
@@ -383,6 +396,7 @@ pub(super) fn extract_units_from_bcx(
             unit.target.name(),
             &features,
             &crate_types,
+            &profile.identity(),
         );
 
         // Manifest dir — map to store path
@@ -452,6 +466,7 @@ pub(super) fn extract_units_from_bcx(
             compile_test,
             self_contained_build_script: package_self_contained_build_script(&unit.pkg),
             sliced_crate_rel: None,
+            profile,
             drv_path: None,
             drv_json: None,
         });
@@ -543,8 +558,10 @@ fn check_test_suffix(compile_test: bool, kind: UnitKind) -> &'static str {
 }
 
 /// Compute a "compilation identity" for a unit — units with the same identity
-/// produce identical rustc output and can be deduplicated.
-fn compilation_identity(unit: &Unit) -> String {
+/// produce identical rustc output and can be deduplicated. The profile is part
+/// of it because Cargo compiles a crate shared by a proc macro and a library
+/// twice, once with the build-override profile and once with the main one.
+fn compilation_identity(unit: &Unit, profile: &UnitProfile) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
@@ -572,7 +589,7 @@ fn compilation_identity(unit: &Unit) -> String {
     let mut feats: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
     feats.sort();
     format!(
-        "{}-{}-{}{}{}-{}-{:?}-{}",
+        "{}-{}-{}{}{}-{}-{:?}-{}-{}",
         unit.pkg.name(),
         unit.pkg.version(),
         unit.target.name(),
@@ -581,19 +598,15 @@ fn compilation_identity(unit: &Unit) -> String {
         unit.target.edition(),
         crate_types,
         feats.join(","),
+        profile.identity(),
     )
-}
-
-/// Create a stable sort key for a unit (must be deterministic across runs).
-fn unit_sort_key(unit: &Unit) -> String {
-    compilation_identity(unit)
 }
 
 /// Generate a deterministic unique key for a unit.
 /// Uses SHA-256 of the compilation identity to guarantee stability across runs
 /// (DefaultHasher uses randomized SipHash seeds, breaking nix derivation caching).
-fn make_unit_key(unit: &Unit) -> String {
-    let identity = compilation_identity(unit);
+fn make_unit_key(unit: &Unit, profile: &UnitProfile) -> String {
+    let identity = compilation_identity(unit, profile);
     let hash = Sha256::digest(identity.as_bytes());
     let short_hash = format!(
         "{:016x}",
@@ -718,22 +731,26 @@ pub(super) fn aggregate_vendor_id(entries: &[(String, String, String)]) -> Strin
 }
 
 /// Compute deterministic extra-filename hash for a unit.
-/// Includes features and crate types to avoid StableCrateId collisions
-/// when the same crate is compiled with different configurations.
+/// Includes features, crate types and the profile to avoid StableCrateId
+/// collisions when the same crate is compiled with different configurations.
+/// A consumer can see both profile variants of a crate through
+/// `-L dependency=`, one through a proc macro and one through a library.
 pub(super) fn compute_extra_filename(
     pkg_name: &str,
     pkg_version: &str,
     target_name: &str,
     features: &[String],
     crate_types: &[String],
+    profile_identity: &str,
 ) -> String {
     let input = format!(
-        "{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}-{}",
         pkg_name,
         pkg_version,
         target_name,
         features.join(","),
-        crate_types.join(",")
+        crate_types.join(","),
+        profile_identity,
     );
     let hash = Sha256::digest(input.as_bytes());
     format!(
@@ -1068,8 +1085,10 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
     let kind_suffix = if u.for_host { "-host" } else { "" };
     let mut ct = u.crate_types.clone();
     ct.sort();
+    // Variants with different profiles stay apart, as they do in Cargo, so
+    // a build dependency keeps its build-override profile.
     format!(
-        "{}/{}/{}{}{}{}/{}:{:?}",
+        "{}/{}/{}{}{}{}/{}:{:?}:{}",
         u.crate_name,
         u.edition,
         u.source_file,
@@ -1078,6 +1097,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         kind_suffix,
         u.manifest_dir,
         ct,
+        u.profile.identity(),
     )
 }
 
@@ -1158,6 +1178,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             target_name_field,
             &unified,
             &u.crate_types,
+            &u.profile.identity(),
         );
 
         // Compute new key from a synthetic identity string.
@@ -1177,7 +1198,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();
         let unified_identity = format!(
-            "{}-{}-{}{}{}{}-{}-{:?}-{}",
+            "{}-{}-{}{}{}{}-{}-{:?}-{}-{}",
             pkg_name,
             pkg_version,
             target_name_field,
@@ -1187,6 +1208,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             u.edition,
             crate_types_sorted,
             unified.join(","),
+            u.profile.identity(),
         );
         let hash = Sha256::digest(unified_identity.as_bytes());
         let short_hash = format!(
@@ -1347,7 +1369,7 @@ mod tests {
     fn make_unit(name: &str, version: &str, features: &[&str], deps: &[(&str, &str)]) -> NixUnit {
         let feats: Vec<String> = features.iter().map(|f| f.to_string()).collect();
         let crate_types = vec!["lib".to_string()];
-        let extra_filename = compute_extra_filename(name, version, name, &feats, &crate_types);
+        let extra_filename = compute_extra_filename(name, version, name, &feats, &crate_types, "");
         let identity = format!(
             "{}-{}-{}-{}-{:?}-{}",
             name,
@@ -1397,6 +1419,7 @@ mod tests {
             compile_test: false,
             self_contained_build_script: false,
             sliced_crate_rel: None,
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1633,13 +1656,14 @@ mod tests {
 
     #[test]
     fn extra_filename_differs_with_features() {
-        let a = compute_extra_filename("foo", "1.0.0", "foo", &["a".into()], &["lib".into()]);
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["a".into()], &["lib".into()], "");
         let b = compute_extra_filename(
             "foo",
             "1.0.0",
             "foo",
             &["a".into(), "b".into()],
             &["lib".into()],
+            "",
         );
         assert_ne!(
             a, b,
@@ -1647,10 +1671,28 @@ mod tests {
         );
     }
 
+    /// A consumer can reach the build-override and the main variant of one
+    /// crate through `-L dependency=`, so they need distinct filenames.
+    #[test]
+    fn extra_filename_differs_with_profile() {
+        let feats = ["x".to_string()];
+        let types = ["lib".to_string()];
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &feats, &types, "|0|false|release");
+        let b = compute_extra_filename(
+            "foo",
+            "1.0.0",
+            "foo",
+            &feats,
+            &types,
+            "-C opt-level=3|3|false|release",
+        );
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn extra_filename_deterministic() {
-        let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
-        let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()], "");
+        let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()], "");
         assert_eq!(a, b);
     }
 
@@ -1933,6 +1975,20 @@ mod tests {
             "unified key should NOT convert underscores to hyphens: {}",
             serde_core_unit.key,
         );
+    }
+
+    /// A crate built with the build-override profile for a proc macro and
+    /// with the main profile for a library stays two units, as in Cargo.
+    #[test]
+    fn unify_keeps_profile_variants_apart() {
+        let a = make_unit("syn", "2.0.0", &["full"], &[]);
+        let mut b = make_unit("syn", "2.0.0", &["full", "visit"], &[]);
+        b.profile.rustc_args = vec!["-C".into(), "opt-level=3".into()];
+        b.key = "syn-opt".into();
+        let mut units = vec![a, b];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 2);
+        assert_ne!(units[0].extra_filename, units[1].extra_filename);
     }
 
     // -- Doc kind tests ---------------------------------------------------------

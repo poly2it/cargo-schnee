@@ -1,5 +1,5 @@
 use super::util::{collect_store_paths, manifest_symlink_name, shell_quote};
-use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
+use super::{NixUnit, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -111,7 +111,6 @@ pub(super) fn construct_derivation(
     pkg_config_bin: &Option<String>,
     pkg_config_path: &str,
     sys_build_closure: &[String],
-    profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     host_cfg_envs: &[(String, String)],
@@ -177,7 +176,6 @@ pub(super) fn construct_derivation(
             cc_bin_dir,
             pkg_config_bin,
             pkg_config_path,
-            profile,
             target,
             cfg_envs,
             host_cfg_envs,
@@ -209,7 +207,6 @@ pub(super) fn construct_derivation(
             resolved_sysroot,
             &coreutils_bin_dir,
             cc_bin_dir,
-            profile,
             target,
             win_sdk_lib_dirs,
             if use_clippy { clippy_lint_args } else { &[] },
@@ -425,7 +422,7 @@ fn setup_source_fragment(setup_scripts: &[String]) -> String {
 
 /// Build the shell script for a regular compilation or build-script compilation.
 #[allow(clippy::too_many_arguments)]
-fn build_compile_script(
+pub(super) fn build_compile_script(
     unit: &NixUnit,
     units: &[NixUnit],
     key_to_idx: &HashMap<String, usize>,
@@ -435,7 +432,6 @@ fn build_compile_script(
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
     cc_bin_dir: &str,
-    profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
     // Extra rustc / clippy-driver flags appended after every other
@@ -562,15 +558,7 @@ fn build_compile_script(
     // metadata = extra_filename without leading dash
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
 
-    // Profile optimization flags
-    if profile.opt_level != "0" {
-        parts.push("-C".into());
-        parts.push(format!("opt-level={}", profile.opt_level));
-    }
-    if !profile.debug_info {
-        parts.push("-C".into());
-        parts.push("debuginfo=0".into());
-    }
+    parts.extend(unit.profile.rustc_args.iter().cloned());
 
     // --extern deps
     for (extern_name, dep_key) in &unit.dep_extern {
@@ -878,7 +866,6 @@ fn build_run_script(
     cc_bin_dir: &str,
     pkg_config_bin: &Option<String>,
     pkg_config_path: &str,
-    profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     host_cfg_envs: &[(String, String)],
@@ -961,12 +948,9 @@ fn build_run_script(
     script.push_str(&format!("export HOST={} && ", target.host_triple));
     script.push_str(&format!("export TARGET={} && ", effective_target));
     script.push_str("export NUM_JOBS=1 && ");
-    script.push_str(&format!("export OPT_LEVEL={} && ", profile.opt_level));
-    script.push_str(&format!(
-        "export DEBUG={} && ",
-        if profile.debug_info { "true" } else { "false" }
-    ));
-    script.push_str(&format!("export PROFILE={} && ", profile.name));
+    script.push_str(&format!("export OPT_LEVEL={} && ", unit.profile.opt_level));
+    script.push_str(&format!("export DEBUG={} && ", unit.profile.debug));
+    script.push_str(&format!("export PROFILE={} && ", unit.profile.root));
 
     // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals).
     // Host-compiled crates use the host's cfg values, not the cross target's.
@@ -1380,6 +1364,7 @@ mod tests {
             compile_test: false,
             self_contained_build_script: false,
             sliced_crate_rel: None,
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1594,7 +1579,6 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             "/nix/store/cc/bin",
-            &ProfileConfig::dev(),
             &TargetConfig::native(),
             &[],
             &[],
@@ -1721,7 +1705,6 @@ mod tests {
             "/nix/store/cc/bin",
             &None,
             "",
-            &ProfileConfig::dev(),
             &TargetConfig::native(),
             &[],
             &[],
@@ -1778,7 +1761,6 @@ mod tests {
             "/nix/store/cc/bin",
             &None,
             "",
-            &ProfileConfig::dev(),
             &TargetConfig::native(),
             &[],
             &[],
@@ -1850,6 +1832,7 @@ mod tests {
             compile_test: true,
             self_contained_build_script: false,
             sliced_crate_rel: Some(name.to_string()),
+            profile: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1867,7 +1850,6 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             "/nix/store/cc/bin",
-            &ProfileConfig::dev(),
             &TargetConfig::native(),
             &[],
             &[],
@@ -1967,7 +1949,6 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             "/nix/store/cc/bin",
-            &ProfileConfig::dev(),
             &TargetConfig::with_target("aarch64-unknown-linux-gnu"),
             &[],
             &[],
