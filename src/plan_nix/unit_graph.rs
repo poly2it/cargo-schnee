@@ -685,6 +685,13 @@ pub(super) fn map_to_store_path(
 /// content-addressed FOD per crate — decouples the lock axis: a `Cargo.lock`
 /// bump that changes one crate leaves every other crate's identity, and thus
 /// every non-dependent unit's input, untouched.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Change 2 of docs/input-decoupling-spec.md, proven by its test but not wired in yet"
+    )
+)]
 pub(super) fn per_crate_vendor_id(name: &str, version: &str, checksum: &str) -> String {
     format!("{name}-{version}-{checksum}")
 }
@@ -692,6 +699,13 @@ pub(super) fn per_crate_vendor_id(name: &str, version: &str, checksum: &str) -> 
 /// The aggregate vendor identity cargo-schnee references today: a hash over the
 /// whole lock. Any single entry change moves it, so every dependency unit's
 /// input moves — the coupling the per-crate identity replaces.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Change 2 of docs/input-decoupling-spec.md, the baseline its test compares against"
+    )
+)]
 pub(super) fn aggregate_vendor_id(entries: &[(String, String, String)]) -> String {
     let mut h = Sha256::new();
     for (name, version, checksum) in entries {

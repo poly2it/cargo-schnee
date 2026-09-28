@@ -1881,7 +1881,7 @@ fn write_profile(
 
     if !durations.is_empty() {
         // Sort by duration descending (longest first)
-        durations.sort_by(|a, b| b.1.cmp(&a.1));
+        durations.sort_by_key(|d| std::cmp::Reverse(d.1));
 
         let formatted: Vec<(String, std::time::Duration)> = durations
             .iter()
@@ -2240,14 +2240,15 @@ fn run_build_pipeline(
     // the lookup below treats it identically to a `target/`-cached entry.
     // This is the in-derivation hand-off used by `nix/buildPackage.nix`,
     // where `target/` is throwaway and the file cache provides nothing.
-    if !no_graph_cache && !cache.unit_graphs.contains_key(&unit_graph_key) {
-        if let Some(entry) = try_load_unit_graph_from_env(&unit_graph_key) {
-            tracing::info!(
-                "Loaded unit graph from CARGO_SCHNEE_UNIT_GRAPH ({} units)",
-                entry.units.len(),
-            );
-            cache.unit_graphs.insert(unit_graph_key.clone(), entry);
-        }
+    if !no_graph_cache
+        && !cache.unit_graphs.contains_key(&unit_graph_key)
+        && let Some(entry) = try_load_unit_graph_from_env(&unit_graph_key)
+    {
+        tracing::info!(
+            "Loaded unit graph from CARGO_SCHNEE_UNIT_GRAPH ({} units)",
+            entry.units.len(),
+        );
+        cache.unit_graphs.insert(unit_graph_key.clone(), entry);
     }
     let cached_entry = if no_graph_cache {
         None

@@ -662,7 +662,7 @@ pub fn narrow_to_requested_roots(
     // into the scope-wide arm below and build every root except `a`, which
     // is the opposite of what the caller asked for.
     anyhow::ensure!(
-        !(requested.is_empty() && !packages.is_empty()),
+        !requested.is_empty() || packages.is_empty(),
         "every requested package is also excluded: -p {} with --exclude {} \
          selects nothing to build",
         packages.join(", "),
@@ -1006,10 +1006,10 @@ fn git_source_overrides(lock_text: &str) -> String {
         // Carry a `?rev=` / `?branch=` / `?tag=` ref over verbatim.
         if let Some(q) = query {
             for kv in q.split('&') {
-                if let Some((k, v)) = kv.split_once('=') {
-                    if matches!(k, "rev" | "branch" | "tag") {
-                        out.push_str(&format!("{k} = \"{v}\"\n"));
-                    }
+                if let Some((k, v)) = kv.split_once('=')
+                    && matches!(k, "rev" | "branch" | "tag")
+                {
+                    out.push_str(&format!("{k} = \"{v}\"\n"));
                 }
             }
         }
@@ -1739,6 +1739,20 @@ mod unit_setup_tests {
     }
 }
 
+/// What `run_plan_nix` returns: the root derivations as drv path, target name
+/// and kind, every planned unit, and the target's and the host's cfg
+/// environment variables.
+pub type PlanOutput = (
+    Vec<(String, String, UnitKind)>,
+    Vec<NixUnit>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+);
+
+// Each parameter is one independent setting of the build pipeline, and
+// sibling branches add parameters here, so a parameter struct is left for
+// once those merge. `run_build_pipeline` carries the same allow.
+#[allow(clippy::too_many_arguments)]
 pub fn run_plan_nix(
     src: &Path,
     vendor_dir: &Path,
@@ -1792,12 +1806,7 @@ pub fn run_plan_nix(
     // cache entry, so the cached graph is a whole-scope graph that still
     // has to be narrowed to the roots this invocation asked for.
     resolution: Option<&ResolutionScope>,
-) -> Result<(
-    Vec<(String, String, UnitKind)>,
-    Vec<NixUnit>,
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-)> {
+) -> Result<PlanOutput> {
     let _root_span = tracing::info_span!("plan_nix").entered();
 
     let manifest_path = src.join("Cargo.toml");
