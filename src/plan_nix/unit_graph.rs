@@ -4,6 +4,7 @@ use super::{NixUnit, UnitKind};
 use anyhow::Result;
 use cargo::core::FeatureValue;
 use cargo::core::compiler::{CompileKind, CompileMode, Unit};
+use cargo::core::dependency::DepKind;
 use cargo::util::command_prelude::UserIntent;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -260,6 +261,11 @@ pub(super) fn extract_units_from_bcx(
             let mut feature_dep_activations: HashMap<String, Vec<(String, String)>> =
                 HashMap::new();
             let summary = unit.pkg.manifest().summary();
+            let linked_dep_kind = if unit.target.is_custom_build() {
+                DepKind::Build
+            } else {
+                DepKind::Normal
+            };
             for feat in &unit.features {
                 let fvs = match summary.features().get(feat) {
                     Some(v) => v,
@@ -277,14 +283,20 @@ pub(super) fn extract_units_from_bcx(
                     };
                     let extern_name = dep_toml_name.as_str().replace('-', "_");
                     // Look up the actual crate name (may differ with
-                    // `package = "..."` in the dep spec).
-                    let dep_spec = unit
-                        .pkg
-                        .dependencies()
-                        .iter()
-                        .find(|d| d.name_in_toml() == dep_toml_name);
-                    let pkg_name = dep_spec.map(|d| d.package_name()).unwrap_or(dep_toml_name);
-                    let is_platform_gated = dep_spec.is_some_and(|d| d.platform().is_some());
+                    // `package = "..."` in the dep spec).  Features are
+                    // package-wide, but a build script links only the
+                    // `[build-dependencies]` and every other target only the
+                    // `[dependencies]`.  A dep of the other table is not this
+                    // unit's dep, whatever the feature activates.
+                    let Some(dep_spec) =
+                        unit.pkg.dependencies().iter().find(|d| {
+                            d.name_in_toml() == dep_toml_name && d.kind() == linked_dep_kind
+                        })
+                    else {
+                        continue;
+                    };
+                    let pkg_name = dep_spec.package_name();
+                    let is_platform_gated = dep_spec.platform().is_some();
                     // Find the matching lib Unit in the full graph, honouring
                     // the consumer's compile kind.
                     match find_linkable_lib_unit(&all_units, pkg_name.as_str(), unit) {
@@ -308,12 +320,9 @@ pub(super) fn extract_units_from_bcx(
                         }
                         LibUnitLookup::WrongKind => {
                             // The crate is in the graph, but only compiled for
-                            // a compile kind this unit cannot link.  Usually a
-                            // build-script compile, which runs on the host and
-                            // draws its externs from `[build-dependencies]`,
-                            // looking at its package's regular deps that exist
-                            // only as target units.  That case is routine and
-                            // stays quiet.  A target consumer reaching this arm
+                            // a compile kind this unit cannot link.  A host
+                            // consumer reaching it stays quiet.  A target
+                            // consumer reaching this arm
                             // is not routine: the unit compiles with no
                             // `--extern` for a dep its features activated, and
                             // the only symptom is E0463 inside the unit's own
@@ -2024,5 +2033,98 @@ mod tests {
         u.kind = UnitKind::Doc;
         let filename = u.output_lib_filename();
         assert_eq!(filename, "doc/my_lib");
+    }
+}
+
+#[cfg(test)]
+mod build_script_dep_tests {
+    use super::super::{ProfileConfig, TargetConfig, fresh_unit_graph};
+    use super::*;
+
+    const FILES: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nserde = { path = \"serde\", features = [\"derive\"] }\n",
+        ),
+        ("src/main.rs", "fn main() {}\n"),
+        (
+            "serde/Cargo.toml",
+            "[package]\nname = \"serde\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nserde_derive = { path = \"../serde_derive\", optional = true }\n\n\
+             [features]\nderive = [\"serde_derive\"]\n",
+        ),
+        ("serde/build.rs", "fn main() {}\n"),
+        ("serde/src/lib.rs", ""),
+        (
+            "serde_derive/Cargo.toml",
+            "[package]\nname = \"serde_derive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [lib]\nproc-macro = true\n",
+        ),
+        ("serde_derive/src/lib.rs", ""),
+        (
+            "Cargo.lock",
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"serde\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"0.1.0\"\ndependencies = [\n \"serde_derive\",\n]\n\n\
+             [[package]]\nname = \"serde_derive\"\nversion = \"0.1.0\"\n",
+        ),
+    ];
+
+    /// serde's `derive` feature activates `serde_derive`, a regular dependency.
+    /// Cargo compiles serde's build script against its `[build-dependencies]`
+    /// only, so the build script must not wait for `serde_derive` and its
+    /// closure.
+    #[test]
+    fn feature_activated_regular_dep_stays_out_of_build_script() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in FILES {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vendor = tempfile::tempdir().unwrap();
+        let (units, _, _) = fresh_unit_graph(
+            dir.path(),
+            vendor.path(),
+            &ProfileConfig::release(),
+            &TargetConfig::native(),
+            UserIntent::Build,
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let serde_unit = |kind: UnitKind| {
+            units
+                .iter()
+                .find(|u| {
+                    u.kind == kind
+                        && u.cargo_envs
+                            .iter()
+                            .any(|(k, v)| k == "CARGO_PKG_NAME" && v == "serde")
+                })
+                .unwrap()
+        };
+        let names_derive = |key: &String| key.starts_with("serde_derive-");
+
+        let build_script = serde_unit(UnitKind::BuildScriptCompile);
+        assert!(
+            !build_script.dep_extern.iter().any(|(_, k)| names_derive(k)),
+            "{:?}",
+            build_script.dep_extern
+        );
+        assert!(
+            !build_script.all_dep_keys.iter().any(names_derive),
+            "{:?}",
+            build_script.all_dep_keys
+        );
+
+        let lib = serde_unit(UnitKind::Compile);
+        assert!(lib.dep_extern.iter().any(|(_, k)| names_derive(k)));
     }
 }
