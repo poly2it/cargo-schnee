@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub fn serialize_nar(root: &Path, allowed_files: Option<&HashSet<PathBuf>>) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024 * 1024);
     nar_string(&mut buf, "nix-archive-1");
-    nar_serialize_path(&mut buf, root, root, allowed_files, false)?;
+    nar_serialize_path(&mut buf, root, root, allowed_files, false, false)?;
     Ok(buf)
 }
 
@@ -40,7 +40,7 @@ pub fn serialize_nar_skeleton(
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024 * 1024);
     nar_string(&mut buf, "nix-archive-1");
-    nar_serialize_path(&mut buf, root, root, allowed_files, true)?;
+    nar_serialize_path(&mut buf, root, root, allowed_files, true, false)?;
     Ok(buf)
 }
 
@@ -62,9 +62,14 @@ fn nar_serialize_path(
     root: &Path,
     allowed_files: Option<&HashSet<PathBuf>>,
     skeleton: bool,
+    follow: bool,
 ) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let meta = if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    }
+    .with_context(|| format!("Failed to stat {}", path.display()))?;
 
     nar_string(buf, "(");
 
@@ -84,17 +89,28 @@ fn nar_serialize_path(
             let name_str = name.to_string_lossy();
             let child_path = entry.path();
 
-            // Skip symlinks (matching existing copy_dir_excluding behavior)
+            let rel = child_path.strip_prefix(root).unwrap_or(&child_path);
             let child_meta = std::fs::symlink_metadata(&child_path);
-            if let Ok(ref m) = child_meta
+            // Skip symlinks, matching `copy_dir_excluding`. An allowed symlink
+            // to a regular file becomes that file, matching the copy of the
+            // allowed files that `std::fs::copy` makes.
+            let follow = if let Ok(ref m) = child_meta
                 && m.file_type().is_symlink()
             {
-                continue;
-            }
+                let copied = allowed_files.is_some_and(|a| a.contains(rel))
+                    && std::fs::metadata(&child_path).is_ok_and(|m| m.is_file());
+                if !copied {
+                    continue;
+                }
+                true
+            } else {
+                false
+            };
 
             // If filtering, check if this subtree has any allowed files
-            if let Some(allowed) = allowed_files {
-                let rel = child_path.strip_prefix(root).unwrap_or(&child_path);
+            if let Some(allowed) = allowed_files
+                && !follow
+            {
                 let is_file = child_meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
                 let is_dir = child_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 if is_file {
@@ -114,7 +130,7 @@ fn nar_serialize_path(
             nar_string(buf, "name");
             nar_string(buf, &name_str);
             nar_string(buf, "node");
-            nar_serialize_path(buf, &child_path, root, allowed_files, skeleton)?;
+            nar_serialize_path(buf, &child_path, root, allowed_files, skeleton, follow)?;
             nar_string(buf, ")");
         }
     } else if meta.is_file() {

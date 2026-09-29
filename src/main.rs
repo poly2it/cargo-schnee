@@ -1218,11 +1218,7 @@ fn add_project_source_to_store(
                     tracing::info!("Source store path is valid: {}", store_path);
                     return Ok((store_path, skeleton));
                 }
-                // The copy below follows symlinks and creates the parents of
-                // files it then skips, and the filtered NAR does neither. The
-                // two trees agree when every allowed file is a regular file,
-                // so the NAR can go to the store without the copy.
-                if allowed_files_are_plain(project_dir, files) {
+                if nar_matches_copy(project_dir, files) {
                     match tracing::info_span!("store_add_project")
                         .in_scope(|| plan_nix::add_source_nar("project-src", &nar_data))
                     {
@@ -1365,13 +1361,16 @@ fn copy_allowed_files(project_dir: &Path, dest: &Path, files: &HashSet<PathBuf>)
     Ok(())
 }
 
-/// Whether every one of `files` is a regular file and not a symlink. Only
-/// then does the NAR that `nar::serialize_nar` writes for `files` match the
-/// tree `copy_allowed_files` builds.
-fn allowed_files_are_plain(project_dir: &Path, files: &HashSet<PathBuf>) -> bool {
-    files
-        .iter()
-        .all(|f| std::fs::symlink_metadata(project_dir.join(f)).is_ok_and(|m| m.is_file()))
+/// Whether the NAR that `nar::serialize_nar` writes for `files` matches the
+/// tree `copy_allowed_files` builds. Both turn a symlink to a regular file
+/// into that file and leave out any other symlink. They differ only for an
+/// entry that is missing or a directory, such as a submodule, because the
+/// copy then creates directories the NAR lacks.
+fn nar_matches_copy(project_dir: &Path, files: &HashSet<PathBuf>) -> bool {
+    files.iter().all(|f| {
+        std::fs::symlink_metadata(project_dir.join(f))
+            .is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+    })
 }
 
 /// Collect git-tracked + untracked-but-not-ignored files.
@@ -3936,24 +3935,45 @@ mod tests {
         (tmp, files)
     }
 
-    #[test]
-    fn plain_allowed_files_serialise_like_their_copy() {
-        let (tmp, files) = plain_project();
-        assert!(allowed_files_are_plain(tmp.path(), &files));
+    fn assert_nar_matches_copy(root: &Path, files: &HashSet<PathBuf>) {
+        assert!(nar_matches_copy(root, files));
         let copy = tempfile::tempdir().unwrap();
-        copy_allowed_files(tmp.path(), copy.path(), &files).unwrap();
+        copy_allowed_files(root, copy.path(), files).unwrap();
         assert_eq!(
-            nar::serialize_nar(tmp.path(), Some(&files)).unwrap(),
+            nar::serialize_nar(root, Some(files)).unwrap(),
             nar::serialize_nar(copy.path(), None).unwrap(),
         );
     }
 
     #[test]
-    fn a_symlinked_allowed_file_is_not_plain() {
+    fn plain_allowed_files_serialise_like_their_copy() {
+        let (tmp, files) = plain_project();
+        assert_nar_matches_copy(tmp.path(), &files);
+    }
+
+    #[test]
+    fn allowed_symlinks_serialise_like_their_copy() {
         let (tmp, mut files) = plain_project();
-        std::os::unix::fs::symlink("Cargo.toml", tmp.path().join("link.toml")).unwrap();
-        files.insert(PathBuf::from("link.toml"));
-        assert!(!allowed_files_are_plain(tmp.path(), &files));
+        let root = tmp.path();
+        std::os::unix::fs::symlink("run.sh", root.join("run-link")).unwrap();
+        std::os::unix::fs::symlink("crates", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("crates/a/dangling")).unwrap();
+        for f in ["run-link", "dir-link", "crates/a/dangling"] {
+            files.insert(PathBuf::from(f));
+        }
+        assert_nar_matches_copy(root, &files);
+    }
+
+    #[test]
+    fn a_missing_or_directory_entry_needs_the_copy() {
+        let (tmp, files) = plain_project();
+        let mut missing = files.clone();
+        missing.insert(PathBuf::from("gone/file.rs"));
+        assert!(!nar_matches_copy(tmp.path(), &missing));
+        std::fs::create_dir_all(tmp.path().join("vendor/submodule")).unwrap();
+        let mut submodule = files;
+        submodule.insert(PathBuf::from("vendor/submodule"));
+        assert!(!nar_matches_copy(tmp.path(), &submodule));
     }
 
     /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the
