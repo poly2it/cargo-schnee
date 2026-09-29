@@ -4512,4 +4512,27 @@ mod skeleton_tests {
         );
         assert_eq!(std::fs::read(dest.join("app/src/main.rs")).unwrap(), b"");
     }
+
+    /// The full source NAR follows an allowed symlink to a regular file, but
+    /// the skeleton must not, because `write_skeleton` skips every symlink.
+    #[test]
+    fn written_skeleton_matches_its_nar_with_a_symlinked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "notes\n").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", project.join("AGENTS.md")).unwrap();
+        let files: HashSet<PathBuf> = ["Cargo.toml", "CLAUDE.md", "AGENTS.md"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let dest = tmp.path().join(nar::SKELETON_NAME);
+        write_skeleton(&project, &files, &dest).unwrap();
+        assert!(
+            nar::serialize_nar(&dest, None).unwrap()
+                == nar::serialize_nar_skeleton(&project, Some(&files)).unwrap(),
+            "the written skeleton hashes differently"
+        );
+    }
 }

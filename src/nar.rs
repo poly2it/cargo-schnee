@@ -97,7 +97,10 @@ fn nar_serialize_path(
             let follow = if let Ok(ref m) = child_meta
                 && m.file_type().is_symlink()
             {
-                let copied = allowed_files.is_some_and(|a| a.contains(rel))
+                // The skeleton's writer skips every symlink, so the skeleton
+                // does too.
+                let copied = !skeleton
+                    && allowed_files.is_some_and(|a| a.contains(rel))
                     && std::fs::metadata(&child_path).is_ok_and(|m| m.is_file());
                 if !copied {
                     continue;
