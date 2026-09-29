@@ -475,6 +475,7 @@ pub(super) fn extract_units_from_bcx(
             compile_test,
             sliced_crate_rel: None,
             profile,
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         });
@@ -1016,7 +1017,16 @@ pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
         for i in 0..nix_units.len() {
             let unit = &nix_units[i];
             let mut max_dep: usize = 0;
-            for (_, dep_key) in &unit.dep_extern {
+            // A linking unit whose libraries were compiled against split
+            // metadata halves reaches their link halves only through
+            // `all_dep_keys`, and each is an input that must be registered
+            // before it.
+            let lib_deps = unit
+                .dep_extern
+                .iter()
+                .map(|(_, k)| k)
+                .chain(&unit.all_dep_keys);
+            for dep_key in lib_deps {
                 if let Some(&dep_idx) = key_to_idx.get(dep_key) {
                     max_dep = max_dep.max(unit_level[dep_idx] + 1);
                 }
@@ -1407,6 +1417,7 @@ mod tests {
             compile_test: false,
             sliced_crate_rel: None,
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }

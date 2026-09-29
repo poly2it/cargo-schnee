@@ -47,6 +47,19 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     write_profile_to: Option<PathBuf>,
 
+    /// Split the libraries whose compile times in this pipeline profile
+    /// show a long codegen after a short frontend into a metadata and a
+    /// link derivation, so that dependent libraries start on the metadata.
+    /// Without a profile no library is split.
+    #[arg(long, global = true, value_name = "PATH")]
+    pipeline_profile: Option<PathBuf>,
+
+    /// Record every library's frontend and total compile time from this
+    /// build's log and write them as a pipeline profile to the given path.
+    /// Only libraries built in this run are recorded.
+    #[arg(long, global = true, value_name = "PATH")]
+    write_pipeline_profile: Option<PathBuf>,
+
     /// Verify in-process .drv path computation against nix derivation add (debug)
     #[arg(long, global = true)]
     verify_drv_paths: bool,
@@ -2388,6 +2401,13 @@ struct RootUnit {
     bin_path: Option<PathBuf>,
 }
 
+/// The pipeline profile a build splits libraries by, and where it records
+/// a new one.  See `SchneeArgs::pipeline_profile`.
+struct PipelineOptions {
+    profile: Option<plan_nix::pipeline::PipelineProfile>,
+    record_to: Option<PathBuf>,
+}
+
 struct BuildResult {
     root_units: Vec<RootUnit>,
     /// target/<profile>/ directory
@@ -2409,6 +2429,7 @@ fn run_build_pipeline(
     verify_drv_paths: bool,
     verbose: u8,
     write_profile_to: &Option<PathBuf>,
+    pipeline_opts: &PipelineOptions,
     interrupted: &Arc<AtomicBool>,
     document_private_items: bool,
     // Run clippy-driver instead of rustc on local (workspace) compile units.
@@ -2658,6 +2679,7 @@ fn run_build_pipeline(
         &unit_setup,
         all_targets,
         resolution,
+        pipeline_opts.profile.as_ref(),
     )?;
 
     let plan_duration = plan_start.elapsed();
@@ -2732,6 +2754,12 @@ fn run_build_pipeline(
     cmd.arg(format!("{}^out", aggregator_drv));
     cmd.arg("--print-out-paths");
     cmd.arg("--no-link");
+    let mut recorder = pipeline_opts.record_to.as_ref().map(|_| {
+        // The recorder reads rustc's artifact notifications from the build
+        // logs, which `nix build` shows only with `-L`.
+        cmd.arg("-L");
+        plan_nix::pipeline::PipelineRecorder::new()
+    });
     let mut child = cmd
         .env(
             "NIX_CONFIG",
@@ -2773,6 +2801,13 @@ fn run_build_pipeline(
             anyhow::bail!("Interrupted by signal");
         }
         let trimmed = line.trim();
+        if let Some(recorder) = recorder.as_mut() {
+            if let Some(drv_path) = shell::parse_building_line(trimmed) {
+                recorder.building(drv_path, Instant::now());
+            } else if recorder.log_line(trimmed, Instant::now()) {
+                continue;
+            }
+        }
         if let Some(drv_path) = shell::parse_building_line(trimmed) {
             building_events.push((Instant::now(), drv_path.to_string()));
             let (pkg, version, kind) = shell::parse_drv_display(drv_path);
@@ -2920,6 +2955,15 @@ fn run_build_pipeline(
             }
         }
         std::process::exit(1);
+    }
+    if let (Some(recorder), Some(path)) = (recorder, &pipeline_opts.record_to) {
+        let profile = recorder.finish();
+        profile.save(path)?;
+        tracing::info!(
+            "Wrote the compile times of {} libraries to {}",
+            profile.units.len(),
+            path.display()
+        );
     }
     // Aggregator output: a single $out path with `root-<idx>`
     // symlinks pointing at each root's realised output.  Project the
@@ -3250,6 +3294,14 @@ fn main() -> Result<()> {
 
     let verbose = args.verbose;
     let write_profile_to = args.write_profile_to;
+    let pipeline_opts = PipelineOptions {
+        profile: args
+            .pipeline_profile
+            .as_deref()
+            .map(plan_nix::pipeline::PipelineProfile::load)
+            .transpose()?,
+        record_to: args.write_pipeline_profile,
+    };
     let verify_drv_paths = args.verify_drv_paths;
     let plan_only = args.plan_only.clone();
     let plan_only_ref = plan_only.as_deref();
@@ -3284,6 +3336,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 false,
@@ -3319,6 +3372,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 false,
@@ -3356,6 +3410,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 false,
@@ -3442,6 +3497,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 false,
@@ -3515,6 +3571,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 false,
@@ -3626,6 +3683,7 @@ fn main() -> Result<()> {
                 &[],
                 false,
                 None,
+                pipeline_opts.profile.as_ref(),
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
@@ -3676,6 +3734,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
                 true,
@@ -3716,6 +3775,7 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 document_private_items,
                 false,
@@ -3816,6 +3876,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 false,
+                None,
                 None,
             )?;
             // Output the root .drv paths

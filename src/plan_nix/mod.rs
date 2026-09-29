@@ -12,6 +12,7 @@ mod derivation;
 mod derivation_format;
 pub(crate) mod graph_drv;
 mod profile;
+pub mod pipeline;
 mod realise;
 pub(crate) mod store_paths;
 mod unit_graph;
@@ -327,6 +328,9 @@ pub struct NixUnit {
     pub(crate) sliced_crate_rel: Option<String>,
     /// Codegen settings Cargo resolved for this unit.
     pub(crate) profile: profile::UnitProfile,
+    /// The unit's part in a pipelined build.  See [`pipeline::split_units`].
+    #[serde(default)]
+    pub(crate) pipeline: pipeline::PipelineRole,
     /// Filled after nix derivation add
     pub(crate) drv_path: Option<String>,
     /// The derivation registered at `drv_path`, kept so that
@@ -349,8 +353,8 @@ impl NixUnit {
     /// `crate-type = ["cdylib", "rlib"]` produce both; we must pick the rlib.
     /// Proc-macros are the exception — they are loaded as shared objects.
     pub(crate) fn output_lib_filename(&self) -> String {
-        // Check mode emits only .rmeta (no .rlib/.so)
-        if self.kind == UnitKind::Check {
+        // Check mode and metadata halves emit only .rmeta (no .rlib/.so)
+        if self.kind == UnitKind::Check || self.pipeline == pipeline::PipelineRole::Metadata {
             return format!("lib{}{}.rmeta", self.crate_name, self.extra_filename);
         }
         // Doc mode outputs HTML directories, not linkable artifacts.
@@ -1517,6 +1521,7 @@ mod slice_tests {
             compile_test: false,
             sliced_crate_rel: None,
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1787,6 +1792,7 @@ mod unit_setup_tests {
             compile_test: false,
             sliced_crate_rel: None,
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -2025,6 +2031,9 @@ pub fn run_plan_nix(
     // cache entry, so the cached graph is a whole-scope graph that still
     // has to be narrowed to the roots this invocation asked for.
     resolution: Option<&ResolutionScope>,
+    // Recorded compile times that decide which libraries are split into
+    // a metadata and a link half.  `None` splits nothing.
+    pipeline_profile: Option<&pipeline::PipelineProfile>,
 ) -> Result<PlanOutput> {
     let _root_span = tracing::info_span!("plan_nix").entered();
 
@@ -2096,6 +2105,10 @@ pub fn run_plan_nix(
     // different unit sets.
     if let Some(scope) = resolution {
         nix_units = narrow_to_requested_roots(nix_units, packages, exclude, scope)?;
+    }
+    if let Some(profile) = pipeline_profile {
+        let split = pipeline::split_units(&mut nix_units, profile);
+        info!("Pipelined compilation: split {split} libraries");
     }
     tracing::Span::current().record("crate_count", nix_units.len());
     drop(_extract_span);
@@ -3216,6 +3229,7 @@ mod narrow_tests {
             compile_test: false,
             sliced_crate_rel: None,
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }

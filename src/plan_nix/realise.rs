@@ -126,7 +126,10 @@ fn local_diagnostic_drv_paths(units: &[NixUnit]) -> impl Iterator<Item = &str> {
     units
         .iter()
         .filter(|u| {
+            // A split library's metadata half reports the same diagnostics as
+            // its link half.
             u.is_local
+                && u.pipeline != super::pipeline::PipelineRole::Metadata
                 && matches!(
                     u.kind,
                     UnitKind::Compile

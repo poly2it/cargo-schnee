@@ -1,3 +1,4 @@
+use super::pipeline::PipelineRole;
 use super::util::{TEST_MANIFEST_DIR_FD, collect_store_paths, shell_quote, test_manifest_dir};
 use super::{NixUnit, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
@@ -68,6 +69,9 @@ const JOBSERVER_BUILD_DEPS: &[&str] = &["autotools", "cmake", "jobserver"];
 /// script run opts in only when its dependencies show it spawns work that
 /// takes tokens, because the script binary itself never does.
 fn joins_jobserver(unit: &NixUnit, units: &[NixUnit], key_to_idx: &HashMap<String, usize>) -> bool {
+    if unit.pipeline == PipelineRole::Metadata {
+        return false;
+    }
     match unit.kind {
         UnitKind::Compile | UnitKind::TestCompile | UnitKind::BuildScriptCompile => true,
         UnitKind::Check | UnitKind::Doc => false,
@@ -565,6 +569,10 @@ pub(super) fn build_compile_script(
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
 
     parts.extend(unit.profile.rustc_args.iter().cloned());
+    if unit.pipeline == PipelineRole::Metadata {
+        parts.push("-Z".into());
+        parts.push("no-codegen".into());
+    }
 
     // --extern deps
     for (extern_name, dep_key) in &unit.dep_extern {
@@ -681,17 +689,32 @@ pub(super) fn build_compile_script(
     // SCHNEE_AUX_DIR's parent) exists before the first script sources.
     script.push_str(&format!("{} -p $out && ", shell_quote(&mkdir_path)));
     script.push_str(&setup_source_fragment(setup_scripts));
+    if unit.pipeline != PipelineRole::Off {
+        script.push_str("export RUSTC_BOOTSTRAP=1 && ");
+    }
     // `$out/diagnostics` keeps rustc's `stderr` for replay on cached builds.
     // `tee` also passes each line on as rustc writes it, because the build
     // log's timestamps are what a profile reads the `rmeta` notification of
     // `--json=artifacts` from.  rustc's `stdout` goes around the pipe on
     // descriptor 3.
     script.push_str(&format!(
-        "{{ {} {} $EXTRA_ARGS 2>&1 1>&3 3>&- | {} $out/diagnostics >&2 3>&-; __rs=${{PIPESTATUS[0]}}; }} 3>&1; exit $__rs",
+        "{{ {} {} $EXTRA_ARGS 2>&1 1>&3 3>&- | {} $out/diagnostics >&2 3>&-; __rs=${{PIPESTATUS[0]}}; }} 3>&1; ",
         shell_quote(rustc_path),
         parts.join(" "),
         shell_quote(&format!("{}/tee", coreutils_bin_dir)),
     ));
+    // `-Z no-codegen` still writes an `.rlib` without object code.  A
+    // consumer resolving a transitive crate through `-L dependency=` could
+    // pick it over the `.rmeta`, so it must not reach `$out`.
+    if unit.pipeline == PipelineRole::Metadata {
+        script.push_str(&format!(
+            "{} -f $out/lib{}{}.rlib; ",
+            shell_quote(&format!("{}/rm", coreutils_bin_dir)),
+            unit.crate_name,
+            unit.extra_filename,
+        ));
+    }
+    script.push_str("exit $__rs");
 
     Ok(script)
 }
@@ -1416,6 +1439,7 @@ mod tests {
             compile_test: false,
             sliced_crate_rel: None,
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }
@@ -1886,6 +1910,7 @@ mod tests {
             compile_test: true,
             sliced_crate_rel: Some(name.to_string()),
             profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
             drv_json: None,
         }
