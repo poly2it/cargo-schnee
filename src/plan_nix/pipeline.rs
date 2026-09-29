@@ -230,7 +230,13 @@ fn artifact(text: &str) -> Option<(String, String)> {
         return None;
     }
     let emit = value.get("emit")?.as_str()?.to_string();
-    let path = value.get("artifact")?.as_str()?.strip_prefix("/nix/store/")?;
+    let path = value.get("artifact")?.as_str()?;
+    // A library and a binary of one package share a derivation name, and
+    // only libraries are ever split.
+    if emit == "link" && !path.ends_with(".rlib") {
+        return None;
+    }
+    let path = path.strip_prefix("/nix/store/")?;
     let out = path.split('/').next()?;
     Some((emit, out.split_once('-')?.1.to_string()))
 }
