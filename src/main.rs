@@ -51,14 +51,6 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     verify_drv_paths: bool,
 
-    /// Disable the unit-graph cache for this run.  Bypasses both the
-    /// in-tree `target/.schnee-cache.json` cache and the
-    /// `CARGO_SCHNEE_UNIT_GRAPH` env-var hand-off, forcing a full cargo
-    /// bootstrap.  Use this when investigating a suspected stale-graph
-    /// issue.
-    #[arg(long, global = true)]
-    no_graph_cache: bool,
-
     /// Number of parallel daemon connections to use for derivation
     /// registration.  Defaults to the number of available CPU cores,
     /// capped per topo level by the level's width.  Set to `1` to
@@ -1119,7 +1111,14 @@ fn rewrite_paths_in_table(
 ///
 /// When path dependencies outside `project_dir` are detected, they are
 /// copied into the store tree and Cargo.toml paths are rewritten.
-fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
+///
+/// With `want_skeleton`, also returns the store path of the project's
+/// skeleton, see `add_graph_skeleton`, unless the source reaches outside
+/// `project_dir` or is not a git work tree.
+fn add_project_source_to_store(
+    project_dir: &Path,
+    want_skeleton: bool,
+) -> Result<(String, Option<String>)> {
     // Collect allowed files via git2
     let mut allowed_files = collect_git_files(project_dir)?;
 
@@ -1201,6 +1200,13 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         HashMap::new()
     });
 
+    let skeleton = match &allowed_files {
+        Some(files) if want_skeleton && external_deps.is_empty() && extra_outside.is_empty() => {
+            Some(add_graph_skeleton(project_dir, files)?)
+        }
+        _ => None,
+    };
+
     // Fast path: no external deps or outside extra includes → try in-process NAR cache
     if external_deps.is_empty()
         && extra_outside.is_empty()
@@ -1209,9 +1215,11 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         match nar::serialize_nar(project_dir, Some(files)) {
             Ok(nar_data) => {
                 let store_path = nar::compute_nar_store_path("project-src", &nar_data);
-                if Path::new(&store_path).exists() {
-                    tracing::info!("Source store path exists: {}", store_path);
-                    return Ok(store_path);
+                // A collected path can outlive its store registration on
+                // disk, so only the store can say whether it is reusable.
+                if plan_nix::store_paths::is_valid_store_path(&store_path).unwrap_or(false) {
+                    tracing::info!("Source store path is valid: {}", store_path);
+                    return Ok((store_path, skeleton));
                 }
                 tracing::info!("Source store path miss, falling back to subprocess");
             }
@@ -1279,7 +1287,61 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
         rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
     }
 
-    add_to_nix_store(&dest.to_string_lossy())
+    Ok((add_to_nix_store(&dest.to_string_lossy())?, skeleton))
+}
+
+/// Add the project's skeleton to the store and return its path. The
+/// skeleton holds every file of the project, but only manifests keep their
+/// contents, see `nar::is_manifest`. Cargo plans the same unit
+/// graph from it as from the full source, and its path only moves when a
+/// manifest changes or a file appears or disappears.
+fn add_graph_skeleton(project_dir: &Path, files: &HashSet<PathBuf>) -> Result<String> {
+    let store_path = nar::skeleton_source_store_path(project_dir, files)?;
+    if plan_nix::store_paths::is_valid_store_path(&store_path)? {
+        return Ok(store_path);
+    }
+    let temp = tempfile::tempdir().context("Failed to create temp dir for the skeleton")?;
+    let dest = temp.path().join(nar::SKELETON_NAME);
+    write_skeleton(project_dir, files, &dest)?;
+    let added = add_to_nix_store(&dest.to_string_lossy())?;
+    anyhow::ensure!(
+        added == store_path,
+        "The skeleton landed at {added}, expected {store_path}"
+    );
+    Ok(added)
+}
+
+/// Write the skeleton of `files` under `project_dir` to `dest`, the tree
+/// whose NAR `nar::serialize_nar_skeleton` describes.
+fn write_skeleton(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for file in files {
+        // The NAR keeps every real directory on the way to an allowed path,
+        // even when the path itself is a symlink or missing.
+        let mut dir = PathBuf::new();
+        for component in file.parent().into_iter().flat_map(Path::components) {
+            dir.push(component);
+            let is_dir =
+                std::fs::symlink_metadata(project_dir.join(&dir)).is_ok_and(|m| m.is_dir());
+            if !is_dir {
+                break;
+            }
+            std::fs::create_dir_all(dest.join(&dir))?;
+        }
+        let src = project_dir.join(file);
+        let dest_path = dest.join(file);
+        let is_file = std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file());
+        if !is_file || !dest_path.parent().is_some_and(Path::is_dir) {
+            continue;
+        }
+        if nar::is_manifest(&src) {
+            std::fs::copy(&src, &dest_path)
+                .with_context(|| format!("Failed to copy {}", src.display()))?;
+        } else {
+            std::fs::write(&dest_path, b"")?;
+        }
+    }
+    Ok(())
 }
 
 /// Collect git-tracked + untracked-but-not-ignored files.
@@ -1394,7 +1456,7 @@ fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Build cache — skip vendoring + derivation registration on unchanged builds
+// Unit-graph keys and the `CARGO_SCHNEE_UNIT_GRAPH` hand-off
 // ---------------------------------------------------------------------------
 
 /// Render the bool fields of `UserIntent` variants into a cache-key
@@ -1501,22 +1563,20 @@ fn compose_unit_graph_key(
     )
 }
 
-/// A single unit-graph cache entry, keyed by
+/// A unit graph that `cargo-schnee compute-graph` wrote, usually inside
+/// the `lib.unitGraph` derivation, for a later invocation to read through
+/// `CARGO_SCHNEE_UNIT_GRAPH`. The key is
 /// `hash(Cargo.lock + Cargo.toml + discovered targets + profile + target
-/// + intent + packages + features)` — see `compose_unit_graph_key`.
+/// + intent + packages + features)`, see `compose_unit_graph_key`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct UnitGraphCacheEntry {
     src_store: String,
     units: Vec<plan_nix::NixUnit>,
     target_cfg_envs: Vec<(String, String)>,
     host_cfg_envs: Vec<(String, String)>,
-    /// Cache key the entry was generated for. Always populated — both
-    /// the in-tree `target/.schnee-cache.json` cache and the
-    /// `cargo-schnee compute-graph` standalone files write it, so the
-    /// env-var hand-off path and the on-disk-cache path use the same
-    /// validation routine. Old caches written without this field
-    /// deserialise as the default empty string and miss validation,
-    /// triggering a fresh bootstrap.
+    /// Key the graph was computed for. A file without it deserialises
+    /// with an empty key, fails validation and triggers a fresh
+    /// bootstrap.
     #[serde(default)]
     cache_key: String,
 }
@@ -1574,76 +1634,6 @@ fn try_load_unit_graph_from_env(expected_key: &str) -> Option<UnitGraphCacheEntr
         path
     };
     parse_unit_graph_file(&path, expected_key)
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct SchneeCache {
-    /// SHA-256 of Cargo.lock → vendor nix store path
-    #[serde(default)]
-    vendor_lockfile_hash: Option<String>,
-    #[serde(default)]
-    vendor_store_path: Option<String>,
-    /// Tool closure cache: store path → sorted list of closure paths.
-    /// Keyed on individual nix store paths (e.g. rustc, cc, pkg-config deps).
-    /// Invalidated per-entry: if a store path changes, its old entry is simply unused.
-    #[serde(default)]
-    tool_closures: HashMap<String, Vec<String>>,
-    /// Unit graph cache, keyed by a composite of Cargo.lock, workspace manifests,
-    /// profile, target, intent, packages, and features.  Multiple entries coexist
-    /// so that e.g. `--package X` does not evict the full-workspace entry.
-    #[serde(default)]
-    unit_graphs: HashMap<String, UnitGraphCacheEntry>,
-}
-
-struct CacheLock {
-    _file: std::fs::File,
-}
-
-impl CacheLock {
-    fn acquire(project_dir: &Path) -> Result<Self> {
-        use fs2::FileExt;
-        let dir = project_dir.join("target");
-        std::fs::create_dir_all(&dir)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(dir.join(".schnee-cache.lock"))
-            .context("Failed to open cache lock file")?;
-        file.lock_exclusive()
-            .context("Failed to acquire cache lock")?;
-        Ok(Self { _file: file })
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
-    }
-}
-
-impl SchneeCache {
-    fn load(project_dir: &Path) -> Self {
-        let path = project_dir.join("target/.schnee-cache.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    fn save(&self, project_dir: &Path) -> Result<()> {
-        use tempfile::NamedTempFile;
-        let dir = project_dir.join("target");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(".schnee-cache.json");
-        let json = serde_json::to_string_pretty(self)?;
-        let mut tmp =
-            NamedTempFile::new_in(&dir).context("Failed to create temp file for cache")?;
-        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
-        tmp.persist(&path)
-            .context("Failed to atomically persist cache file")?;
-        Ok(())
-    }
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -1769,6 +1759,256 @@ fn hash_discovered_targets(manifest_path: &Path, project_dir: &Path) -> Result<S
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Point `link` at a GC root that keeps what the next warm build of the
+/// same profile, target and intent reuses. That is `sources`, every
+/// per-unit source and derivation, the aggregator derivation and every
+/// realised output, plus the `memoised` vendor and graph derivations and
+/// outputs. The link replaces the one the previous such build registered,
+/// which makes that build's paths collectable again. Returns whether it
+/// registered a new root.
+#[allow(clippy::too_many_arguments)]
+fn root_last_build(
+    link: &Path,
+    name: &str,
+    sources: &[String],
+    units: &[plan_nix::NixUnit],
+    aggregator_drv: &str,
+    aggregator_out: &str,
+    memoised: &[String],
+) -> Result<bool> {
+    use plan_nix::store_paths::{
+        realised_outputs, references_of_link, register_gc_root, store_dir, store_path_of,
+    };
+    // The aggregator derivation's path covers every unit derivation, so a
+    // root that already names it and the memoised inputs keeps this build.
+    // Skipping the re-registration spares `realised_outputs`, which resolves
+    // every unit.
+    let mut identity: Vec<String> = vec![aggregator_drv.to_string(), aggregator_out.to_string()];
+    identity.extend(memoised.iter().cloned());
+    if let Some(existing) = references_of_link(link)
+        && identity.iter().all(|p| existing.contains(p))
+    {
+        return Ok(false);
+    }
+    let store_dir = store_dir();
+    let unit_drvs: Vec<String> = units.iter().filter_map(|u| u.drv_path.clone()).collect();
+    let mut kept: Vec<String> = realised_outputs(&unit_drvs)?;
+    kept.extend(unit_drvs);
+    kept.extend(identity);
+    kept.extend(
+        units
+            .iter()
+            .flat_map(|u| [u.manifest_dir.as_str(), u.source_file.as_str()])
+            .chain(sources.iter().map(String::as_str))
+            .filter_map(|p| store_path_of(p, &store_dir))
+            .map(str::to_string),
+    );
+    register_gc_root(link, name, &kept)?;
+    Ok(true)
+}
+
+/// What `realise_memoised_inputs` needs to put the unit graph into a
+/// derivation.
+struct GraphRequest<'a> {
+    name: String,
+    skeleton: &'a str,
+    project_dir: &'a Path,
+    args: Vec<String>,
+}
+
+/// The vendor farm and, when asked for, the unit graph, both realised from
+/// derivations whose paths follow from their inputs.
+struct MemoisedInputs {
+    vendor: String,
+    /// `graph.json` inside the realised unit-graph output.
+    graph: Option<PathBuf>,
+    /// Every planned derivation and realised output, for the GC root.
+    kept: Vec<String>,
+}
+
+/// The `compute-graph` flags that select the graph this build plans, or
+/// `None` for an intent `compute-graph` cannot express.
+#[allow(clippy::too_many_arguments)]
+fn compute_graph_args(
+    profile: &str,
+    target: Option<&str>,
+    user_intent: &UserIntent,
+    packages: &[String],
+    exclude: &[String],
+    features: &[String],
+    no_default_features: bool,
+    all_targets: bool,
+    resolution_scope: Option<&str>,
+) -> Option<Vec<String>> {
+    let intent = match user_intent {
+        UserIntent::Build => "build",
+        UserIntent::Check { test: false } => "check",
+        UserIntent::Test => "test",
+        UserIntent::Bench => "bench",
+        UserIntent::Doc {
+            deps: false,
+            json: false,
+        } => "doc",
+        _ => return None,
+    };
+    let mut args = vec!["--profile".to_string(), profile.to_string()];
+    let mut flag = |name: &str, values: &[String]| {
+        for v in values {
+            args.push(name.to_string());
+            args.push(v.clone());
+        }
+    };
+    flag(
+        "--target",
+        &target.map(String::from).into_iter().collect::<Vec<_>>(),
+    );
+    flag("--package", packages);
+    flag("--exclude", exclude);
+    flag("--features", features);
+    flag(
+        "--resolution-scope",
+        &resolution_scope
+            .map(String::from)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+    if no_default_features {
+        args.push("--no-default-features".into());
+    }
+    if all_targets {
+        args.push("--all-targets".into());
+    }
+    args.extend(["--intent".to_string(), intent.to_string()]);
+    Some(args)
+}
+
+/// The store path of the running `cargo-schnee` binary and the binary
+/// itself, when it lives in the store and a sandbox can therefore run it.
+fn schnee_in_store() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let exe = exe.to_string_lossy().to_string();
+    let store = plan_nix::store_paths::store_path_of(&exe, &plan_nix::store_paths::store_dir())?
+        .to_string();
+    Some((store, exe))
+}
+
+/// Realise the vendor farm for `lock_text`, and the unit graph when
+/// `graph` asks for it, through derivations that the store memoises by
+/// content. On a warm build both are already realised, and this costs one
+/// validity query and one `nix build` that builds nothing.
+///
+/// Returns `None` when the farm cannot describe this lockfile, such as for
+/// a git dependency, or when the build tools, the daemon or a
+/// store-resident `cargo-schnee` are missing. The caller then vendors with
+/// `cargo vendor` and bootstraps cargo in-process.
+fn realise_memoised_inputs(
+    lock_text: &str,
+    graph: Option<GraphRequest>,
+    system: &str,
+) -> Result<Option<MemoisedInputs>> {
+    use plan_nix::vendor_farm::{
+        BuildTools, crates_io_packages, plan_vendor_farm, register_planned,
+    };
+    let Some(crates) = crates_io_packages(lock_text)? else {
+        tracing::info!("Cargo.lock has non-crates.io packages, vendoring with cargo vendor");
+        return Ok(None);
+    };
+    let Some(tools) = BuildTools::from_path(system) else {
+        tracing::info!(
+            "bash, coreutils, tar or gzip missing from PATH, vendoring with cargo vendor"
+        );
+        return Ok(None);
+    };
+    let plan_span = tracing::info_span!("plan_vendor_and_graph").entered();
+    let farm = plan_vendor_farm(&crates, &tools)?;
+    let mut drvs = farm.drvs;
+    let graph_drv = match (graph, schnee_in_store()) {
+        (Some(request), Some((schnee_store, schnee_bin))) => {
+            let rustc = plan_nix::util::which_command("rustc")?
+                .to_string_lossy()
+                .to_string();
+            let rustc_store =
+                plan_nix::store_paths::store_path_of(&rustc, &plan_nix::store_paths::store_dir())
+                    .map(String::from);
+            match rustc_store {
+                Some(rustc_store) => {
+                    let inputs = plan_nix::graph_drv::GraphInputs {
+                        skeleton: request.skeleton,
+                        vendor_farm_drv: &farm.farm_drv,
+                        schnee_bin: &schnee_bin,
+                        schnee_store: &schnee_store,
+                        rustc_store: &rustc_store,
+                        args: request.args,
+                        profile_env: plan_nix::graph_drv::profile_env(),
+                        parent_configs: plan_nix::graph_drv::parent_configs(request.project_dir),
+                    };
+                    let planned =
+                        plan_nix::graph_drv::plan_graph_drv(&request.name, &inputs, &tools)?;
+                    let path = planned.path.clone();
+                    drvs.push(planned);
+                    Some(path)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    drop(plan_span);
+    let _register_span = tracing::info_span!("register_vendor_and_graph").entered();
+    let added = match register_planned(&drvs) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(
+                "Registering the vendor derivations failed ({e:#}), vendoring with cargo vendor"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::info!(
+        "Registered {added} of {} vendor and graph derivations",
+        drvs.len()
+    );
+
+    let mut installables = vec![format!("{}^out", farm.farm_drv)];
+    installables.extend(graph_drv.iter().map(|d| format!("{d}^out")));
+    let _realise_span = tracing::info_span!("realise_vendor_and_graph").entered();
+    let output = Command::new("nix")
+        .arg("build")
+        .args(&installables)
+        .args(["--print-out-paths", "--no-link"])
+        .env(
+            "NIX_CONFIG",
+            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+        )
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to spawn nix build for the vendor farm")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Realising the vendor farm failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let outs = String::from_utf8(output.stdout)?;
+    let mut vendor = None;
+    let mut graph = None;
+    let mut kept: Vec<String> = drvs.iter().map(|d| d.path.clone()).collect();
+    for out in outs.lines().map(str::trim).filter(|o| !o.is_empty()) {
+        kept.push(out.to_string());
+        if out.ends_with("-vendor") {
+            vendor = Some(out.to_string());
+        } else {
+            graph = Some(PathBuf::from(out).join("graph.json"));
+        }
+    }
+    let vendor = vendor.context("nix build printed no vendor farm path")?;
+    Ok(Some(MemoisedInputs {
+        vendor,
+        graph,
+        kept,
+    }))
+}
+
 /// Run cargo vendor and add result to the nix store.
 fn vendor_dependencies(manifest_path: &Path) -> Result<String> {
     let vendor_dir = tempfile::tempdir().context("Failed to create temp dir for vendoring")?;
@@ -1787,6 +2027,13 @@ fn vendor_dependencies(manifest_path: &Path) -> Result<String> {
     // cargo vendor may not create the directory for zero-dep projects
     if !vendor_path.exists() {
         std::fs::create_dir_all(&vendor_path)?;
+    }
+    // The same `Cargo.lock` vendors to the same content, so the store path
+    // follows from the NAR hash and the add is skipped when it is valid.
+    let nar = nar::serialize_nar(&vendor_path, None)?;
+    let store_path = nar::compute_nar_store_path("vendor", &nar);
+    if plan_nix::store_paths::is_valid_store_path(&store_path).unwrap_or(false) {
+        return Ok(store_path);
     }
     add_to_nix_store(&vendor_path.to_string_lossy())
 }
@@ -2104,10 +2351,6 @@ fn run_build_pipeline(
     // Empty for non-clippy commands and ignored for dependency units so
     // their per-unit derivations stay byte-shared with regular runs.
     clippy_lint_args: &[String],
-    // Bypass the unit-graph cache (both `target/.schnee-cache.json` and the
-    // `CARGO_SCHNEE_UNIT_GRAPH` env var). Set by the global
-    // `--no-graph-cache` flag on `SchneeArgs`.
-    no_graph_cache: bool,
     // Worker count for parallel derivation registration. `None` defaults
     // to the number of available CPU cores; `Some(1)` reproduces the
     // pre-parallel behaviour. Capped per level by the level's width
@@ -2166,49 +2409,13 @@ fn run_build_pipeline(
         None => plan_nix::TargetConfig::native(),
     };
 
-    // Load build cache (locked to prevent concurrent cache corruption)
-    let _cache_lock = CacheLock::acquire(project_dir)?;
-    let mut cache = SchneeCache::load(project_dir);
-
-    // Vendor dependencies — skip if Cargo.lock hasn't changed
     let vendor_start = Instant::now();
     let lockfile_path = find_lockfile(project_dir)?;
     let lockfile_hash = hash_file(&lockfile_path)?;
-    let vendor_store = if let Some(dir) = vendor_dir {
-        let dir = dir
-            .canonicalize()
-            .with_context(|| format!("Cannot canonicalize vendor dir: {}", dir.display()))?;
-        shell::status("Vendoring", &format!("using provided {}", dir.display()));
-        dir.to_string_lossy().into_owned()
-    } else if cache.vendor_lockfile_hash.as_deref() == Some(&lockfile_hash) {
-        if let Some(ref cached_path) = cache.vendor_store_path {
-            if Path::new(cached_path).exists() {
-                shell::status("Vendoring", "dependencies (cached)");
-                cached_path.clone()
-            } else {
-                vendor_dependencies(&manifest_path)?
-            }
-        } else {
-            vendor_dependencies(&manifest_path)?
-        }
-    } else {
-        shell::status("Vendoring", "dependencies...");
-        vendor_dependencies(&manifest_path)?
-    };
-    cache.vendor_lockfile_hash = Some(lockfile_hash.clone());
-    cache.vendor_store_path = Some(vendor_store.clone());
 
-    // Add project source to the Nix store
-    let src_store = add_project_source_to_store(project_dir)?;
-    let vendor_duration = vendor_start.elapsed();
-
-    // Plan: extract unit graph and register per-unit CA derivations directly.
-    let plan_start = Instant::now();
-    shell::status("Planning", "build...");
-
-    // Check unit graph cache.  Note: clippy mode reuses the regular check
-    // unit graph because the cargo plan is identical — only the rustc binary
-    // swapped out per-unit at construction time.
+    // Clippy mode reuses the regular check unit graph because the cargo
+    // plan is identical, only the rustc binary is swapped per unit at
+    // construction time.
     let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
     // Filesystem-driven target discovery (tests/, benches/, examples/,
     // src/bin/, src/lib.rs, src/main.rs, build.rs) changes the unit-graph
@@ -2231,32 +2438,94 @@ fn run_build_pipeline(
         all_targets,
         resolution,
     );
-    // If `CARGO_SCHNEE_UNIT_GRAPH` points at a graph generated for the
-    // same `unit_graph_key`, fold its contents into the in-memory cache so
-    // the lookup below treats it identically to a `target/`-cached entry.
-    // This is the in-derivation hand-off used by `nix/buildPackage.nix`,
-    // where `target/` is throwaway and the file cache provides nothing.
-    if !no_graph_cache
-        && !cache.unit_graphs.contains_key(&unit_graph_key)
-        && let Some(entry) = try_load_unit_graph_from_env(&unit_graph_key)
-    {
+    // `nix/buildPackage.nix` computes the graph in the `lib.unitGraph`
+    // derivation and hands it over. Otherwise this build registers its
+    // own unit-graph derivation next to the vendor farm, and the store
+    // memoises both by the content of their inputs.
+    let mut graph = try_load_unit_graph_from_env(&unit_graph_key);
+    if let Some(entry) = &graph {
         tracing::info!(
             "Loaded unit graph from CARGO_SCHNEE_UNIT_GRAPH ({} units)",
             entry.units.len(),
         );
-        cache.unit_graphs.insert(unit_graph_key.clone(), entry);
     }
-    let cached_entry = if no_graph_cache {
-        None
+    let source_span = tracing::info_span!("add_project_source").entered();
+    let want_skeleton = vendor_dir.is_none() && graph.is_none();
+    let (src_store, skeleton) = add_project_source_to_store(project_dir, want_skeleton)?;
+    drop(source_span);
+    let mut memoised_paths: Vec<String> = Vec::new();
+    let vendor_store = if let Some(dir) = vendor_dir {
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("Cannot canonicalize vendor dir: {}", dir.display()))?;
+        shell::status("Vendoring", &format!("using provided {}", dir.display()));
+        dir.to_string_lossy().into_owned()
     } else {
-        cache.unit_graphs.get(&unit_graph_key)
+        shell::status("Vendoring", "dependencies...");
+        let lock_text = std::fs::read_to_string(&lockfile_path)
+            .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
+        let request = match (&graph, skeleton.as_deref()) {
+            (None, Some(skeleton)) => compute_graph_args(
+                &profile.name,
+                target.as_deref(),
+                &user_intent,
+                packages,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+                resolution_scope,
+            )
+            .map(|args| GraphRequest {
+                name: format!(
+                    "{}-{}-unit-graph",
+                    read_package_name(&manifest_path).unwrap_or_else(|_| "workspace".into()),
+                    intent_str
+                ),
+                skeleton,
+                project_dir,
+                args,
+            }),
+            _ => None,
+        };
+        // A fetch can fail where `cargo vendor` still succeeds from the local
+        // registry cache, so a failed farm falls back rather than aborting.
+        let memo = realise_memoised_inputs(&lock_text, request, &target_config.nix_system)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Falling back to cargo vendor: {:#}", e);
+                None
+            });
+        match memo {
+            Some(memo) => {
+                if let Some(file) = &memo.graph {
+                    graph = parse_unit_graph_file(file, &unit_graph_key);
+                    if let Some(entry) = &graph {
+                        tracing::info!(
+                            "Loaded unit graph from {} ({} units)",
+                            file.display(),
+                            entry.units.len()
+                        );
+                    }
+                }
+                memoised_paths = memo.kept;
+                memo.vendor
+            }
+            None => vendor_dependencies(&manifest_path)?,
+        }
     };
-    let cached_units = cached_entry.map(|e| {
-        tracing::info!("Unit graph cache hit ({} units)", e.units.len());
-        (e.src_store.clone(), e.units.clone())
-    });
-    let cached_cfg_envs = cached_entry.map(|e| e.target_cfg_envs.clone());
-    let cached_host_cfg_envs = cached_entry.map(|e| e.host_cfg_envs.clone());
+    let vendor_duration = vendor_start.elapsed();
+
+    let plan_start = Instant::now();
+    shell::status("Planning", "build...");
+    let handed_over = graph;
+    let (cached_units, cached_cfg_envs, cached_host_cfg_envs) = match handed_over {
+        Some(e) => (
+            Some((e.src_store, e.units)),
+            Some(e.target_cfg_envs),
+            Some(e.host_cfg_envs),
+        ),
+        None => (None, None, None),
+    };
 
     // Resolve passthrough env vars for build-script derivations.
     // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
@@ -2302,11 +2571,11 @@ fn run_build_pipeline(
         _ => Vec::new(),
     };
 
-    let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
+    let (root_drvs, plan_units, _, _) = plan_nix::run_plan_nix(
         Path::new(&src_store),
         Path::new(&vendor_store),
         verify_drv_paths,
-        &mut cache.tool_closures,
+        &mut HashMap::new(),
         cached_units,
         cached_cfg_envs,
         cached_host_cfg_envs,
@@ -2328,43 +2597,6 @@ fn run_build_pipeline(
         all_targets,
         resolution,
     )?;
-
-    // Update unit graph cache. The `cache_key` field is populated for
-    // both in-tree and `compute-graph`-emitted entries so the load
-    // path uses the same defence-in-depth check regardless of source.
-    //
-    // Entries filed under a scope key must be whole-scope graphs, since
-    // the next invocation may ask for different roots out of the same
-    // scope. `plan_units` here has already been narrowed to this
-    // invocation's roots, so writing it back would serve a truncated
-    // graph to a sibling. Skip the write in that case — the shared graph
-    // arrives via `CARGO_SCHNEE_UNIT_GRAPH` in the pipeline that cares,
-    // and a scope-less build still caches as before.
-    let narrowed = resolution.is_some() && !(packages.is_empty() && exclude.is_empty());
-    if narrowed {
-        tracing::debug!(
-            "Not caching the unit graph: it is narrowed to this invocation's \
-             roots and the key names the whole scope",
-        );
-    } else {
-        cache.unit_graphs.insert(
-            unit_graph_key.clone(),
-            UnitGraphCacheEntry {
-                src_store: src_store.clone(),
-                units: plan_units
-                    .iter()
-                    .map(|u| {
-                        let mut c = u.clone();
-                        c.clear_drv_path();
-                        c
-                    })
-                    .collect(),
-                target_cfg_envs: cfg_envs,
-                host_cfg_envs,
-                cache_key: unit_graph_key,
-            },
-        );
-    }
 
     let plan_duration = plan_start.elapsed();
 
@@ -2410,9 +2642,6 @@ fn run_build_pipeline(
                 .with_context(|| format!("Writing aggregator drv path to {}", agg_out.display()))?;
         }
 
-        if let Err(e) = cache.save(project_dir) {
-            tracing::warn!("Failed to save build cache: {}", e);
-        }
         return Ok(BuildResult {
             root_units: Vec::new(),
             target_debug: PathBuf::new(),
@@ -2646,6 +2875,33 @@ fn run_build_pipeline(
     let build_end = Instant::now();
     let build_duration = build_end.duration_since(build_start);
 
+    let root_start = Instant::now();
+    let mut kept_sources = vec![src_store.clone()];
+    if vendor_dir.is_none() {
+        kept_sources.push(vendor_store.clone());
+    }
+    let gc_root = project_dir.join("target/.schnee-roots").join(format!(
+        "{}-{}-{}",
+        profile.name, target_config.target_triple, intent_str
+    ));
+    match root_last_build(
+        &gc_root,
+        &format!("{}-{}-gc-root", pname_for_agg, intent_str),
+        &kept_sources,
+        &plan_units,
+        &aggregator_drv,
+        &aggregator_out_path,
+        &memoised_paths,
+    ) {
+        Ok(registered) => tracing::info!(
+            "{} GC root {} in {} ms",
+            if registered { "Registered" } else { "Kept" },
+            gc_root.display(),
+            root_start.elapsed().as_millis()
+        ),
+        Err(e) => tracing::warn!("Failed to register GC root {}: {:#}", gc_root.display(), e),
+    }
+
     // Copy outputs to target/<profile>/
     let copy_start = Instant::now();
     let profile_dir = if profile == "dev" { "debug" } else { &profile };
@@ -2776,11 +3032,6 @@ fn run_build_pipeline(
             elapsed.as_secs_f64()
         ),
     );
-
-    // Save cache
-    if let Err(e) = cache.save(project_dir) {
-        tracing::warn!("Failed to save build cache: {}", e);
-    }
 
     if let Some(profile_path) = write_profile_to {
         write_profile(
@@ -2939,7 +3190,6 @@ fn main() -> Result<()> {
     let verbose = args.verbose;
     let write_profile_to = args.write_profile_to;
     let verify_drv_paths = args.verify_drv_paths;
-    let no_graph_cache = args.no_graph_cache;
     // CLI flag wins over env var; the env var is so callers that can't
     // pass cargo-schnee args through (e.g. `lib.buildPackage` consumers
     // who'd otherwise need their own `--registration-jobs` plumbing) can
@@ -2987,7 +3237,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3024,7 +3273,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3063,7 +3311,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3146,7 +3393,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3218,7 +3464,6 @@ fn main() -> Result<()> {
                 false,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3298,7 +3543,7 @@ fn main() -> Result<()> {
                 None => vendor_dependencies(&manifest_path)?,
             };
 
-            let src_store = add_project_source_to_store(project_dir)?;
+            let (src_store, _) = add_project_source_to_store(project_dir, false)?;
             let mut closure_cache = HashMap::new();
             let (_, plan_units, _, _) = plan_nix::run_plan_nix(
                 Path::new(&src_store),
@@ -3379,7 +3624,6 @@ fn main() -> Result<()> {
                 false,
                 true,
                 &lint_args,
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -3421,7 +3665,6 @@ fn main() -> Result<()> {
                 document_private_items,
                 false,
                 &[],
-                no_graph_cache,
                 registration_jobs,
                 plan_only_ref,
                 plan_aggregator_out_ref,
@@ -4115,5 +4358,67 @@ version = "1.2.3"
         let path = tmp.path().join("malformed.json");
         std::fs::write(&path, b"{not json").unwrap();
         assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+}
+
+#[cfg(test)]
+mod skeleton_tests {
+    use super::*;
+
+    /// The tree `write_skeleton` produces must hash to the path that
+    /// `nar::skeleton_source_store_path` predicts, or `add_graph_skeleton`
+    /// adds a path that no derivation names.
+    #[test]
+    fn written_skeleton_matches_its_nar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let write = |rel: &str, body: &str| {
+            let p = project.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n");
+        write("Cargo.lock", "version = 4\n");
+        write(".cargo/config.toml", "[build]\n");
+        write("app/Cargo.toml", "[package]\nname = \"app\"\n");
+        write("app/src/main.rs", "fn main() {}\n");
+        write("app/README.md", "readme\n");
+        write("ignored/file.txt", "not allowed\n");
+        std::fs::create_dir_all(project.join("links")).unwrap();
+        std::os::unix::fs::symlink("../app", project.join("links/app")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = project.join("app/run.sh");
+            std::fs::write(&script, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let files: HashSet<PathBuf> = [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config.toml",
+            "app/Cargo.toml",
+            "app/src/main.rs",
+            "app/README.md",
+            "app/run.sh",
+            "links/app",
+            "deleted/gone.rs",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let dest = tmp.path().join(nar::SKELETON_NAME);
+        write_skeleton(&project, &files, &dest).unwrap();
+        let written = nar::serialize_nar(&dest, None).unwrap();
+        let expected = nar::serialize_nar_skeleton(&project, Some(&files)).unwrap();
+        assert!(
+            written == expected,
+            "the written skeleton hashes differently"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(".cargo/config.toml")).unwrap(),
+            "[build]\n"
+        );
+        assert_eq!(std::fs::read(dest.join("app/src/main.rs")).unwrap(), b"");
     }
 }

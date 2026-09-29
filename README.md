@@ -108,13 +108,29 @@ sequenceDiagram
 
 ### Source preparation
 
-Dependencies are vendored via `cargo vendor` into a temporary
-directory, then added to the Nix store with `nix-store --add`. The resulting
-store path is reused across builds by caching the `Cargo.lock` hash to
-vendor store path mapping in `target/.schnee-cache.json`. When running inside
-a Nix derivation, such as via `buildRustPackage`, network access is unavailable,
-so the `--vendor-dir` flag accepts a pre-vendored directory already in the Nix
-store from the outer build's fetch phase.
+Dependencies are vendored through derivations whose paths follow from
+`Cargo.lock`. Each crates.io package becomes a `builtin:fetchurl` fixed-output
+derivation keyed on its lockfile checksum and an unpack derivation, and a
+derivation named `vendor` symlinks the unpacked crates into the directory
+source cargo reads. cargo-schnee computes every `.drv` path itself, registers
+the missing ones and realises the farm, so a warm build finds it realised and
+the store memoises it by content. A lockfile with a git or alternative-registry
+package falls back to `cargo vendor` into a temporary directory and
+`nix-store --add`. When running inside a Nix derivation, such as via
+`buildRustPackage`, network access is unavailable, so the `--vendor-dir` flag
+accepts a pre-vendored directory already in the Nix store from the outer
+build's fetch phase.
+
+The unit graph comes from a derivation as well. It runs
+`cargo-schnee compute-graph` over the vendor farm and a skeleton of the
+project, in which only `Cargo.toml`, `Cargo.lock` and `.cargo/config*` keep
+their contents, so a source edit that adds or removes no file reuses it. This
+needs `cargo-schnee` itself in the store. A binary run from `target/`
+bootstraps cargo in-process on every build instead.
+
+A successful build points `target/.schnee-roots/<profile>-<target>-<intent>`
+at a GC root that keeps the sources, every unit derivation and every realised
+output alive, so a garbage collection does not undo a warm build.
 
 The project source is added to the Nix store with
 `.gitignore`-aware filtering via `libgit2`. To avoid spawning `nix-store
@@ -1048,12 +1064,6 @@ cargo schnee build --verify-drv-paths \
 # of available CPU cores capped per topological level by the level's
 # width.
 cargo schnee build --registration-jobs 1 \
-    --manifest-path examples/simple/Cargo.toml
-
-# Bypass the unit-graph cache (both target/.schnee-cache.json and the
-# CARGO_SCHNEE_UNIT_GRAPH env-var hand-off). Forces a full cargo
-# bootstrap. Use this when investigating a suspected stale-graph issue.
-cargo schnee build --no-graph-cache \
     --manifest-path examples/simple/Cargo.toml
 ```
 

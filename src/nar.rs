@@ -55,11 +55,14 @@ pub fn serialize_nar_skeleton(
 
 /// A manifest whose contents the planner actually reads; kept verbatim in the
 /// skeleton. Everything else is blanked.
-fn is_manifest(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("Cargo.toml") | Some("Cargo.lock")
-    )
+pub fn is_manifest(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str());
+    let in_cargo_dir = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == ".cargo");
+    matches!(name, Some("Cargo.toml") | Some("Cargo.lock"))
+        || (in_cargo_dir && matches!(name, Some("config") | Some("config.toml")))
 }
 
 fn nar_serialize_path(
@@ -252,8 +255,11 @@ pub fn skeleton_source_store_path(
     allowed_files: &HashSet<PathBuf>,
 ) -> Result<String> {
     let nar = serialize_nar_skeleton(project_dir, Some(allowed_files))?;
-    Ok(compute_nar_store_path("project-src-skeleton", &nar))
+    Ok(compute_nar_store_path(SKELETON_NAME, &nar))
 }
+
+/// The store name of the skeleton source.
+pub const SKELETON_NAME: &str = "project-src-skeleton";
 
 #[cfg(test)]
 mod tests {

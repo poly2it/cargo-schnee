@@ -10,10 +10,13 @@ mod aterm;
 mod daemon;
 mod derivation;
 mod derivation_format;
+pub(crate) mod graph_drv;
 mod profile;
 mod realise;
+pub(crate) mod store_paths;
 mod unit_graph;
 pub(crate) mod util;
+pub(crate) mod vendor_farm;
 
 use aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use daemon::NixDaemonConn;

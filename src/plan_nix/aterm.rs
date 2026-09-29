@@ -44,7 +44,9 @@ pub(super) fn serialize_derivation_aterm(json: &serde_json::Value) -> Result<Vec
         out.push(b'(');
         aterm_string(&mut out, name);
         out.push(b',');
-        aterm_string(&mut out, ""); // path (empty for floating CA)
+        // A fixed output carries its path and hash, a floating one neither.
+        let path = info.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        aterm_string(&mut out, path);
         out.push(b',');
         let hash_algo = info["hashAlgo"]
             .as_str()
@@ -57,7 +59,8 @@ pub(super) fn serialize_derivation_aterm(json: &serde_json::Value) -> Result<Vec
         };
         aterm_string(&mut out, &algo_str);
         out.push(b',');
-        aterm_string(&mut out, ""); // hash (empty for floating CA)
+        let hash = info.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+        aterm_string(&mut out, hash);
         out.push(b')');
     }
     out.push(b']');

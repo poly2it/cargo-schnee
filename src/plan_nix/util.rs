@@ -75,7 +75,7 @@ pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
     );
 }
 
-pub(super) fn which_command(name: &str) -> Result<PathBuf> {
+pub(crate) fn which_command(name: &str) -> Result<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
             let candidate = PathBuf::from(dir).join(name);

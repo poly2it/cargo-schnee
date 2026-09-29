@@ -13,6 +13,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 static MINIMAL_BIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static MINIMAL_LIB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WORKSPACE_ADVANCED_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lock(m: &'static LazyLock<Mutex<()>>) -> MutexGuard<'static, ()> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -189,6 +190,7 @@ fn fixture_workspace_binaries() {
 #[test]
 #[ignore]
 fn fixture_workspace_advanced() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -280,6 +282,135 @@ fn fixture_workspace_warm_rebuild() {
 
     assert_eq!(hash_a1, hash_a2, "warm rebuild changed bin-a");
     assert_eq!(hash_b1, hash_b2, "warm rebuild changed bin-b");
+}
+
+/// Run a nix command with the features cargo-schnee's derivations need and
+/// return its stdout lines.
+fn nix_lines(program: &str, args: &[&str]) -> Vec<String> {
+    let output = Command::new(program)
+        .args(args)
+        .env(
+            "NIX_CONFIG",
+            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+        )
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {program}: {e}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A build leaves a GC root under `target/` that keeps every unit
+/// derivation and every unit output alive, so a garbage collection
+/// between two builds does not force a rebuild.
+#[test]
+#[ignore]
+fn fixture_build_roots_derivations_and_outputs() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let roots_dir = fixture_dir.join("target/.schnee-roots");
+    let links: Vec<PathBuf> = std::fs::read_dir(&roots_dir)
+        .unwrap_or_else(|e| panic!("No GC roots at {}: {}", roots_dir.display(), e))
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(links.len(), 1, "expected one GC root, got {links:?}");
+    let root = std::fs::read_link(&links[0]).expect("GC root is not a symlink");
+    let root = root.to_string_lossy().to_string();
+
+    let kept: Vec<String> = nix_lines("nix-store", &["--query", "--references", &root]);
+    let drvs: Vec<&str> = kept
+        .iter()
+        .map(String::as_str)
+        .filter(|p| p.ends_with(".drv"))
+        .collect();
+    assert!(
+        drvs.iter().any(|d| d.contains("shared-lib")),
+        "the dependency's derivation is not rooted: {kept:?}"
+    );
+    assert!(
+        drvs.iter().any(|d| d.ends_with("-build-aggregator.drv")),
+        "the aggregator derivation is not rooted: {kept:?}"
+    );
+    let outputs: Vec<String> = drvs.iter().map(|d| format!("{d}^out")).collect();
+    let mut args = vec!["path-info"];
+    args.extend(outputs.iter().map(String::as_str));
+    for output in nix_lines("nix", &args) {
+        assert!(
+            kept.contains(&output),
+            "output {output} is not rooted: {kept:?}"
+        );
+    }
+}
+
+/// Writes a file's original contents back when dropped, so a test that
+/// edits a fixture leaves it unchanged even when an assertion fails.
+struct RestoreFile {
+    path: PathBuf,
+    original: Vec<u8>,
+}
+
+impl RestoreFile {
+    fn edit(path: PathBuf, from: &str, to: &str) -> Self {
+        let original = std::fs::read(&path).expect("Failed to read fixture file");
+        let edited = String::from_utf8_lossy(&original).replace(from, to);
+        assert_ne!(
+            edited.as_bytes(),
+            original.as_slice(),
+            "edit changed nothing"
+        );
+        std::fs::write(&path, edited).expect("Failed to edit fixture file");
+        Self { path, original }
+    }
+}
+
+impl Drop for RestoreFile {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+    }
+}
+
+/// A warm build must compile the current sources of a workspace member.
+/// The member is sliced onto its own store path, and the removed unit-graph
+/// cache kept the slice of the first build, so the second build ran the
+/// old binary.
+#[test]
+#[ignore]
+fn fixture_workspace_warm_rebuild_sees_member_edit() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
+    let manifest = fixture_dir.join("Cargo.toml");
+    let binary = fixture_dir.join("target/debug/app");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let _restore = RestoreFile::edit(
+        fixture_dir.join("app/src/main.rs"),
+        "answer={}",
+        "answer2={}",
+    );
+    run_schnee_build(&manifest);
+
+    let output = Command::new(&binary).output().expect("Failed to run app");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("answer2=42"),
+        "warm build compiled stale sources: {}",
+        stdout
+    );
 }
 
 // B6: warm build produces identical binary
