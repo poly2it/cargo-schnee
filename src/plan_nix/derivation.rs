@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::debug;
 
+/// The `--json` value for rustc and rustdoc: rendered diagnostics plus one
+/// notice per written artefact.
+const JSON_FLAGS: &str = "--json=diagnostic-rendered-ansi,artifacts";
+
 /// Built-in lookup table mapping `links` values to env vars that tell -sys crates
 /// to use pkg-config instead of building bundled C code.
 const SYS_PKG_CONFIG_ENVS: &[(&str, &str)] = &[
@@ -548,8 +552,10 @@ pub(super) fn build_compile_script(
 
     // Emit JSON diagnostics with ANSI colors pre-baked by rustc.
     // cargo-schnee parses these and renders via cargo's Shell::print_ansi_stderr().
+    // The artifact notices mark when the `.rmeta` is written, which a build
+    // profile shows inside the unit's span, and the renderer skips them.
     parts.push("--error-format=json".into());
-    parts.push("--json=diagnostic-rendered-ansi".into());
+    parts.push(JSON_FLAGS.into());
 
     // -C extra-filename and -C metadata
     parts.push("-C".into());
@@ -749,7 +755,7 @@ fn build_doc_script(
 
     // JSON diagnostics
     parts.push("--error-format=json".into());
-    parts.push("--json=diagnostic-rendered-ansi".into());
+    parts.push(JSON_FLAGS.into());
 
     // --document-private-items if requested
     if document_private_items && unit.is_local {
@@ -1587,6 +1593,11 @@ mod tests {
             setup_scripts,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn compile_script_requests_artifact_notices() {
+        assert!(check_script(&[]).contains(" --json=diagnostic-rendered-ansi,artifacts "));
     }
 
     #[test]

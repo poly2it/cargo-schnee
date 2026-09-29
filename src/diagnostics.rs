@@ -134,6 +134,45 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Units run rustc with `--json=diagnostic-rendered-ansi,artifacts`, so a
+    /// saved `diagnostics` file interleaves artifact notices with diagnostics.
+    /// The replay prints only the rendered diagnostic.
+    #[test]
+    fn replay_skips_artifact_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"$message_type":"artifact","artifact":"/nix/store/out/lib.d","emit":"dep-info"}"#,
+                "\n",
+                r#"{"$message_type":"diagnostic","rendered":"warning: unused /nix/store/src/lib.rs\n"}"#,
+                "\n",
+                r#"{"$message_type":"artifact","artifact":"/nix/store/out/liba.rmeta","emit":"metadata"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let out = Captured::default();
+        let mut shell = Shell::from_write(Box::new(out.clone()));
+        replay_diagnostics_from_file(&mut shell, &path, "/nix/store/src/", "/home/user/");
+        let printed = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(printed, "warning: unused /home/user/lib.rs\n");
+    }
+
     #[test]
     fn remap_every_sliced_crate() {
         let text = " --> /nix/store/aaa-warn-bin/src/main.rs:2:9\n \
