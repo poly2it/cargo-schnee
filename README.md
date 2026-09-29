@@ -426,10 +426,22 @@ with `-Z no-codegen` and keeps only the `.rmeta`. The link half runs it
 unchanged. Dependent libraries compile against the metadata half, and linking
 units against the link halves.
 
-A split repeats the frontend and adds a derivation, so cargo-schnee splits
-only libraries that another library depends on, whose codegen took at least
-1 s and whose frontend took at most 60 % of the compile. It reads those times
-from a pipeline profile, which a previous build records:
+A split repeats the frontend and adds a derivation, and it shortens the build
+only where a library's codegen holds up the longest chain of units. So
+cargo-schnee models the build on the current unit graph, with every unit
+starting as soon as its inputs are done, and follows the modelled critical
+path. It splits each library on the path whose dependent on the path is a
+library and whose frontend took at most 60 % of its build, whatever its size,
+and repeats this until the path holds no such library. It then undoes every
+split whose removal lengthens the modelled build by less than 0.1 s. A
+library off the path is therefore never split.
+
+The model costs a unit at the CPU time Nix reports for its builder, because
+that changes less with the host's load than wall time, but never above the
+wall time, because parallel codegen spends several CPU seconds per second.
+Without a CPU time the wall time stands in. It reads those times from a
+pipeline profile, which a previous build records from Nix's
+`--log-format internal-json` output with `log-profiling` enabled:
 
 ```sh
 cargo schnee build --release --write-pipeline-profile pipeline.json
