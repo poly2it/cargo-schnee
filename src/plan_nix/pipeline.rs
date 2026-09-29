@@ -124,15 +124,16 @@ impl PipelineProfile {
         map.get(&unit.drv_name)
     }
 
-    fn record(&mut self, name: String, timing: UnitTiming, rlib: bool) {
+    fn record(&mut self, name: String, timing: UnitTiming, rlib: bool, fresh: bool) {
         let map = if rlib {
             &mut self.libraries
         } else {
             &mut self.others
         };
-        // Units built for the host and for the target share a name, and the
-        // longer one is kept.
-        if map.get(&name).is_none_or(|old| old.secs() < timing.secs()) {
+        // A unit built in this run replaces the profile it was planned with.
+        // Units built for the host and for the target share a name, and of
+        // those the longer one is kept.
+        if fresh || map.get(&name).is_none_or(|old| old.secs() < timing.secs()) {
             map.insert(name, timing);
         }
     }
@@ -388,10 +389,18 @@ pub fn split_units(units: &mut Vec<NixUnit>, profile: &PipelineProfile) -> usize
 /// Builds a [`PipelineProfile`] from the `--log-format internal-json`
 /// output of `nix build`, which ties each log line and resource report to
 /// its build by activity id.
+///
+/// A split build records its units under the contention the split causes,
+/// which moves the critical path, so a profile is meant to be re-recorded
+/// from the builds it plans.  The recorder therefore starts from the
+/// profile the build was planned with and replaces the units this build
+/// ran, and a unit that came from the cache keeps its earlier times.
 pub struct PipelineRecorder {
     clock: Instant,
     builds: HashMap<u64, Build>,
     profile: PipelineProfile,
+    /// Names recorded in this run, each with whether it wrote an `.rlib`.
+    recorded: HashSet<(String, bool)>,
 }
 
 /// A build in progress, with times in seconds on the log's clock.
@@ -404,11 +413,13 @@ struct Build {
 }
 
 impl PipelineRecorder {
-    pub fn new(clock: Instant) -> Self {
+    /// Starts from `planned_with`, the profile the build was planned with.
+    pub fn new(clock: Instant, planned_with: PipelineProfile) -> Self {
         Self {
             clock,
             builds: HashMap::new(),
-            profile: PipelineProfile::default(),
+            profile: planned_with,
+            recorded: HashSet::new(),
         }
     }
 
@@ -427,7 +438,11 @@ impl PipelineRecorder {
                 text,
                 at,
             } => {
-                if let Some(name) = drv_name_of(&drv_path) {
+                // A metadata half repeats its library's frontend, whose time
+                // the link half records.
+                if let Some(name) =
+                    drv_name_of(&drv_path).filter(|name| !name.ends_with(META_NAME_SUFFIX))
+                {
                     let build = Build {
                         name: name.to_string(),
                         started: at.unwrap_or(now),
@@ -464,7 +479,8 @@ impl PipelineRecorder {
                         cpu: build.cpu,
                         frontend: build.frontend,
                     };
-                    self.profile.record(build.name, timing, build.rlib);
+                    let fresh = self.recorded.insert((build.name.clone(), build.rlib));
+                    self.profile.record(build.name, timing, build.rlib, fresh);
                 }
                 Vec::new()
             }
@@ -689,6 +705,45 @@ mod tests {
         assert_eq!(profile.timing(&units[1]).unwrap().wall, 9.0);
     }
 
+    /// Recording a split build that was planned with a profile replaces the
+    /// units it ran, keeps those that came from the cache, and leaves out
+    /// metadata halves.
+    #[test]
+    fn recorder_updates_the_profile_a_split_build_was_planned_with() {
+        let event = |json: serde_json::Value| format!("@nix {json}");
+        let started = |id: u64, name: &str, us: u64| {
+            event(serde_json::json!({
+                "action": "start", "fields": [format!("/nix/store/h-{name}.drv"), "", 1, 1],
+                "id": id, "level": 3, "text": "building", "ts": us, "type": 105,
+            }))
+        };
+        let artifact = |id: u64, file: &str, emit: &str, us: u64| {
+            let notice = serde_json::json!({
+                "$message_type": "artifact", "artifact": format!("/nix/store/o/{file}"), "emit": emit,
+            });
+            event(serde_json::json!({
+                "action": "result", "fields": [notice.to_string()], "id": id, "ts": us, "type": 101,
+            }))
+        };
+        let stopped =
+            |id: u64, us: u64| event(serde_json::json!({"action": "stop", "id": id, "ts": us}));
+
+        let planned_with = profile(&[("a", timing(1.0, 9.0)), ("z", timing(1.0, 2.0))]);
+        let mut recorder = PipelineRecorder::new(Instant::now(), planned_with);
+        recorder.read(&started(1, "a-0.1.0-a-meta", 0));
+        recorder.read(&started(2, "a-0.1.0-a", 0));
+        recorder.read(&artifact(1, "liba.rmeta", "metadata", 2_000_000));
+        recorder.read(&artifact(2, "liba.rmeta", "metadata", 2_500_000));
+        recorder.read(&stopped(1, 2_100_000));
+        recorder.read(&artifact(2, "liba.rlib", "link", 5_000_000));
+        recorder.read(&stopped(2, 5_000_000));
+
+        let profile = recorder.finish();
+        assert_eq!(profile.libraries["a-0.1.0-a"], timing(2.5, 5.0));
+        assert_eq!(profile.libraries["z-0.1.0-z"], timing(1.0, 2.0));
+        assert!(profile.others.is_empty());
+    }
+
     #[test]
     fn recorder_times_builds_by_activity_on_nix_clock() {
         let started = |id: u64, name: &str, us: u64| {
@@ -712,7 +767,7 @@ mod tests {
         };
         let stopped = |id: u64, us: u64| format!(r#"@nix {{"action":"stop","id":{id},"ts":{us}}}"#);
 
-        let mut recorder = PipelineRecorder::new(Instant::now());
+        let mut recorder = PipelineRecorder::new(Instant::now(), PipelineProfile::default());
         assert_eq!(
             recorder.read(&started(1, "a-0.1.0-a", 10_000_000)),
             vec!["building '/nix/store/h-a-0.1.0-a.drv'".to_string()]

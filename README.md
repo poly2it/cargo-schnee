@@ -448,6 +448,21 @@ cargo schnee build --release --write-pipeline-profile pipeline.json
 cargo schnee build --release --pipeline-profile pipeline.json
 ```
 
+A split build runs more units at once than the build that recorded the
+profile, and the contention can move the critical path onto a library the
+profile left whole. So a profile is meant to be re-recorded from the builds it
+plans, by giving both flags the same file:
+
+```sh
+cargo schnee build --release --pipeline-profile pipeline.json \
+  --write-pipeline-profile pipeline.json
+```
+
+The recording then starts from the profile the build was planned with and
+replaces the times of every unit that the build ran. Units that came from the
+cache keep their earlier times, and metadata halves are not recorded, because
+the link half records the library's frontend.
+
 Without `--pipeline-profile` nothing is split and every derivation is as
 before. With it, every rustc unit exports `RUSTC_BOOTSTRAP=1`, which
 `-Z no-codegen` needs and which changes the crate hash. Both halves of a

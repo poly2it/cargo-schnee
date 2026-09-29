@@ -59,8 +59,9 @@ struct SchneeArgs {
 
     /// Record every unit's build time, its CPU time where Nix reports it,
     /// and each library's frontend time from this build's log, and write
-    /// them as a pipeline profile to the given path.  Only units built in
-    /// this run are recorded.
+    /// them as a pipeline profile to the given path.  With
+    /// `--pipeline-profile`, the recording starts from that profile and
+    /// replaces the units this build ran.
     #[arg(long, global = true, value_name = "PATH")]
     write_pipeline_profile: Option<PathBuf>,
 
@@ -2671,7 +2672,10 @@ fn run_build_pipeline(
         // without the setting warns and leaves the CPU time out.
         cmd.args(["--log-format", "internal-json"]);
         cmd.args(["--option", "log-profiling", "true"]);
-        plan_nix::pipeline::PipelineRecorder::new(build_start)
+        plan_nix::pipeline::PipelineRecorder::new(
+            build_start,
+            pipeline_opts.profile.clone().unwrap_or_default(),
+        )
     });
     let mut child = cmd
         .env(
