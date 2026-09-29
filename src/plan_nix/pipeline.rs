@@ -3,25 +3,31 @@
 //! waiting for its codegen.
 //!
 //! Splitting costs a second run of the frontend and one more derivation,
-//! so only libraries whose recorded codegen is long and whose frontend is a
-//! small share of the compile are split. The timings come from a pipeline
-//! profile that a previous build wrote with `--write-pipeline-profile`.
-//! Without a profile nothing is split.
+//! and it shortens the build only where the library's codegen holds up the
+//! longest chain of units.  So cargo-schnee models the build from a
+//! pipeline profile that a previous build wrote with
+//! `--write-pipeline-profile`, and splits the libraries on the modelled
+//! critical path.  Without a profile nothing is split.
 
 use super::{NixUnit, UnitKind};
+use crate::nix_log::{self, Event};
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
-
-/// Codegen, which is the compile time after the `.rmeta` is written, below
-/// which a split cannot win back the derivation and frontend it adds.
-const MIN_CODEGEN_SECS: f64 = 1.0;
 
 /// The largest share of a compile the frontend may take in a split unit.
 /// The metadata half repeats the frontend, so a unit above this share
 /// costs more CPU than its dependents gain in time.
 const MAX_FRONTEND_SHARE: f64 = 0.6;
+
+/// Time from a unit's last input finishing until its own build starts.
+/// On rust-analyzer's critical path, Nix's scheduling latency and the gap
+/// between builds add up to about this much per derivation.
+const HOP_SECS: f64 = 0.15;
+
+/// The least a split must shorten the modelled build to be kept.
+const MIN_GAIN_SECS: f64 = 0.1;
 
 /// Suffix of a split library's key and derivation name that names its
 /// metadata half.
@@ -46,21 +52,46 @@ pub enum PipelineRole {
     Metadata,
 }
 
-/// Recorded compile times of library units, keyed by derivation name, which
+/// Recorded build times of every unit, keyed by derivation name, which
 /// holds the package, its version and the crate and so stays the same
-/// across machines and source edits.
+/// across machines and source edits.  The dependency structure is not
+/// recorded, because the plan that applies the profile has the current one.
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PipelineProfile {
-    pub units: BTreeMap<String, UnitTiming>,
+    /// Units that wrote an `.rlib`.  A package's library and binary share
+    /// a derivation name, so libraries are kept apart from other units.
+    pub libraries: BTreeMap<String, UnitTiming>,
+    /// Every other unit, which only adds its time to the chains through it.
+    pub others: BTreeMap<String, UnitTiming>,
 }
 
-/// One unit's compile, in seconds from the start of its build.
+/// One unit's build, in seconds from the start of its derivation's build.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnitTiming {
+    /// When Nix finished the derivation.
+    pub wall: f64,
+    /// The CPU time the builder used, where Nix reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
     /// When rustc reported the `.rmeta` written.
-    pub frontend: f64,
-    /// When rustc reported the `.rlib` written.
-    pub total: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<f64>,
+}
+
+impl UnitTiming {
+    /// The unit's cost in the model.  CPU time changes less with the
+    /// host's load than wall time, so it is preferred where known.
+    fn secs(&self) -> f64 {
+        self.cpu.unwrap_or(self.wall)
+    }
+
+    /// The frontend's share of the build, measured in wall time, because
+    /// rustc reports the `.rmeta` only as a point in time.
+    fn frontend_share(&self) -> Option<f64> {
+        self.frontend
+            .filter(|_| self.wall > 0.0)
+            .map(|f| f / self.wall)
+    }
 }
 
 impl PipelineProfile {
@@ -77,10 +108,31 @@ impl PipelineProfile {
             .with_context(|| format!("Failed to write pipeline profile {}", path.display()))
     }
 
-    fn pays(&self, drv_name: &str) -> bool {
-        self.units.get(drv_name).is_some_and(|t| {
-            t.total - t.frontend >= MIN_CODEGEN_SECS && t.frontend <= MAX_FRONTEND_SHARE * t.total
-        })
+    fn timing(&self, unit: &NixUnit) -> Option<&UnitTiming> {
+        let writes_rlib = unit.kind == UnitKind::Compile
+            && unit
+                .crate_types
+                .iter()
+                .any(|ct| ct == "lib" || ct == "rlib");
+        let map = if writes_rlib {
+            &self.libraries
+        } else {
+            &self.others
+        };
+        map.get(&unit.drv_name)
+    }
+
+    fn record(&mut self, name: String, timing: UnitTiming, rlib: bool) {
+        let map = if rlib {
+            &mut self.libraries
+        } else {
+            &mut self.others
+        };
+        // Units built for the host and for the target share a name, and the
+        // longer one is kept.
+        if map.get(&name).is_none_or(|old| old.secs() < timing.secs()) {
+            map.insert(name, timing);
+        }
     }
 }
 
@@ -102,8 +154,185 @@ fn runs_rustc(unit: &NixUnit) -> bool {
     )
 }
 
-/// Splits every library that `profile` shows pays for it and that another
-/// library depends on, and returns how many it split.
+/// The unit graph with profiled times, on which a schedule is modelled as
+/// if every unit started as soon as its inputs were done.
+struct Model {
+    deps: Vec<Vec<usize>>,
+    /// Indices in an order where every unit follows its dependencies.
+    order: Vec<usize>,
+    secs: Vec<f64>,
+    /// The metadata half's time, for units that may be split.
+    frontend: Vec<Option<f64>>,
+    consumes_metadata: Vec<bool>,
+}
+
+struct Schedule {
+    finish: Vec<f64>,
+    /// The dependency whose output the unit waited for last.
+    last_input: Vec<Option<usize>>,
+}
+
+impl Schedule {
+    fn makespan(&self) -> f64 {
+        self.finish.iter().copied().fold(0.0, f64::max)
+    }
+}
+
+impl Model {
+    fn new(units: &[NixUnit], profile: &PipelineProfile) -> Self {
+        let index: HashMap<&str, usize> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.as_str(), i))
+            .collect();
+        let deps: Vec<Vec<usize>> = units
+            .iter()
+            .map(|u| {
+                u.dep_extern
+                    .iter()
+                    .map(|(_, k)| k)
+                    .chain(&u.all_dep_keys)
+                    .chain(&u.build_script_dep)
+                    .chain(&u.build_script_compile_key)
+                    .chain(u.links_dep_keys.iter().map(|(k, _)| k))
+                    .filter_map(|k| index.get(k.as_str()).copied())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        let has_library_dependent: HashSet<usize> = units
+            .iter()
+            .zip(&deps)
+            .filter(|(u, _)| consumes_metadata(u))
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+        let timings: Vec<Option<&UnitTiming>> = units.iter().map(|u| profile.timing(u)).collect();
+        let frontend = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let timing = timings[i]?;
+                let share = timing.frontend_share()?;
+                (consumes_metadata(u)
+                    && has_library_dependent.contains(&i)
+                    && share <= MAX_FRONTEND_SHARE)
+                    .then(|| share * timing.secs())
+            })
+            .collect();
+        Self {
+            order: topological_order(&deps),
+            secs: timings
+                .iter()
+                .map(|t| t.map_or(0.0, UnitTiming::secs))
+                .collect(),
+            frontend,
+            consumes_metadata: units.iter().map(consumes_metadata).collect(),
+            deps,
+        }
+    }
+
+    fn schedule(&self, split: &[bool]) -> Schedule {
+        let n = self.deps.len();
+        let mut finish = vec![0.0; n];
+        let mut metadata = vec![0.0; n];
+        let mut last_input = vec![None; n];
+        for &i in &self.order {
+            let ready = |d: usize| -> f64 {
+                if split[d] && self.consumes_metadata[i] {
+                    metadata[d]
+                } else {
+                    finish[d]
+                }
+            };
+            let last = self.deps[i]
+                .iter()
+                .copied()
+                .max_by(|&a, &b| ready(a).total_cmp(&ready(b)).then(b.cmp(&a)));
+            let start = last.map_or(0.0, ready) + HOP_SECS;
+            last_input[i] = last;
+            finish[i] = start + self.secs[i];
+            metadata[i] = start + self.frontend[i].unwrap_or(self.secs[i]);
+        }
+        Schedule { finish, last_input }
+    }
+
+    /// The edges of the longest chain, each as its dependency and the unit
+    /// that waited for it.
+    fn critical_edges(&self, schedule: &Schedule) -> Vec<(usize, usize)> {
+        let Some(mut unit) =
+            (0..self.deps.len()).max_by(|&a, &b| schedule.finish[a].total_cmp(&schedule.finish[b]))
+        else {
+            return Vec::new();
+        };
+        let mut edges = Vec::new();
+        while let Some(dep) = schedule.last_input[unit] {
+            edges.push((dep, unit));
+            unit = dep;
+        }
+        edges
+    }
+
+    /// Splits every library whose codegen holds up a library after it on
+    /// the critical path, until no such library is left, and then undoes
+    /// each split whose removal lengthens the modelled build by less than
+    /// [`MIN_GAIN_SECS`].
+    fn select(&self) -> Vec<bool> {
+        let mut split = vec![false; self.deps.len()];
+        loop {
+            let schedule = self.schedule(&split);
+            let on_path: Vec<usize> = self
+                .critical_edges(&schedule)
+                .into_iter()
+                .filter(|&(dep, unit)| {
+                    !split[dep] && self.frontend[dep].is_some() && self.consumes_metadata[unit]
+                })
+                .map(|(dep, _)| dep)
+                .collect();
+            if on_path.is_empty() {
+                break;
+            }
+            on_path.into_iter().for_each(|i| split[i] = true);
+        }
+        for i in 0..split.len() {
+            if !split[i] {
+                continue;
+            }
+            let with = self.schedule(&split).makespan();
+            split[i] = false;
+            let without = self.schedule(&split).makespan();
+            split[i] = without - with >= MIN_GAIN_SECS;
+        }
+        split
+    }
+}
+
+/// Kahn's algorithm over `deps`.  A unit on a cycle, which a valid plan
+/// never has, is appended at the end.
+fn topological_order(deps: &[Vec<usize>]) -> Vec<usize> {
+    let mut pending: Vec<usize> = deps.iter().map(Vec::len).collect();
+    let mut dependents = vec![Vec::new(); deps.len()];
+    for (unit, unit_deps) in deps.iter().enumerate() {
+        unit_deps.iter().for_each(|&d| dependents[d].push(unit));
+    }
+    let mut ready: VecDeque<usize> = (0..deps.len()).filter(|&i| pending[i] == 0).collect();
+    let mut order = Vec::with_capacity(deps.len());
+    while let Some(unit) = ready.pop_front() {
+        order.push(unit);
+        for &d in &dependents[unit] {
+            pending[d] -= 1;
+            if pending[d] == 0 {
+                ready.push_back(d);
+            }
+        }
+    }
+    let placed: HashSet<usize> = order.iter().copied().collect();
+    order.extend((0..deps.len()).filter(|i| !placed.contains(i)));
+    order
+}
+
+/// Splits the libraries on the critical path that the build modelled from
+/// `profile` shows, and returns how many it split.
 ///
 /// The link half keeps the unit's key, so linking units, which need every
 /// library's object code, still reach it through their unchanged
@@ -111,16 +340,18 @@ fn runs_rustc(unit: &NixUnit) -> bool {
 /// library, both halves of split ones included, is rewritten to compile
 /// against the metadata halves of its split dependencies.
 pub fn split_units(units: &mut Vec<NixUnit>, profile: &PipelineProfile) -> usize {
-    let has_library_dependent: HashSet<&str> = units
-        .iter()
-        .filter(|u| consumes_metadata(u))
-        .flat_map(|u| u.dep_extern.iter().map(|(_, k)| k.as_str()))
-        .collect();
+    let model = Model::new(units, profile);
+    let selected = model.select();
+    tracing::info!(
+        unsplit = model.schedule(&vec![false; units.len()]).makespan(),
+        split = model.schedule(&selected).makespan(),
+        "Modelled build time in seconds"
+    );
     let split: HashMap<String, String> = units
         .iter()
-        .filter(|u| consumes_metadata(u) && has_library_dependent.contains(u.key.as_str()))
-        .filter(|u| profile.pays(&u.drv_name))
-        .map(|u| (u.key.clone(), format!("{}{META_KEY_SUFFIX}", u.key)))
+        .zip(&selected)
+        .filter(|(_, s)| **s)
+        .map(|(u, _)| (u.key.clone(), format!("{}{META_KEY_SUFFIX}", u.key)))
         .collect();
 
     let halves: Vec<NixUnit> = units
@@ -151,70 +382,91 @@ pub fn split_units(units: &mut Vec<NixUnit>, profile: &PipelineProfile) -> usize
     split.len()
 }
 
-/// Builds a [`PipelineProfile`] from the log of a `nix build -L`, whose
-/// build log lines carry the derivation name as a `<name>> ` prefix.
+/// Builds a [`PipelineProfile`] from the `--log-format internal-json`
+/// output of `nix build`, which ties each log line and resource report to
+/// its build by activity id.
 pub struct PipelineRecorder {
-    started: HashMap<String, Instant>,
-    frontend: HashMap<String, f64>,
+    clock: Instant,
+    builds: HashMap<u64, Build>,
     profile: PipelineProfile,
 }
 
-impl Default for PipelineRecorder {
-    fn default() -> Self {
-        Self::new()
-    }
+/// A build in progress, with times in seconds on the log's clock.
+struct Build {
+    name: String,
+    started: f64,
+    frontend: Option<f64>,
+    rlib: bool,
+    cpu: Option<f64>,
 }
 
 impl PipelineRecorder {
-    pub fn new() -> Self {
+    pub fn new(clock: Instant) -> Self {
         Self {
-            started: HashMap::new(),
-            frontend: HashMap::new(),
+            clock,
+            builds: HashMap::new(),
             profile: PipelineProfile::default(),
         }
     }
 
-    /// Notes that Nix started building `drv_path`.
-    pub fn building(&mut self, drv_path: &str, now: Instant) {
-        if let Some(name) = drv_name_of(drv_path) {
-            self.started.insert(name.to_string(), now);
-        }
-    }
-
-    /// Reads one line of `nix build -L` output and returns whether it was a
-    /// rustc artifact notification, which the caller then need not show.
+    /// Reads one line of the JSON log and returns the lines that the
+    /// plain-text log would have shown for it.
     ///
-    /// Nix prefixes a log line with the derivation name cut before its
-    /// version, which several units share, so the unit comes from the
-    /// artifact's path instead: rustc writes into `$out`, whose store path
-    /// ends in the full derivation name.
-    pub fn log_line(&mut self, line: &str, now: Instant) -> bool {
-        let Some((_, text)) = line.split_once("> ") else {
-            return false;
-        };
-        let Some((emit, name)) = artifact(text) else {
-            return false;
-        };
-        let Some(&start) = self.started.get(&name) else {
-            return true;
-        };
-        let secs = now.duration_since(start).as_secs_f64();
-        match emit.as_str() {
-            "metadata" => {
-                self.frontend.insert(name, secs);
-            }
-            "link" => {
-                if let Some(&frontend) = self.frontend.get(&name) {
-                    let timing = UnitTiming {
-                        frontend,
-                        total: secs,
+    /// Nix stamps each event with `ts` when it has the profiling patch, and
+    /// otherwise the time the line was read stands in.
+    pub fn read(&mut self, line: &str) -> Vec<String> {
+        let now = self.clock.elapsed().as_secs_f64();
+        match nix_log::parse(line) {
+            Event::Text(lines) => lines,
+            Event::BuildStarted {
+                id,
+                drv_path,
+                text,
+                at,
+            } => {
+                if let Some(name) = drv_name_of(&drv_path) {
+                    let build = Build {
+                        name: name.to_string(),
+                        started: at.unwrap_or(now),
+                        frontend: None,
+                        rlib: false,
+                        cpu: None,
                     };
-                    self.profile.units.insert(name, timing);
+                    self.builds.insert(id, build);
                 }
+                vec![text]
             }
-            _ => {}
+            Event::BuildLog { id, line, at } => {
+                if let Some(build) = self.builds.get_mut(&id)
+                    && let Some((emit, path)) = artifact(&line)
+                {
+                    match emit.as_str() {
+                        "metadata" => build.frontend = Some(at.unwrap_or(now) - build.started),
+                        "link" if path.ends_with(".rlib") => build.rlib = true,
+                        _ => {}
+                    }
+                }
+                Vec::new()
+            }
+            Event::BuildResources { id, cpu_secs } => {
+                if let Some(build) = self.builds.get_mut(&id) {
+                    build.cpu = Some(cpu_secs);
+                }
+                Vec::new()
+            }
+            Event::Stopped { id, at } => {
+                if let Some(build) = self.builds.remove(&id) {
+                    let timing = UnitTiming {
+                        wall: at.unwrap_or(now) - build.started,
+                        cpu: build.cpu,
+                        frontend: build.frontend,
+                    };
+                    self.profile.record(build.name, timing, build.rlib);
+                }
+                Vec::new()
+            }
+            Event::Ignored => Vec::new(),
         }
-        true
     }
 
     pub fn finish(self) -> PipelineProfile {
@@ -222,23 +474,15 @@ impl PipelineRecorder {
     }
 }
 
-/// The `emit` of a rustc `--json=artifacts` notification, and the name of
-/// the derivation whose output holds the artifact.
+/// The `emit` and path of a rustc `--json=artifacts` notification.
 fn artifact(text: &str) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     if value.get("$message_type")?.as_str()? != "artifact" {
         return None;
     }
     let emit = value.get("emit")?.as_str()?.to_string();
-    let path = value.get("artifact")?.as_str()?;
-    // A library and a binary of one package share a derivation name, and
-    // only libraries are ever split.
-    if emit == "link" && !path.ends_with(".rlib") {
-        return None;
-    }
-    let path = path.strip_prefix("/nix/store/")?;
-    let out = path.split('/').next()?;
-    Some((emit, out.split_once('-')?.1.to_string()))
+    let path = value.get("artifact")?.as_str()?.to_string();
+    Some((emit, path))
 }
 
 /// `<name>` of `/nix/store/<hash>-<name>.drv`.
@@ -280,6 +524,7 @@ mod tests {
             .iter()
             .map(|d| (d.to_string(), d.to_string()))
             .collect();
+        unit.all_dep_keys = unit.dep_extern.iter().map(|(_, k)| k.clone()).collect();
         unit
     }
 
@@ -288,15 +533,24 @@ mod tests {
     fn chain() -> Vec<NixUnit> {
         let mut c = unit("c", "bin", &["b"]);
         c.all_dep_keys = vec!["a".into(), "b".into()];
-        let mut b = unit("b", "lib", &["a"]);
-        b.all_dep_keys = vec!["a".into()];
-        vec![unit("a", "lib", &[]), b, c]
+        vec![unit("a", "lib", &[]), unit("b", "lib", &["a"]), c]
     }
 
-    fn profile(frontend: f64, total: f64) -> PipelineProfile {
-        let timing = UnitTiming { frontend, total };
+    fn timing(frontend: f64, wall: f64) -> UnitTiming {
+        UnitTiming {
+            wall,
+            cpu: None,
+            frontend: Some(frontend),
+        }
+    }
+
+    fn profile(libraries: &[(&str, UnitTiming)]) -> PipelineProfile {
         PipelineProfile {
-            units: [("a-0.1.0-a".to_string(), timing)].into(),
+            libraries: libraries
+                .iter()
+                .map(|(k, t)| (format!("{k}-0.1.0-{k}"), t.clone()))
+                .collect(),
+            others: BTreeMap::new(),
         }
     }
 
@@ -307,7 +561,8 @@ mod tests {
     #[test]
     fn split_library_feeds_libraries_its_metadata_and_linkers_its_rlib() {
         let mut units = chain();
-        assert_eq!(split_units(&mut units, &profile(1.0, 5.0)), 1);
+        let profile = profile(&[("a", timing(1.0, 5.0)), ("b", timing(1.0, 2.0))]);
+        assert_eq!(split_units(&mut units, &profile), 1);
 
         let meta = by_key(&units, "a#meta");
         assert_eq!(meta.pipeline, PipelineRole::Metadata);
@@ -325,14 +580,77 @@ mod tests {
     }
 
     #[test]
-    fn short_codegen_or_long_frontend_is_not_split() {
-        for (frontend, total) in [(1.0, 1.5), (4.0, 5.0)] {
-            let mut units = chain();
-            assert_eq!(split_units(&mut units, &profile(frontend, total)), 0);
-            assert_eq!(units.len(), 3);
-            assert_eq!(by_key(&units, "b").dep_extern[0].1, "a");
-            assert!(units.iter().all(|u| u.pipeline == PipelineRole::Whole));
-        }
+    fn long_frontend_is_not_split() {
+        let mut units = chain();
+        let profile = profile(&[("a", timing(4.0, 5.0)), ("b", timing(1.0, 2.0))]);
+        assert_eq!(split_units(&mut units, &profile), 0);
+        assert_eq!(units.len(), 3);
+        assert_eq!(by_key(&units, "b").dep_extern[0].1, "a");
+        assert!(units.iter().all(|u| u.pipeline == PipelineRole::Whole));
+    }
+
+    /// `tt` and `cfg` took about 2 s on rust-analyzer's critical path, but
+    /// a profile from a quieter build recorded them below 1 s of codegen.
+    /// Size does not matter on the critical path, only the share.
+    #[test]
+    fn short_library_on_the_critical_path_is_split() {
+        let mut units = chain();
+        let profile = profile(&[("a", timing(0.1, 0.6)), ("b", timing(1.0, 2.0))]);
+        assert_eq!(split_units(&mut units, &profile), 1);
+        assert_eq!(by_key(&units, "b").dep_extern[0].1, "a#meta");
+    }
+
+    /// `x` feeds the library `y`, but the binary `c` waits for `a`'s link
+    /// half long after `y` is done, so splitting `x` gains nothing.
+    #[test]
+    fn library_off_the_critical_path_is_not_split() {
+        let mut c = unit("c", "bin", &["b", "y"]);
+        c.all_dep_keys = ["a", "b", "x", "y"].map(String::from).to_vec();
+        let mut units = vec![
+            unit("a", "lib", &[]),
+            unit("b", "lib", &["a"]),
+            unit("x", "lib", &[]),
+            unit("y", "lib", &["x"]),
+            c,
+        ];
+        let profile = profile(&[
+            ("a", timing(1.0, 5.0)),
+            ("b", timing(0.5, 1.0)),
+            ("x", timing(0.2, 2.0)),
+            ("y", timing(0.2, 0.5)),
+        ]);
+        assert_eq!(split_units(&mut units, &profile), 1);
+        assert!(units.iter().any(|u| u.key == "a#meta"));
+        assert_eq!(by_key(&units, "y").dep_extern[0].1, "x");
+    }
+
+    /// Two libraries hold up two binaries that take equally long.  Each
+    /// split alone leaves the build as long as before, and only both
+    /// together shorten it, so neither may be undone.
+    #[test]
+    fn splits_that_only_help_together_are_kept() {
+        let mut units = vec![
+            unit("a", "lib", &[]),
+            unit("b", "lib", &["a"]),
+            unit("c", "bin", &["a", "b"]),
+            unit("x", "lib", &[]),
+            unit("y", "lib", &["x"]),
+            unit("z", "bin", &["x", "y"]),
+        ];
+        let profile = profile(&[
+            ("a", timing(0.5, 3.0)),
+            ("b", timing(0.5, 1.0)),
+            ("x", timing(0.5, 3.0)),
+            ("y", timing(0.5, 1.0)),
+        ]);
+        assert_eq!(split_units(&mut units, &profile), 2);
+    }
+
+    #[test]
+    fn split_that_saves_too_little_is_undone() {
+        let mut units = chain();
+        let profile = profile(&[("a", timing(0.02, 0.1)), ("b", timing(1.0, 2.0))]);
+        assert_eq!(split_units(&mut units, &profile), 0);
     }
 
     /// A library that only binaries depend on gains nothing, because a
@@ -340,30 +658,79 @@ mod tests {
     #[test]
     fn library_without_library_dependent_is_not_split() {
         let mut units = vec![unit("a", "lib", &[]), unit("c", "bin", &["a"])];
-        assert_eq!(split_units(&mut units, &profile(1.0, 5.0)), 0);
+        let profile = profile(&[("a", timing(1.0, 5.0))]);
+        assert_eq!(split_units(&mut units, &profile), 0);
     }
 
     #[test]
-    fn recorder_times_library_artifacts_from_the_build_start() {
-        let t0 = Instant::now();
-        let at = |ms| t0 + std::time::Duration::from_millis(ms);
-        let artifact = |name: &str, file: &str, emit: &str| {
+    fn profile_keeps_a_library_apart_from_its_binary() {
+        let mut units = [unit("a", "lib", &[]), unit("a", "bin", &["a"])];
+        units[1].key = "a-bin".into();
+        let profile = PipelineProfile {
+            libraries: [("a-0.1.0-a".into(), timing(1.0, 5.0))].into(),
+            others: [("a-0.1.0-a".into(), timing(0.5, 9.0))].into(),
+        };
+        assert_eq!(profile.timing(&units[0]).unwrap().wall, 5.0);
+        assert_eq!(profile.timing(&units[1]).unwrap().wall, 9.0);
+    }
+
+    #[test]
+    fn recorder_times_builds_by_activity_on_nix_clock() {
+        let started = |id: u64, name: &str, us: u64| {
             format!(
-                "a> {{\"$message_type\":\"artifact\",\"artifact\":\"/nix/store/0000-{name}/{file}\",\"emit\":\"{emit}\"}}"
+                r#"@nix {{"action":"start","fields":["/nix/store/h-{name}.drv","",1,1],"id":{id},"level":3,"text":"building '/nix/store/h-{name}.drv'","ts":{us},"type":105}}"#
             )
         };
-        let mut recorder = PipelineRecorder::new();
-        recorder.building("/nix/store/hash-a-0.1.0-a.drv", at(0));
-        assert!(recorder.log_line(&artifact("a-0.1.0-a", "liba.rmeta", "metadata"), at(1000)));
-        assert!(!recorder.log_line("a> warning: unused", at(1500)));
-        assert!(recorder.log_line(&artifact("a-0.1.0-a", "liba.rlib", "link"), at(4000)));
-        recorder.building("/nix/store/hash-c-0.1.0-c.drv", at(5000));
-        assert!(recorder.log_line(&artifact("c-0.1.0-c", "c.rmeta", "metadata"), at(5100)));
-        assert!(!recorder.log_line(&artifact("c-0.1.0-c", "c", "link"), at(6000)));
+        let artifact = |id: u64, file: &str, emit: &str, us: u64| {
+            let notice = format!(
+                r#"{{"$message_type":"artifact","artifact":"/nix/store/o-a-0.1.0-a/{file}","emit":"{emit}"}}"#
+            );
+            let line = serde_json::json!({
+                "action": "result", "fields": [notice], "id": id, "ts": us, "type": 101,
+            });
+            format!("@nix {line}")
+        };
+        let resources = |id: u64| {
+            format!(
+                r#"@nix {{"action":"result","fields":["cpu-user-us",6000000,"cpu-system-us",500000],"id":{id},"type":1001}}"#
+            )
+        };
+        let stopped = |id: u64, us: u64| format!(r#"@nix {{"action":"stop","id":{id},"ts":{us}}}"#);
+
+        let mut recorder = PipelineRecorder::new(Instant::now());
+        assert_eq!(
+            recorder.read(&started(1, "a-0.1.0-a", 10_000_000)),
+            vec!["building '/nix/store/h-a-0.1.0-a.drv'".to_string()]
+        );
+        recorder.read(&started(2, "a-0.1.0-a", 11_000_000));
+        assert!(
+            recorder
+                .read(&artifact(1, "liba.rmeta", "metadata", 11_000_000))
+                .is_empty()
+        );
+        recorder.read(&artifact(1, "liba.rlib", "link", 14_000_000));
+        recorder.read(&resources(1));
+        recorder.read(&stopped(1, 14_500_000));
+        recorder.read(&artifact(2, "a.rmeta", "metadata", 11_500_000));
+        recorder.read(&artifact(2, "a", "link", 12_000_000));
+        recorder.read(&stopped(2, 13_000_000));
 
         let profile = recorder.finish();
-        assert_eq!(profile.units.len(), 1);
-        let a = &profile.units["a-0.1.0-a"];
-        assert!((a.frontend - 1.0).abs() < 1e-9 && (a.total - 4.0).abs() < 1e-9);
+        assert_eq!(
+            profile.libraries["a-0.1.0-a"],
+            UnitTiming {
+                wall: 4.5,
+                cpu: Some(6.5),
+                frontend: Some(1.0),
+            }
+        );
+        assert_eq!(
+            profile.others["a-0.1.0-a"],
+            UnitTiming {
+                wall: 2.0,
+                cpu: None,
+                frontend: Some(0.5),
+            }
+        );
     }
 }

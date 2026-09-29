@@ -7,6 +7,7 @@
 mod diagnostics;
 mod nar;
 mod nix_encoding;
+mod nix_log;
 mod plan;
 mod plan_nix;
 mod shell;
@@ -49,16 +50,17 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     write_profile_to: Option<PathBuf>,
 
-    /// Split the libraries whose compile times in this pipeline profile
-    /// show a long codegen after a short frontend into a metadata and a
-    /// link derivation, so that dependent libraries start on the metadata.
-    /// Without a profile no library is split.
+    /// Split the libraries on the critical path that this pipeline profile
+    /// predicts, where a short frontend precedes a long codegen, into a
+    /// metadata and a link derivation, so that dependent libraries start
+    /// on the metadata.  Without a profile no library is split.
     #[arg(long, global = true, value_name = "PATH")]
     pipeline_profile: Option<PathBuf>,
 
-    /// Record every library's frontend and total compile time from this
-    /// build's log and write them as a pipeline profile to the given path.
-    /// Only libraries built in this run are recorded.
+    /// Record every unit's build time, its CPU time where Nix reports it,
+    /// and each library's frontend time from this build's log, and write
+    /// them as a pipeline profile to the given path.  Only units built in
+    /// this run are recorded.
     #[arg(long, global = true, value_name = "PATH")]
     write_pipeline_profile: Option<PathBuf>,
 
@@ -2662,11 +2664,14 @@ fn run_build_pipeline(
     cmd.arg(format!("{}^out", aggregator_drv));
     cmd.arg("--print-out-paths");
     cmd.arg("--no-link");
+    let build_start = Instant::now();
     let mut recorder = pipeline_opts.record_to.as_ref().map(|_| {
-        // The recorder reads rustc's artifact notifications from the build
-        // logs, which `nix build` shows only with `-L`.
-        cmd.arg("-L");
-        plan_nix::pipeline::PipelineRecorder::new()
+        // The JSON log carries every build's log lines by activity id, and
+        // with `log-profiling` the CPU time each builder used.  A Nix
+        // without the setting warns and leaves the CPU time out.
+        cmd.args(["--log-format", "internal-json"]);
+        cmd.args(["--option", "log-profiling", "true"]);
+        plan_nix::pipeline::PipelineRecorder::new(build_start)
     });
     let mut child = cmd
         .env(
@@ -2692,7 +2697,6 @@ fn run_build_pipeline(
     let stderr = child.stderr.take().context("stderr not piped")?;
     let reader = std::io::BufReader::new(stderr);
     let mut seen_pkgs: HashSet<String> = HashSet::new();
-    let build_start = Instant::now();
     let mut building_events: Vec<(Instant, String)> = Vec::new();
     let mut total_drv_count: Option<usize> = None;
 
@@ -2702,20 +2706,20 @@ fn run_build_pipeline(
     let path_remaps = plan_nix::diagnostic_path_remaps(&plan_units, &src_store, project_dir);
     let mut nix_error_lines: Vec<String> = Vec::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    let lines = reader
+        .lines()
+        .map_while(Result::ok)
+        .flat_map(|line| match recorder.as_mut() {
+            Some(recorder) => recorder.read(&line),
+            None => vec![line],
+        });
+    for line in lines {
         if interrupted.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("Interrupted by signal");
         }
         let trimmed = line.trim();
-        if let Some(recorder) = recorder.as_mut() {
-            if let Some(drv_path) = shell::parse_building_line(trimmed) {
-                recorder.building(drv_path, Instant::now());
-            } else if recorder.log_line(trimmed, Instant::now()) {
-                continue;
-            }
-        }
         if let Some(drv_path) = shell::parse_building_line(trimmed) {
             building_events.push((Instant::now(), drv_path.to_string()));
             let (pkg, version, kind) = shell::parse_drv_display(drv_path);
@@ -2868,8 +2872,9 @@ fn run_build_pipeline(
         let profile = recorder.finish();
         profile.save(path)?;
         tracing::info!(
-            "Wrote the compile times of {} libraries to {}",
-            profile.units.len(),
+            "Wrote the build times of {} libraries and {} other units to {}",
+            profile.libraries.len(),
+            profile.others.len(),
             path.display()
         );
     }
