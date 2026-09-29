@@ -389,6 +389,10 @@ impl NixDaemonConn {
                     let _msg = self.read_string()?;
                 }
                 STDERR_ERROR => {
+                    // Protocol >= 1.26 serialises the error as the literal
+                    // "Error", the verbosity level, the name, the message,
+                    // a position flag and the traces.
+                    let _error_tag = self.read_string()?;
                     let _level = self.read_u64()?;
                     let typ = self.read_string()?;
                     let msg = self.read_string()?;
@@ -405,5 +409,53 @@ impl NixDaemonConn {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn conn_over(stream: std::os::unix::net::UnixStream) -> NixDaemonConn {
+        NixDaemonConn {
+            reader: std::io::BufReader::new(stream.try_clone().unwrap()),
+            writer: std::io::BufWriter::new(stream),
+            negotiated_protocol: (1 << 8) | 37,
+        }
+    }
+
+    fn word(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn string(buf: &mut Vec<u8>, s: &str) {
+        word(buf, s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+        buf.resize(buf.len() + (8 - s.len() % 8) % 8, 0);
+    }
+
+    /// A daemon error must be read to its end and reported with its
+    /// message, rather than desynchronising the stream.
+    #[test]
+    fn reads_a_daemon_error_frame() {
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut frame = Vec::new();
+        word(&mut frame, STDERR_ERROR);
+        string(&mut frame, "Error");
+        word(&mut frame, 0);
+        string(&mut frame, "Error");
+        string(&mut frame, "path '/nix/store/x' is not valid");
+        word(&mut frame, 0);
+        word(&mut frame, 1);
+        word(&mut frame, 0);
+        string(&mut frame, "while adding a derivation");
+        word(&mut frame, 42);
+        theirs.write_all(&frame).unwrap();
+
+        let mut conn = conn_over(ours);
+        let err = conn.process_stderr().unwrap_err().to_string();
+        assert!(err.contains("is not valid"), "{err}");
+        assert_eq!(conn.read_u64().unwrap(), 42, "the stream lost its framing");
     }
 }
