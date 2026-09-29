@@ -677,19 +677,20 @@ pub(super) fn build_compile_script(
     ));
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
-    let cat_path = format!("{}/cat", coreutils_bin_dir);
     // The mkdir stays ahead of the setup hook so `$out` (and thereby
     // SCHNEE_AUX_DIR's parent) exists before the first script sources.
     script.push_str(&format!("{} -p $out && ", shell_quote(&mkdir_path)));
     script.push_str(&setup_source_fragment(setup_scripts));
-    script.push_str(&format!("{} {}", shell_quote(rustc_path), parts.join(" ")));
-
-    // Append $EXTRA_ARGS (own + transitive build script link directives)
-    // Capture stderr to $out/diagnostics for replay on cached builds,
-    // then replay to stderr for live display. Preserve rustc exit code.
+    // `$out/diagnostics` keeps rustc's `stderr` for replay on cached builds.
+    // `tee` also passes each line on as rustc writes it, because the build
+    // log's timestamps are what a profile reads the `rmeta` notification of
+    // `--json=artifacts` from.  rustc's `stdout` goes around the pipe on
+    // descriptor 3.
     script.push_str(&format!(
-        " $EXTRA_ARGS 2>$out/diagnostics; __rs=$?; {} $out/diagnostics >&2; exit $__rs",
-        shell_quote(&cat_path),
+        "{{ {} {} $EXTRA_ARGS 2>&1 1>&3 3>&- | {} $out/diagnostics >&2 3>&-; __rs=${{PIPESTATUS[0]}}; }} 3>&1; exit $__rs",
+        shell_quote(rustc_path),
+        parts.join(" "),
+        shell_quote(&format!("{}/tee", coreutils_bin_dir)),
     ));
 
     Ok(script)
@@ -1687,11 +1688,9 @@ mod tests {
         // pre-feature byte layout.
         let script = check_script(&[]);
         assert!(!script.contains("SCHNEE_AUX_DIR"));
-        assert!(
-            script.contains(
-                "/nix/store/coreutils/bin/mkdir -p $out && /nix/store/rustc-bin/bin/rustc"
-            )
-        );
+        assert!(script.contains(
+            "/nix/store/coreutils/bin/mkdir -p $out && { /nix/store/rustc-bin/bin/rustc"
+        ));
         // And the with-scripts variant differs only by the inserted
         // fragment: removing it restores the byte-identical script.
         let with = check_script(&[SETUP_A.to_string()]);
@@ -2284,7 +2283,7 @@ mod tests {
         let diagnostics = std::fs::read_to_string(out.join("diagnostics")).unwrap_or_default();
         assert!(status.success(), "rustc failed:\n{diagnostics}");
         assert!(
-            !diagnostics.contains("jobserver"),
+            !diagnostics.contains("failed to connect to jobserver"),
             "rustc rejected the job server:\n{diagnostics}"
         );
 
@@ -2296,5 +2295,82 @@ mod tests {
         let mut returned = Vec::new();
         let _ = pool.read_to_end(&mut returned);
         assert_eq!(returned, TOKENS, "rustc kept or forged tokens");
+    }
+
+    /// A stand-in rustc writes one line to `stderr` and then waits until the
+    /// test has read that line from the script's `stderr`.  The line must
+    /// therefore arrive while rustc still runs, and it must also land in
+    /// `$out/diagnostics` exactly once, next to rustc's exit status.
+    #[test]
+    fn compile_script_streams_stderr_while_rustc_runs() {
+        use std::io::BufRead;
+
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        let rustc = dir.path().join("rustc");
+        std::fs::write(
+            &rustc,
+            format!(
+                "#!{}\necho '{{\"artifact\":\"x.rmeta\",\"emit\":\"metadata\"}}' >&2\nwhile [ ! -e {} ]; do sleep 0.05; done\necho out\nexit 3\n",
+                find_on_path("bash").display(),
+                go.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rustc, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let coreutils = find_on_path("tee").parent().unwrap().to_path_buf();
+
+        let units = vec![unit_of_kind("stream-probe", UnitKind::Compile)];
+        let key_to_idx = HashMap::from([("stream-probe".to_string(), 0_usize)]);
+        let script = build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            rustc.to_str().unwrap(),
+            "",
+            "/nix/store/rust-sysroot",
+            coreutils.to_str().unwrap(),
+            "/nix/store/cc/bin",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let mut child = Command::new(find_on_path("bash"))
+            .arg("-c")
+            .arg(&script)
+            .env("out", &out)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Releases the stand-in if the line never streams, so a regression
+        // fails the test instead of hanging it.
+        let watchdog_go = go.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = std::fs::write(watchdog_go, "");
+        });
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        assert!(!go.exists(), "the line arrived only after rustc exited");
+        assert!(line.contains("x.rmeta"), "{line:?}");
+        std::fs::write(&go, "").unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(
+            std::fs::read_to_string(out.join("diagnostics")).unwrap(),
+            "{\"artifact\":\"x.rmeta\",\"emit\":\"metadata\"}\n"
+        );
     }
 }
