@@ -1,4 +1,4 @@
-use super::util::{collect_store_paths, manifest_symlink_name, shell_quote};
+use super::util::{TEST_MANIFEST_DIR_FD, collect_store_paths, shell_quote, test_manifest_dir};
 use super::{NixUnit, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
 use anyhow::{Context, Result};
@@ -657,23 +657,17 @@ pub(super) fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
-    // For TestCompile units, use a deterministic /tmp symlink as
-    // CARGO_MANIFEST_DIR. At compile time the symlink points to the store
-    // path so proc macros (e.g. sqlx::migrate!) can read files. At test
-    // runtime the same path is re-symlinked to the writable project dir,
-    // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
-    // a readable+writable location.
-    let tmp_manifest_path;
+    // A test binary bakes in `test_manifest_dir()`, which the test runner
+    // later points at the writable checkout. Here it resolves to the store
+    // path for rustc and the proc macros it loads.
+    let test_manifest_path;
     let manifest_dir_for_compile = if unit.kind == UnitKind::TestCompile {
-        tmp_manifest_path = manifest_symlink_name(&unit.manifest_dir);
-        let ln_path = format!("{}/ln", coreutils_bin_dir);
+        test_manifest_path = test_manifest_dir();
         script.push_str(&format!(
-            "{} -sfn {} {} && ",
-            shell_quote(&ln_path),
+            "exec {TEST_MANIFEST_DIR_FD}<{} && ",
             shell_quote(&unit.manifest_dir),
-            shell_quote(&tmp_manifest_path),
         ));
-        &tmp_manifest_path
+        &test_manifest_path
     } else {
         &unit.manifest_dir
     };
@@ -1920,7 +1914,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The manifest-dir symlink a test binary bakes in must not depend on
+    /// The manifest dir a test binary bakes in must not depend on
     /// where the checkout happens to live, or the same source compiled from
     /// two directories produces two derivations and neither can reuse the
     /// other's build.
@@ -1931,16 +1925,27 @@ mod tests {
         assert_eq!(test_compile_script(&a), test_compile_script(&b));
     }
 
-    /// Two crates in one workspace must still get distinct symlinks, or the
-    /// runner's `ln -sfn` for one clobbers the other.
+    /// The compile step reaches the crate's store path through the
+    /// descriptor, and never writes outside the sandbox's own tree.
     #[test]
-    fn manifest_symlink_name_differs_per_crate() {
-        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
-        let b = make_test_compile_unit("other-lib", "/home/dev/workspace-1");
-        assert_ne!(
-            manifest_symlink_name(&a.manifest_dir),
-            manifest_symlink_name(&b.manifest_dir)
+    fn test_compile_script_opens_the_store_path_on_the_descriptor() {
+        let unit = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let script = test_compile_script(&unit);
+        assert!(
+            script.contains(&format!(
+                "exec {TEST_MANIFEST_DIR_FD}<{} && ",
+                shell_quote(&unit.manifest_dir)
+            )),
+            "{script}"
         );
+        assert!(
+            script.contains(&format!(
+                "export CARGO_MANIFEST_DIR={} && ",
+                shell_quote(&test_manifest_dir())
+            )),
+            "{script}"
+        );
+        assert!(!script.contains("/tmp"), "{script}");
     }
 
     // -- cross-compile link directive scoping ------------------------------

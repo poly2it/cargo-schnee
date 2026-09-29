@@ -2282,7 +2282,7 @@ fn run_binary(
     binary_path: &Path,
     args: &[String],
     target: &Option<String>,
-    manifest_dir: Option<&str>,
+    crate_dir: Option<CrateDir<'_>>,
 ) -> Result<std::process::ExitStatus> {
     let runner = resolve_runner(target);
     if runner.is_none() && is_cross_target(target) {
@@ -2310,12 +2310,8 @@ fn run_binary(
         cmd.args(args);
         cmd
     };
-    // Set CARGO_MANIFEST_DIR so that runtime lookups via std::env::var()
-    // resolve to the writable project directory instead of the nix store.
-    // Also set the working directory to match vanilla cargo behavior.
-    if let Some(dir) = manifest_dir {
-        cmd.env("CARGO_MANIFEST_DIR", dir);
-        cmd.current_dir(dir);
+    if let Some(dir) = crate_dir {
+        set_crate_dir(&mut cmd, dir)?;
     }
     let status = cmd
         .status()
@@ -2323,24 +2319,48 @@ fn run_binary(
     Ok(status)
 }
 
-/// Re-point a test binary's CARGO_MANIFEST_DIR symlink at the checkout.
-///
-/// The compile derivation created the same path pointing at the crate's Nix
-/// store path so proc macros could read files. Here at runtime we re-create
-/// it pointing to the writable project directory, so both
-/// `env!("CARGO_MANIFEST_DIR")` (baked at compile time) and
-/// `std::env::var("CARGO_MANIFEST_DIR")` resolve to a readable+writable
-/// location.
-///
-/// `store_manifest_dir` names the symlink and must be the same store path the
-/// derivation hashed, or the binary looks up a path nothing created.
-fn schnee_manifest_symlink(store_manifest_dir: &str, project_manifest_dir: &str) -> String {
-    let tmp_path = plan_nix::util::manifest_symlink_name(store_manifest_dir);
-    // Atomically replace any stale symlink (may point to a store path from
-    // a previous build).
-    let _ = std::fs::remove_file(&tmp_path);
-    let _ = std::os::unix::fs::symlink(project_manifest_dir, &tmp_path);
-    tmp_path
+/// The crate directory a spawned binary runs in and sees as
+/// `CARGO_MANIFEST_DIR`.
+enum CrateDir<'a> {
+    /// A binary whose `CARGO_MANIFEST_DIR` is the checkout directory itself.
+    Checkout(&'a str),
+    /// A `TestCompile` binary. It was compiled with
+    /// `plan_nix::util::test_manifest_dir()`, so the checkout directory is
+    /// opened on `TEST_MANIFEST_DIR_FD` in the child, private to that run.
+    Test(&'a str),
+}
+
+/// Configure `cmd` to run in `dir`, as cargo does.
+fn set_crate_dir(cmd: &mut Command, dir: CrateDir<'_>) -> Result<()> {
+    match dir {
+        CrateDir::Checkout(dir) => {
+            cmd.env("CARGO_MANIFEST_DIR", dir);
+            cmd.current_dir(dir);
+        }
+        CrateDir::Test(dir) => {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let handle = std::fs::File::open(dir)
+                .with_context(|| format!("Failed to open the crate directory {dir}"))?;
+            cmd.env("CARGO_MANIFEST_DIR", plan_nix::util::test_manifest_dir());
+            cmd.current_dir(dir);
+            // SAFETY: the closure runs between fork and exec and calls only
+            // `dup2`, which is async-signal-safe. `handle` stays open in the
+            // parent until `cmd` is dropped, because the closure owns it.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let target = plan_nix::util::TEST_MANIFEST_DIR_FD;
+                    // `dup2` leaves the new descriptor without `FD_CLOEXEC`,
+                    // so the test binary inherits it.
+                    if libc::dup2(handle.as_raw_fd(), target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `NIX_CONFIG` for a spawned Nix command: the caller's `NIX_CONFIG`
@@ -2362,12 +2382,8 @@ struct RootUnit {
     drv_path: String,
     target_name: String,
     kind: plan_nix::UnitKind,
-    /// The crate's content-addressed store path. `manifest_symlink_name`
-    /// derives the unit's CARGO_MANIFEST_DIR symlink from it, so the runner
-    /// must hash this and not the checkout path.
-    store_manifest_dir: String,
-    /// The crate's directory in the checkout, which that symlink points at
-    /// once the binary runs.
+    /// The crate's directory in the checkout, which the binary sees as its
+    /// `CARGO_MANIFEST_DIR` once it runs.
     project_manifest_dir: String,
     bin_path: Option<PathBuf>,
 }
@@ -3112,7 +3128,6 @@ fn run_build_pipeline(
                 .iter()
                 .find(|u| u.drv_path.as_deref() == Some(&drv_path));
             RootUnit {
-                store_manifest_dir: unit.map(|u| u.manifest_dir.clone()).unwrap_or_default(),
                 project_manifest_dir: unit
                     .map(|u| u.original_manifest_dir.clone())
                     .unwrap_or_default(),
@@ -3393,7 +3408,12 @@ fn main() -> Result<()> {
             let bin_name = binary_name(&root.target_name, target);
             let binary_path = result.target_debug.join(&bin_name);
             shell::status("Running", &format!("`{}`", binary_path.display()));
-            let status = run_binary(&binary_path, args, target, Some(&root.project_manifest_dir))?;
+            let status = run_binary(
+                &binary_path,
+                args,
+                target,
+                Some(CrateDir::Checkout(&root.project_manifest_dir)),
+            )?;
             std::process::exit(status.code().unwrap_or(1));
         }
         SchneeCommand::Test {
@@ -3450,14 +3470,17 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for root in &test_roots {
-                let symlink_path =
-                    schnee_manifest_symlink(&root.store_manifest_dir, &root.project_manifest_dir);
                 let binary_path = root
                     .bin_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("test root has no binary output"))?;
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
-                let status = run_binary(binary_path, args, target, Some(&symlink_path))?;
+                let status = run_binary(
+                    binary_path,
+                    args,
+                    target,
+                    Some(CrateDir::Test(&root.project_manifest_dir)),
+                )?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -3520,8 +3543,6 @@ fn main() -> Result<()> {
 
             let mut any_failed = false;
             for root in &bench_roots {
-                let symlink_path =
-                    schnee_manifest_symlink(&root.store_manifest_dir, &root.project_manifest_dir);
                 let binary_path = root
                     .bin_path
                     .as_ref()
@@ -3532,7 +3553,12 @@ fn main() -> Result<()> {
                 );
                 let mut bench_args = vec!["--bench".to_string()];
                 bench_args.extend(args.iter().cloned());
-                let status = run_binary(binary_path, &bench_args, target, Some(&symlink_path))?;
+                let status = run_binary(
+                    binary_path,
+                    &bench_args,
+                    target,
+                    Some(CrateDir::Test(&root.project_manifest_dir)),
+                )?;
                 if !status.success() {
                     any_failed = true;
                 }

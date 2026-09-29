@@ -29,10 +29,10 @@ tempfile = "3"
 toml = "0.8"
 git2 = "0.20"
 signal-hook = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"
-libc = "0.2"
 
 [workspace]
 exclude = ["tests/fixtures/*", "examples/simple", "examples/cross", "examples/cross-windows", "examples/build-package", "examples/build-package-cross", "examples/build-package-cross-windows"]

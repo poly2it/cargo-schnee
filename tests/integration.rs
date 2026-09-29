@@ -1575,3 +1575,67 @@ fn fixture_warnings_point_at_checkout() {
     );
     let _ = std::fs::remove_dir_all(&project);
 }
+
+/// Two `cargo schnee test` runs of one crate from two checkouts, alive at
+/// the same time, each see their own checkout through the compile-time
+/// `CARGO_MANIFEST_DIR`, and neither leaves anything behind in `/tmp`. The
+/// crate content is identical, so both runs execute the same test binary.
+#[test]
+#[ignore]
+fn fixture_concurrent_test_runs_see_their_own_checkout() {
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn start(project: &Path) -> Child {
+        Command::new(cargo_schnee_bin())
+            .args(["schnee", "test", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to execute cargo-schnee")
+    }
+
+    fn wait_for(path: &Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        while !path.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("run exited with {status} before {}", path.display());
+            }
+            assert!(Instant::now() < deadline, "timed out on {}", path.display());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn tmp_links_into(project: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| std::fs::read_link(p).is_ok_and(|t| t.starts_with(project)))
+            .collect()
+    }
+
+    let a = fresh_fixture_copy("manifest-dir-concurrent");
+    let b = fresh_fixture_copy("manifest-dir-concurrent");
+    let mut run_a = start(&a);
+    wait_for(&a.join("started"), &mut run_a);
+    let mut run_b = start(&b);
+    wait_for(&b.join("started"), &mut run_b);
+    std::fs::write(a.join("release"), "").unwrap();
+    std::fs::write(b.join("release"), "").unwrap();
+
+    for (project, run) in [(&a, run_a), (&b, run_b)] {
+        let output = run.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the run in {} failed:\nstdout:\n{}\nstderr:\n{}",
+            project.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let leaked = tmp_links_into(project);
+        assert!(leaked.is_empty(), "left in /tmp: {leaked:?}");
+    }
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}

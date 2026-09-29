@@ -1,6 +1,5 @@
 use crate::nix_encoding::NIX_BASE32;
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -184,25 +183,23 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The `/tmp` path a `TestCompile` unit uses as `CARGO_MANIFEST_DIR`.
+/// Descriptor on which every process that compiles or runs a `TestCompile`
+/// unit holds the crate directory open. It sits below the common soft
+/// `RLIMIT_NOFILE` of 1024.
+pub(crate) const TEST_MANIFEST_DIR_FD: i32 = 1000;
+
+/// The `CARGO_MANIFEST_DIR` a `TestCompile` unit is compiled with and its
+/// binary runs with.
 ///
-/// The compile derivation points this symlink at the crate's read-only store
-/// path so proc macros such as `sqlx::migrate!` can read the crate's files,
-/// and the test runner re-points the same path at the writable checkout so
-/// `std::env::var("CARGO_MANIFEST_DIR")` and the `env!` value baked into the
-/// binary both resolve somewhere writable.
-///
-/// `store_manifest_dir` is the crate's content-addressed store path, never the
-/// checkout path. Hashing the checkout path would put the location of the tree
-/// into the derivation, so the same crate compiled from two directories would
-/// build twice and neither result could substitute for the other.
-pub(crate) fn manifest_symlink_name(store_manifest_dir: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(store_manifest_dir.as_bytes());
-    format!(
-        "/tmp/_schnee_md_{}",
-        crate::nix_encoding::hex_lower(&hasher.finalize()[..8])
-    )
+/// `/proc/self/fd/<n>` resolves in each process to whatever that process
+/// holds open on descriptor `n`. The compile derivation opens the crate's
+/// read-only store path there, so proc macros such as `sqlx::migrate!` read
+/// the crate's files. The test runner opens the writable checkout there, so
+/// the `env!` value baked into the binary resolves to that run's own
+/// checkout. The path is the same on every machine, so it adds nothing to the
+/// derivation, and no run shares it with another or leaves a file behind.
+pub(crate) fn test_manifest_dir() -> String {
+    format!("/proc/self/fd/{TEST_MANIFEST_DIR_FD}")
 }
 
 pub(crate) fn sanitize_drv_name(name: &str) -> String {

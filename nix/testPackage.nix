@@ -64,7 +64,6 @@ in
   pkgs.runCommand "${built.name}-result" {
     inherit built src;
     passthru = { inherit built; };
-    nativeBuildInputs = [ pkgs.binutils ];
   } ''
     set -euo pipefail
     mkdir -p $out
@@ -77,36 +76,24 @@ in
       export SCHNEE_AUX_DIR=$out/schnee-aux
       . ${testRunnerSetup}
     ''}
-    # cargo-schnee bakes `/tmp/_schnee_md_<hash>` into each test
-    # binary as `CARGO_MANIFEST_DIR`.  At compile time the symlink
-    # points at the project-src store path so proc macros can read
-    # files; at test runtime cargo-schnee's CLI re-creates it to
-    # point at the writable source dir.  Replicate that here so
-    # tests using `env!("CARGO_MANIFEST_DIR").join("testdata/...")`
-    # find their fixtures.  Extract the symlink path from the
-    # binary itself rather than recomputing the hash — keeps the
-    # runner agnostic to cargo-schnee's hash scheme.
+    # cargo-schnee compiles test binaries with `CARGO_MANIFEST_DIR`
+    # set to `/proc/self/fd/1000`, which resolves to whatever the
+    # running process holds open on descriptor 1000.  Open the crate
+    # source there, so tests using
+    # `env!("CARGO_MANIFEST_DIR").join("testdata/...")` find their
+    # fixtures.  Best-effort: `$src/<package>` if that exists, else
+    # `$src`.  Tests requiring workspace-root-prefixed paths need the
+    # consumer to lay out src to match (skeptiva does — `crates/` is
+    # its src).
+    target="$src"
+    if [ -n "${pkgArg}" ] && [ -d "$src${pkgArg}" ]; then
+      target="$src${pkgArg}"
+    fi
+    exec 1000<"$target"
     found=0
     for bin in "$built"/bin/*; do
       [ -x "$bin" ] || continue
       found=1
-      # cargo-schnee bakes `/tmp/_schnee_md_<hex>` into TestCompile
-      # binaries as CARGO_MANIFEST_DIR.  Match precisely; rust
-      # binaries don't null-separate string-table entries, so a bare
-      # grep picks up trailing garbage from preceding strings.
-      symlink_path="$(strings "$bin" | grep -oE '/tmp/_schnee_md_[0-9a-f]+' | head -1 || true)"
-      if [ -n "$symlink_path" ]; then
-        # Best-effort: point at $src/<package> if that exists, else
-        # at $src.  Tests using `env!(CARGO_MANIFEST_DIR).join(…)`
-        # resolve through this symlink at runtime.  Tests requiring
-        # workspace-root-prefixed paths need the consumer to lay
-        # out src to match (skeptiva does — `crates/` is its src).
-        target="$src"
-        if [ -n "${pkgArg}" ] && [ -d "$src${pkgArg}" ]; then
-          target="$src${pkgArg}"
-        fi
-        ln -sfn "$target" "$symlink_path"
-      fi
       echo "Running $(basename "$bin")..."
       "$bin" ${runnerArgsStr}
     done
