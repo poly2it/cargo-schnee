@@ -182,26 +182,34 @@ impl PipelineRecorder {
     }
 
     /// Reads one line of `nix build -L` output and returns whether it was a
-    /// build log line, which the caller then need not show.
+    /// rustc artifact notification, which the caller then need not show.
+    ///
+    /// Nix prefixes a log line with the derivation name cut before its
+    /// version, which several units share, so the unit comes from the
+    /// artifact's path instead: rustc writes into `$out`, whose store path
+    /// ends in the full derivation name.
     pub fn log_line(&mut self, line: &str, now: Instant) -> bool {
-        let Some((name, text)) = line.split_once("> ") else {
+        let Some((_, text)) = line.split_once("> ") else {
             return false;
         };
-        let Some(&start) = self.started.get(name) else {
+        let Some((emit, name)) = artifact(text) else {
             return false;
+        };
+        let Some(&start) = self.started.get(&name) else {
+            return true;
         };
         let secs = now.duration_since(start).as_secs_f64();
-        match artifact_emit(text).as_deref() {
-            Some("metadata") => {
-                self.frontend.insert(name.to_string(), secs);
+        match emit.as_str() {
+            "metadata" => {
+                self.frontend.insert(name, secs);
             },
-            Some("link") => {
-                if let Some(&frontend) = self.frontend.get(name) {
+            "link" => {
+                if let Some(&frontend) = self.frontend.get(&name) {
                     let timing = UnitTiming {
                         frontend,
                         total: secs,
                     };
-                    self.profile.units.insert(name.to_string(), timing);
+                    self.profile.units.insert(name, timing);
                 }
             },
             _ => {},
@@ -214,13 +222,17 @@ impl PipelineRecorder {
     }
 }
 
-/// The `emit` of a rustc `--json=artifacts` notification.
-fn artifact_emit(text: &str) -> Option<String> {
+/// The `emit` of a rustc `--json=artifacts` notification, and the name of
+/// the derivation whose output holds the artifact.
+fn artifact(text: &str) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     if value.get("$message_type")?.as_str()? != "artifact" {
         return None;
     }
-    Some(value.get("emit")?.as_str()?.to_string())
+    let emit = value.get("emit")?.as_str()?.to_string();
+    let path = value.get("artifact")?.as_str()?.strip_prefix("/nix/store/")?;
+    let out = path.split('/').next()?;
+    Some((emit, out.split_once('-')?.1.to_string()))
 }
 
 /// `<name>` of `/nix/store/<hash>-<name>.drv`.
