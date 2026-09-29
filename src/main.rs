@@ -1978,7 +1978,10 @@ fn realise_memoised_inputs(
         .args(["--print-out-paths", "--no-link"])
         .env(
             "NIX_CONFIG",
-            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            nix_config(
+                std::env::var_os("NIX_CONFIG").as_deref(),
+                "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            ),
         )
         .stderr(Stdio::piped())
         .output()
@@ -2466,7 +2469,7 @@ fn run_build_pipeline(
             .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
         let request = match (&graph, skeleton.as_deref()) {
             (None, Some(skeleton)) => compute_graph_args(
-                &profile.name,
+                &profile,
                 target.as_deref(),
                 &user_intent,
                 packages,
@@ -2882,7 +2885,7 @@ fn run_build_pipeline(
     }
     let gc_root = project_dir.join("target/.schnee-roots").join(format!(
         "{}-{}-{}",
-        profile.name, target_config.target_triple, intent_str
+        profile, target_config.target_triple, intent_str
     ));
     match root_last_build(
         &gc_root,

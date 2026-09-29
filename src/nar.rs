@@ -34,15 +34,6 @@ pub fn serialize_nar(root: &Path, allowed_files: Option<&HashSet<PathBuf>>) -> R
 /// skeleton means a `.rs` body edit does not move the planner's input (so it
 /// neither re-runs nor re-emits the unit-drv set), while adding/removing a
 /// source file or editing a manifest does.
-// `allow` rather than `expect`, because the flake's newer rustc counts a
-// function whose only caller carries `expect(dead_code)` as used.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Change 4 of docs/input-decoupling-spec.md, proven by its test but not wired in yet"
-    )
-)]
 pub fn serialize_nar_skeleton(
     root: &Path,
     allowed_files: Option<&HashSet<PathBuf>>,
@@ -243,13 +234,6 @@ pub fn crate_source_store_path(
 /// verbatim, every other file blanked (see `serialize_nar_skeleton`). Stable
 /// across source body edits; moves only on a manifest change or a change to the
 /// set of source paths — the conditions under which the unit graph can differ.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Change 4 of docs/input-decoupling-spec.md, proven by its test but not wired in yet"
-    )
-)]
 pub fn skeleton_source_store_path(
     project_dir: &Path,
     allowed_files: &HashSet<PathBuf>,

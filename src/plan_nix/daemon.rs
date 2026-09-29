@@ -422,6 +422,7 @@ mod tests {
             reader: std::io::BufReader::new(stream.try_clone().unwrap()),
             writer: std::io::BufWriter::new(stream),
             negotiated_protocol: (1 << 8) | 37,
+            features: std::collections::HashSet::new(),
         }
     }
 
