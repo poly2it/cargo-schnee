@@ -202,7 +202,7 @@ impl PipelineRecorder {
         match emit.as_str() {
             "metadata" => {
                 self.frontend.insert(name, secs);
-            },
+            }
             "link" => {
                 if let Some(&frontend) = self.frontend.get(&name) {
                     let timing = UnitTiming {
@@ -211,8 +211,8 @@ impl PipelineRecorder {
                     };
                     self.profile.units.insert(name, timing);
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
         true
     }
@@ -245,4 +245,125 @@ fn artifact(text: &str) -> Option<(String, String)> {
 fn drv_name_of(drv_path: &str) -> Option<&str> {
     let base = drv_path.rsplit('/').next()?.strip_suffix(".drv")?;
     Some(base.split_once('-')?.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(key: &str, crate_type: &str, deps: &[&str]) -> NixUnit {
+        let mut unit: NixUnit = serde_json::from_value(serde_json::json!({
+            "key": key,
+            "drv_name": format!("{key}-0.1.0-{key}"),
+            "kind": "Compile",
+            "source_file": "",
+            "crate_name": key,
+            "crate_types": [crate_type],
+            "edition": "2021",
+            "features": [],
+            "dep_extern": [],
+            "all_dep_keys": [],
+            "build_script_dep": null,
+            "build_script_compile_key": null,
+            "manifest_dir": "",
+            "cargo_envs": [],
+            "extra_filename": "-0",
+            "needs_linker": crate_type != "lib",
+            "is_local": false,
+            "links": null,
+            "links_dep_keys": [],
+            "profile": {"rustc_args": [], "opt_level": "3", "debug": false, "root": "release"},
+            "drv_path": null,
+        }))
+        .unwrap();
+        unit.dep_extern = deps
+            .iter()
+            .map(|d| (d.to_string(), d.to_string()))
+            .collect();
+        unit
+    }
+
+    /// `a` is a library that the library `b` depends on, and the binary `c`
+    /// links both.
+    fn chain() -> Vec<NixUnit> {
+        let mut c = unit("c", "bin", &["b"]);
+        c.all_dep_keys = vec!["a".into(), "b".into()];
+        let mut b = unit("b", "lib", &["a"]);
+        b.all_dep_keys = vec!["a".into()];
+        vec![unit("a", "lib", &[]), b, c]
+    }
+
+    fn profile(frontend: f64, total: f64) -> PipelineProfile {
+        let timing = UnitTiming { frontend, total };
+        PipelineProfile {
+            units: [("a-0.1.0-a".to_string(), timing)].into(),
+        }
+    }
+
+    fn by_key<'a>(units: &'a [NixUnit], key: &str) -> &'a NixUnit {
+        units.iter().find(|u| u.key == key).unwrap()
+    }
+
+    #[test]
+    fn split_library_feeds_libraries_its_metadata_and_linkers_its_rlib() {
+        let mut units = chain();
+        assert_eq!(split_units(&mut units, &profile(1.0, 5.0)), 1);
+
+        let meta = by_key(&units, "a#meta");
+        assert_eq!(meta.pipeline, PipelineRole::Metadata);
+        assert_eq!(meta.drv_name, "a-0.1.0-a-meta");
+        assert_eq!(by_key(&units, "a").pipeline, PipelineRole::Whole);
+
+        let b = by_key(&units, "b");
+        assert_eq!(b.dep_extern, vec![("a".to_string(), "a#meta".to_string())]);
+        assert_eq!(b.all_dep_keys, vec!["a#meta".to_string()]);
+
+        let c = by_key(&units, "c");
+        assert_eq!(c.dep_extern, vec![("b".to_string(), "b".to_string())]);
+        assert_eq!(c.all_dep_keys, vec!["a".to_string(), "b".to_string()]);
+        assert!(units.iter().all(|u| u.pipeline != PipelineRole::Off));
+    }
+
+    #[test]
+    fn short_codegen_or_long_frontend_is_not_split() {
+        for (frontend, total) in [(1.0, 1.5), (4.0, 5.0)] {
+            let mut units = chain();
+            assert_eq!(split_units(&mut units, &profile(frontend, total)), 0);
+            assert_eq!(units.len(), 3);
+            assert_eq!(by_key(&units, "b").dep_extern[0].1, "a");
+            assert!(units.iter().all(|u| u.pipeline == PipelineRole::Whole));
+        }
+    }
+
+    /// A library that only binaries depend on gains nothing, because a
+    /// linking unit needs its object code either way.
+    #[test]
+    fn library_without_library_dependent_is_not_split() {
+        let mut units = vec![unit("a", "lib", &[]), unit("c", "bin", &["a"])];
+        assert_eq!(split_units(&mut units, &profile(1.0, 5.0)), 0);
+    }
+
+    #[test]
+    fn recorder_times_library_artifacts_from_the_build_start() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        let artifact = |name: &str, file: &str, emit: &str| {
+            format!(
+                "a> {{\"$message_type\":\"artifact\",\"artifact\":\"/nix/store/0000-{name}/{file}\",\"emit\":\"{emit}\"}}"
+            )
+        };
+        let mut recorder = PipelineRecorder::new();
+        recorder.building("/nix/store/hash-a-0.1.0-a.drv", at(0));
+        assert!(recorder.log_line(&artifact("a-0.1.0-a", "liba.rmeta", "metadata"), at(1000)));
+        assert!(!recorder.log_line("a> warning: unused", at(1500)));
+        assert!(recorder.log_line(&artifact("a-0.1.0-a", "liba.rlib", "link"), at(4000)));
+        recorder.building("/nix/store/hash-c-0.1.0-c.drv", at(5000));
+        assert!(recorder.log_line(&artifact("c-0.1.0-c", "c.rmeta", "metadata"), at(5100)));
+        assert!(!recorder.log_line(&artifact("c-0.1.0-c", "c", "link"), at(6000)));
+
+        let profile = recorder.finish();
+        assert_eq!(profile.units.len(), 1);
+        let a = &profile.units["a-0.1.0-a"];
+        assert!((a.frontend - 1.0).abs() < 1e-9 && (a.total - 4.0).abs() < 1e-9);
+    }
 }

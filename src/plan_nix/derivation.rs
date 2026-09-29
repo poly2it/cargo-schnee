@@ -2296,6 +2296,7 @@ mod tests {
 
         let out = dir.path().join("out");
         let status = Command::new(find_on_path("bash"))
+            .current_dir(dir.path())
             .arg("-c")
             .arg(&script)
             .env("out", &out)
@@ -2369,6 +2370,7 @@ mod tests {
 
         let out = dir.path().join("out");
         let mut child = Command::new(find_on_path("bash"))
+            .current_dir(dir.path())
             .arg("-c")
             .arg(&script)
             .env("out", &out)
@@ -2397,5 +2399,176 @@ mod tests {
             std::fs::read_to_string(out.join("diagnostics")).unwrap(),
             "{\"artifact\":\"x.rmeta\",\"emit\":\"metadata\"}\n"
         );
+    }
+
+    // -- pipelined compilation tests --------------------------------------------
+
+    fn compile_script_of(
+        units: &[NixUnit],
+        idx: usize,
+        dep_drv_map: &HashMap<String, String>,
+    ) -> String {
+        compile_script_with(
+            units,
+            idx,
+            dep_drv_map,
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+        )
+    }
+
+    fn compile_script_with(
+        units: &[NixUnit],
+        idx: usize,
+        dep_drv_map: &HashMap<String, String>,
+        rustc: &str,
+        sysroot: &str,
+        coreutils: &str,
+        cc: &str,
+    ) -> String {
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        build_compile_script(
+            &units[idx],
+            units,
+            &key_to_idx,
+            dep_drv_map,
+            rustc,
+            "",
+            sysroot,
+            coreutils,
+            cc,
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn metadata_half_skips_codegen_and_drops_the_rlib_stub() {
+        let mut unit = unit_of_kind("my-lib", UnitKind::Compile);
+        unit.pipeline = PipelineRole::Metadata;
+        let script = compile_script_of(&[unit], 0, &HashMap::new());
+        assert!(script.contains(" -Z no-codegen "));
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 && "));
+        assert!(
+            script
+                .contains("/nix/store/coreutils/bin/rm -f $out/libmy_lib-abc123.rlib; exit $__rs")
+        );
+    }
+
+    #[test]
+    fn whole_unit_of_pipelined_build_sets_rustc_bootstrap_only() {
+        let mut unit = unit_of_kind("my-lib", UnitKind::Compile);
+        unit.pipeline = PipelineRole::Whole;
+        let script = compile_script_of(&[unit.clone()], 0, &HashMap::new());
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 && "));
+        assert!(!script.contains("no-codegen"));
+        assert!(!script.contains("/rm "));
+
+        unit.pipeline = PipelineRole::Off;
+        let script = compile_script_of(&[unit], 0, &HashMap::new());
+        assert!(!script.contains("RUSTC_BOOTSTRAP"));
+    }
+
+    /// Builds a split library's halves, a library against the metadata half
+    /// and a binary against the link halves, with the real rustc and the
+    /// scripts cargo-schnee generates, and runs the binary.  The crate hash
+    /// of both halves must agree, or the final link fails with E0460.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_library_links_into_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let mut a = unit_of_kind("a", UnitKind::Compile);
+        a.source_file = write(
+            "a.rs",
+            "pub fn f() -> u32 { 40 }\n#[inline] pub fn g<T: Into<u32>>(x: T) -> u32 { x.into() }\n",
+        );
+        a.pipeline = PipelineRole::Whole;
+        let mut a_meta = a.clone();
+        a_meta.key = "a#meta".into();
+        a_meta.pipeline = PipelineRole::Metadata;
+        let mut b = unit_of_kind("b", UnitKind::Compile);
+        b.source_file = write("b.rs", "pub fn h() -> u32 { a::f() + a::g(2u8) }\n");
+        b.dep_extern = vec![("a".into(), "a#meta".into())];
+        b.all_dep_keys = vec!["a#meta".into()];
+        b.pipeline = PipelineRole::Whole;
+        let mut c = unit_of_kind("c", UnitKind::Compile);
+        c.source_file = write("c.rs", "fn main() { println!(\"{}\", b::h()); }\n");
+        c.crate_types = vec!["bin".into()];
+        c.needs_linker = true;
+        c.dep_extern = vec![("b".into(), "b".into())];
+        c.all_dep_keys = vec!["a".into(), "b".into()];
+        c.pipeline = PipelineRole::Whole;
+        let units = vec![a, a_meta, b, c];
+
+        let drv = |n: char| format!("/nix/store/{}-{n}.drv", n.to_string().repeat(32));
+        let dep_drv_map: HashMap<String, String> = [("a", 'a'), ("a#meta", 'm'), ("b", 'b')]
+            .into_iter()
+            .map(|(k, n)| (k.to_string(), drv(n)))
+            .collect();
+        let rustc = find_on_path("rustc");
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        let sysroot = String::from_utf8(sysroot.stdout).unwrap();
+        let coreutils = find_on_path("tee").parent().unwrap().to_path_buf();
+        let cc = find_on_path("cc").parent().unwrap().to_path_buf();
+
+        let mut outs: HashMap<String, PathBuf> = HashMap::new();
+        for idx in [1, 2, 0, 3] {
+            let mut script = compile_script_with(
+                &units,
+                idx,
+                &dep_drv_map,
+                rustc.to_str().unwrap(),
+                sysroot.trim(),
+                coreutils.to_str().unwrap(),
+                cc.to_str().unwrap(),
+            );
+            for (key, path) in &outs {
+                let placeholder = downstream_placeholder(&dep_drv_map[key], "out").unwrap();
+                script = script.replace(&placeholder, &path.to_string_lossy());
+            }
+            let out = dir.path().join(format!("out-{idx}"));
+            // `fresh_unit_graph` tests move the process's working directory
+            // into a temporary directory that may already be gone.
+            let status = Command::new(find_on_path("bash"))
+                .current_dir(dir.path())
+                .arg("-c")
+                .arg(&script)
+                .env("out", &out)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            let diagnostics = std::fs::read_to_string(out.join("diagnostics")).unwrap_or_default();
+            assert!(
+                status.success(),
+                "{} failed:\n{diagnostics}",
+                units[idx].key
+            );
+            outs.insert(units[idx].key.clone(), out);
+        }
+
+        assert!(!outs["a#meta"].join("liba-abc123.rlib").exists());
+        assert!(outs["a#meta"].join("liba-abc123.rmeta").exists());
+        let run = Command::new(outs["c"].join("c-abc123")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
     }
 }
