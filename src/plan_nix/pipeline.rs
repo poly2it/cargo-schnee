@@ -80,9 +80,11 @@ pub struct UnitTiming {
 
 impl UnitTiming {
     /// The unit's cost in the model.  CPU time changes less with the
-    /// host's load than wall time, so it is preferred where known.
+    /// host's load than wall time, so it is preferred where known.  But
+    /// parallel codegen spends several CPU seconds per second, `hir-ty`
+    /// 110 s in 24 s, so the cost never exceeds the wall time.
     fn secs(&self) -> f64 {
-        self.cpu.unwrap_or(self.wall)
+        self.cpu.map_or(self.wall, |cpu| cpu.min(self.wall))
     }
 
     /// The frontend's share of the build, measured in wall time, because
@@ -351,6 +353,7 @@ pub fn split_units(units: &mut Vec<NixUnit>, profile: &PipelineProfile) -> usize
         .iter()
         .zip(&selected)
         .filter(|(_, s)| **s)
+        .inspect(|(u, _)| tracing::debug!(library = %u.drv_name, "Splitting"))
         .map(|(u, _)| (u.key.clone(), format!("{}{META_KEY_SUFFIX}", u.key)))
         .collect();
 
@@ -644,6 +647,18 @@ mod tests {
             ("y", timing(0.5, 1.0)),
         ]);
         assert_eq!(split_units(&mut units, &profile), 2);
+    }
+
+    #[test]
+    fn cost_is_cpu_time_up_to_the_wall_time() {
+        let at = |wall, cpu| UnitTiming {
+            wall,
+            cpu,
+            frontend: None,
+        };
+        assert_eq!(at(3.0, None).secs(), 3.0);
+        assert_eq!(at(3.0, Some(2.0)).secs(), 2.0);
+        assert_eq!(at(24.0, Some(110.0)).secs(), 24.0);
     }
 
     #[test]
