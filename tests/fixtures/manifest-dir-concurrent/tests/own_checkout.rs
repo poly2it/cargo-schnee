@@ -16,8 +16,14 @@ fn compile_time_manifest_dir_is_this_checkout() {
         assert!(Instant::now() < deadline, "never released");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let baked = Path::new(env!("CARGO_MANIFEST_DIR")).canonicalize().unwrap();
+    let baked = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
     assert_eq!(baked, own);
-    std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/written"), "").unwrap();
+    std::fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/written"),
+        "",
+    )
+    .unwrap();
     assert!(own.join("target/written").exists());
 }
