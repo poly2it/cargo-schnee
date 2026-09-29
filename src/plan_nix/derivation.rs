@@ -859,6 +859,21 @@ fn build_doc_script(
     Ok(script)
 }
 
+/// Shell fragment that follows a local build script's run. A local build
+/// script sees only its package directory and the files its package's
+/// `extra-includes` names, so for each path the script names in
+/// `rerun-if-changed` that its sandbox lacks, it prints the path and the
+/// key that would provide it. It then exits with the script's status.
+const MISSING_INPUT_REPORT: &str = concat!(
+    r#"; _bs_rc=$?; if [ -f $out/output ]; then while IFS= read -r _line; do"#,
+    r#" case "$_line" in cargo:rerun-if-changed=*|cargo::rerun-if-changed=*)"#,
+    r#" _p="${_line#*rerun-if-changed=}"; [ -e "$_p" ] ||"#,
+    r#" echo "cargo-schnee: the build script of $CARGO_PKG_NAME names $_p, which is not in"#,
+    r#" its sandbox. A build script sees only its package directory and the files that"#,
+    r#" [package.metadata.schnee] extra-includes in its Cargo.toml names." >&2 ;;"#,
+    r#" esac; done < $out/output; fi; [ $_bs_rc -eq 0 ]"#,
+);
+
 /// Build the shell script for running a build script.
 #[allow(clippy::too_many_arguments)]
 fn build_run_script(
@@ -1109,6 +1124,9 @@ fn build_run_script(
         "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
     ));
+    if unit.is_local {
+        script.push_str(MISSING_INPUT_REPORT);
+    }
     // Rewrite workdir paths back to the original Nix store path so that
     // cargo:rustc-link-search directives survive to the linking derivation.
     // Use pure bash (no sed) since gnused isn't in the sandbox PATH.
@@ -1209,6 +1227,39 @@ pub(super) fn self_placeholder(output_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_input_report_names_the_absent_path_and_keeps_the_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("build.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.join("output"),
+            "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=../spec/api.json\n",
+        )
+        .unwrap();
+        let run = |status: i32| {
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!("(exit {status}){MISSING_INPUT_REPORT}"))
+                .current_dir(dir)
+                .env("out", dir)
+                .env("CARGO_PKG_NAME", "app")
+                .output()
+                .unwrap()
+        };
+
+        let failed = run(101);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(!failed.status.success());
+        assert!(
+            stderr.contains("the build script of app names ../spec/api.json"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("extra-includes"), "{stderr}");
+        assert!(!stderr.contains("names build.rs"), "{stderr}");
+        assert!(run(0).status.success());
+    }
 
     // The project-src root remap that the consumer expresses via
     // `sourceRootPrefix = "crates"`: rewrite the project-src store root to
@@ -1368,7 +1419,6 @@ mod tests {
             target_name: name.to_string(),
             for_host: false,
             compile_test: false,
-            self_contained_build_script: false,
             sliced_crate_rel: None,
             profile: Default::default(),
             drv_path: None,
@@ -1841,7 +1891,6 @@ mod tests {
             target_name: name.to_string(),
             for_host: false,
             compile_test: true,
-            self_contained_build_script: false,
             sliced_crate_rel: Some(name.to_string()),
             profile: Default::default(),
             drv_path: None,

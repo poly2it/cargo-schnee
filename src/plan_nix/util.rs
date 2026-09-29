@@ -223,9 +223,87 @@ pub(crate) fn sanitize_drv_name(name: &str) -> String {
     }
 }
 
+/// The `[package.metadata.schnee] extra-includes` globs of the manifest at
+/// `manifest`, written relative to the package directory. Empty when the
+/// manifest is unreadable or declares none.
+pub(crate) fn package_extra_includes(manifest: &Path) -> Vec<String> {
+    metadata_extra_includes(manifest, "package")
+}
+
+/// The `[workspace.metadata.schnee] extra-includes` globs of the manifest
+/// at `manifest`, written relative to the workspace root.
+pub(crate) fn workspace_extra_includes(manifest: &Path) -> Vec<String> {
+    metadata_extra_includes(manifest, "workspace")
+}
+
+fn metadata_extra_includes(manifest: &Path, table: &str) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&content) else {
+        return Vec::new();
+    };
+    doc.get(table)
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("schnee"))
+        .and_then(|s| s.get("extra-includes"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rewrite `pattern`, a glob relative to the package at `crate_rel`, as a
+/// glob relative to the project source root. A `..` that climbs above the
+/// root becomes `.parent`, where the project source keeps files from
+/// outside the project. A trailing `**` becomes `**/*`, because the `glob`
+/// crate matches `dir/**` against the directory alone.
+pub(crate) fn project_relative_pattern(crate_rel: &str, pattern: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in crate_rel.split('/').chain(pattern.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != ".parent") => {
+                parts.pop();
+            }
+            ".." => parts.push(".parent"),
+            _ => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if joined.ends_with("**") {
+        format!("{joined}/*")
+    } else {
+        joined
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_relative_pattern_maps_escapes_to_parent() {
+        assert_eq!(
+            project_relative_pattern("crates/a", "../../spec/**"),
+            "spec/**/*"
+        );
+        assert_eq!(
+            project_relative_pattern("crates/a", "gen/*.rs"),
+            "crates/a/gen/*.rs"
+        );
+        assert_eq!(
+            project_relative_pattern("", "../spec/x.json"),
+            ".parent/spec/x.json"
+        );
+        assert_eq!(
+            project_relative_pattern("a", "../../../other/x"),
+            ".parent/.parent/other/x"
+        );
+    }
     use proptest::prelude::*;
 
     #[test]

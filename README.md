@@ -670,6 +670,23 @@ Files matching these patterns are added to the source tree even if they appear
 in `.gitignore`. Files outside the project directory are supported and are
 stored with a `.parent` prefix in the Nix store tree.
 
+### Inputs of a build script
+
+Each unit of a local package sees only its package's own directory, so an edit
+in one package leaves every other package's derivations alone. A package at the
+workspace root sees the root without the member directories. A build script that
+reads files outside its package directory, for example a shared `../spec/`
+tree, must name them in its package's `Cargo.toml`, relative to the package:
+
+```toml
+[package.metadata.schnee]
+extra-includes = ["../spec/**"]
+```
+
+Only that package's build-script run sees those files, at their usual place
+relative to its directory. When a build script names a missing path in
+`cargo:rerun-if-changed`, cargo-schnee prints the path and points at this key.
+
 ### Sharing a resolution across packages
 
 Cargo unifies features across whatever a single command line names, so

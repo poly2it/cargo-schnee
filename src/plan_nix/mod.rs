@@ -314,15 +314,6 @@ pub struct NixUnit {
     /// time with E0601 (`main function not found in crate ...`).
     #[serde(default)]
     pub(crate) compile_test: bool,
-    /// Whether this local crate's build script is self-contained — it reads
-    /// only its own crate directory and inputs provided via the environment,
-    /// never sibling directories like `../spec/`. Opt in via
-    /// `[package.metadata.schnee] self-contained-build-script = true`. When set,
-    /// the BuildScriptRun unit is sliced to its own per-crate source (Change 3)
-    /// instead of carrying the whole workspace tree, so it stops re-keying on
-    /// unrelated edits.
-    #[serde(default)]
-    pub(crate) self_contained_build_script: bool,
     /// Set when this local unit was per-crate sliced off the project-src tree
     /// (see `assign_per_crate_src_stores`): the crate's directory relative to
     /// the project-src root, e.g. `skeptiva-ai-common`. Slicing rewrites the
@@ -1000,6 +991,32 @@ fn add_source_dir(conn: &mut Option<NixDaemonConn>, path: &str) -> Result<String
     })
 }
 
+/// Add `files`, relative to `dir`, to the store as the source path `name`
+/// through [`ensure_source_nar`]. `dir` must be a store tree, which holds
+/// only regular files and directories, so a copy of `files` serialises to
+/// the same NAR. Without a daemon, or when the daemon fails, it adds such a
+/// copy with `nix-store --add`.
+fn add_source_files(
+    conn: &mut Option<NixDaemonConn>,
+    dir: &str,
+    name: &str,
+    files: &HashSet<PathBuf>,
+) -> Result<String> {
+    let nar = crate::nar::serialize_nar(Path::new(dir), Some(files))?;
+    let added = match conn.as_mut() {
+        Some(c) => ensure_source_nar(c, name, &nar),
+        None => Err(anyhow::anyhow!("no daemon connection")),
+    };
+    added.or_else(|e| {
+        info!("Daemon add of {} failed: {}, falling back to CLI", name, e);
+        *conn = NixDaemonConn::connect().ok();
+        let tmp = tempfile::tempdir().context("Failed to create temp dir for a source slice")?;
+        let dest = tmp.path().join(name);
+        crate::copy_allowed_files(Path::new(dir), &dest, files)?;
+        crate::add_to_nix_store(&dest.to_string_lossy())
+    })
+}
+
 /// Distribute `units` round-robin across `n` chunks. Returns exactly
 /// `n` Vecs, possibly empty for over-provisioned cases. Round-robin
 /// keeps per-chunk wall time roughly even across workers when unit
@@ -1211,114 +1228,260 @@ pub fn fresh_unit_graph(
     Ok((units, bcx_cfg_envs, bcx_host_cfg_envs))
 }
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-/// Assign each unit its source store path. Local compile/test/doc units are
-/// sliced to a per-crate NAR — decoupled from sibling crates — via `add`, which
-/// adds a crate subtree to the store and returns its content-addressed path;
-/// the unit's `source_file`/`manifest_dir` are rewritten onto that store.
-/// BuildScriptRun units keep the whole-tree `src_str`, because they copy the
-/// workspace into their workdir so sibling reads like `../spec/` resolve (see
-/// `build_run_script`); slicing them needs the spec-via-env change first. `add`
-/// is injected so the slicing logic is testable without a Nix daemon.
+/// A source tree for [`assign_per_crate_src_stores`] to add to the store.
+pub(super) struct SliceSource<'a> {
+    /// Directory the tree is rooted at.
+    pub(super) dir: &'a str,
+    /// Store name of the tree.
+    pub(super) name: &'a str,
+    /// Files of the tree relative to `dir`, or `None` for all of `dir`.
+    pub(super) files: Option<&'a HashSet<PathBuf>>,
+}
+
+/// Assign each unit its source store path. Every unit of a vendored crate
+/// gets the crate's own store path behind the vendor symlink farm. Every
+/// unit of a local crate gets a slice of the project source that `add`
+/// puts in the store, so an edit in one package moves only that package's
+/// units. `add` is injected so the slicing is testable without a daemon.
+///
+/// A member below the root gets its directory. A package at the project
+/// root gets the root minus the directories of the workspace members and
+/// of the other local packages. A build-script run also gets the files
+/// that its package's `[package.metadata.schnee] extra-includes` names,
+/// such as `../spec/**`, and the files of the workspace-level
+/// `extra-includes` that lie outside every package directory, in a tree
+/// shaped like the workspace, so relative reads from its directory
+/// resolve. Nothing else of the workspace is in the sandbox of a
+/// build-script run.
 fn assign_per_crate_src_stores(
     units: &mut [NixUnit],
     src_str: &str,
     vendor_str: &str,
-    mut add: impl FnMut(&str) -> Result<String>,
+    mut add: impl FnMut(&SliceSource) -> Result<String>,
 ) -> Result<Vec<String>> {
     let mut unit_src_store: Vec<String> = vec![src_str.to_string(); units.len()];
     let mut per_crate: HashMap<String, String> = HashMap::new();
+    let other_packages = local_package_dirs(units, src_str);
+    // Files of the workspace-level extra includes that no package directory
+    // holds, such as a shared spec outside the project. Every build-script
+    // run sees them, as it did when it saw the whole tree.
+    let workspace_patterns = if src_str.is_empty() {
+        Vec::new()
+    } else {
+        util::workspace_extra_includes(&Path::new(src_str).join("Cargo.toml"))
+    };
+    let shared_inputs: HashSet<PathBuf> = extra_include_files(src_str, "", &workspace_patterns)?
+        .into_iter()
+        .filter(|f| !other_packages.iter().any(|d| f.starts_with(d)))
+        .collect();
     for i in 0..units.len() {
-        // Pick the root this unit's source lives under and whether to slice it.
-        //
-        // Change 1 (local crates): slice compile/test/doc units. A local
-        // BuildScriptRun normally copies the whole workspace into its workdir so
-        // sibling reads like `../spec/` resolve (see build_run_script), so it is
-        // NOT sliced — UNLESS the crate opts in via
-        // `[package.metadata.schnee] self-contained-build-script` (Change 3),
-        // declaring its build script reads only its own dir and env inputs.
-        //
-        // Change 2 (vendored deps): slice every unit off the aggregate vendor
-        // dir. A vendored crate is self-contained — its build script reads only
-        // its own files — so per-crate slicing is always safe, and it decouples
-        // the lock axis: a `Cargo.lock` bump that changes one dep no longer
-        // re-keys the units of unrelated deps (which kept the same per-crate
-        // store) the way the shared aggregate did.
-        let (is_local, is_bsr, self_contained_bs) = {
-            let u = &units[i];
-            (
-                u.is_local,
-                matches!(u.kind, UnitKind::BuildScriptRun),
-                u.self_contained_build_script,
-            )
-        };
-        let (root, sliceable) = if is_local {
-            (src_str, !is_bsr || self_contained_bs)
-        } else {
-            (vendor_str, !vendor_str.is_empty())
-        };
-        if !sliceable {
+        let (is_local, is_bsr) = (
+            units[i].is_local,
+            matches!(units[i].kind, UnitKind::BuildScriptRun),
+        );
+        let root = if is_local { src_str } else { vendor_str };
+        if root.is_empty() {
             continue;
         }
-        let (crate_rel, source_file, manifest_dir) = {
-            let u = &units[i];
-            let crate_rel = u
-                .manifest_dir
-                .strip_prefix(root)
-                .map(|s| s.trim_start_matches('/').to_string())
-                .filter(|s| !s.is_empty());
-            (crate_rel, u.source_file.clone(), u.manifest_dir.clone())
+        let Some(crate_rel) = units[i]
+            .manifest_dir
+            .strip_prefix(root)
+            .filter(|s| s.is_empty() || s.starts_with('/'))
+            .map(|s| s.trim_start_matches('/').to_string())
+        else {
+            continue;
         };
-        let Some(crate_rel) = crate_rel else { continue };
-        // Key the cache on (root, crate_rel) so a local and a vendored crate
-        // sharing a name never collide.
-        let cache_key = format!("{root}\u{0}{crate_rel}");
-        let crate_store = match per_crate.get(&cache_key) {
-            Some(p) => p.clone(),
-            None => {
-                let full = format!("{}/{}", root, crate_rel);
-                // Local crates: add the subtree to the store. Vendored crates
-                // are already content-addressed per-crate store paths behind the
-                // cargo-vendor-dir symlink farm, so follow the symlink to its
-                // target rather than re-adding — re-adding would capture the
-                // symlink itself, whose target is not mounted in the compile
-                // sandbox. If the vendor entry is a real copy rather than a
-                // symlink, canonicalize returns it unchanged (correct, but not
-                // decoupled).
-                let p = if is_local {
-                    add(&full)?
-                } else {
-                    std::fs::canonicalize(&full)
+        if !is_local {
+            if crate_rel.is_empty() {
+                continue;
+            }
+            // A vendored crate is already a content-addressed store path
+            // behind the vendor symlink farm, so the slice is the symlink's
+            // target. Re-adding would capture the symlink itself, whose
+            // target is not mounted in the compile sandbox.
+            let full = format!("{root}/{crate_rel}");
+            let key = format!("{root}\u{0}{crate_rel}");
+            let store = match per_crate.get(&key) {
+                Some(p) => p.clone(),
+                None => {
+                    let p = std::fs::canonicalize(&full)
                         .with_context(|| format!("resolving vendored crate at {full}"))?
                         .to_string_lossy()
-                        .to_string()
-                };
-                per_crate.insert(cache_key, p.clone());
+                        .to_string();
+                    per_crate.insert(key, p.clone());
+                    p
+                }
+            };
+            rebase_unit(&mut units[i], &full, &store);
+            unit_src_store[i] = store;
+            continue;
+        }
+
+        let extras = if is_bsr {
+            let manifest = Path::new(&units[i].manifest_dir).join("Cargo.toml");
+            let mut files =
+                extra_include_files(root, &crate_rel, &util::package_extra_includes(&manifest))?;
+            if !crate_rel.is_empty() {
+                files.extend(shared_inputs.iter().cloned());
+            }
+            files
+        } else {
+            HashSet::new()
+        };
+        if !crate_rel.is_empty() && extras.is_empty() {
+            let full = format!("{root}/{crate_rel}");
+            let key = format!("{root}\u{0}{crate_rel}");
+            let store = match per_crate.get(&key) {
+                Some(p) => p.clone(),
+                None => {
+                    let name = Path::new(&crate_rel)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("source");
+                    let p = add(&SliceSource {
+                        dir: &full,
+                        name,
+                        files: None,
+                    })?;
+                    per_crate.insert(key, p.clone());
+                    p
+                }
+            };
+            rebase_unit(&mut units[i], &full, &store);
+            units[i].sliced_crate_rel = Some(crate_rel);
+            unit_src_store[i] = store;
+            continue;
+        }
+
+        // A tree shaped like the workspace: the package's own files plus the
+        // extra includes, rooted at the project source.
+        let key = format!("{root}\u{0}{crate_rel}\u{0}{}", !extras.is_empty());
+        let store = match per_crate.get(&key) {
+            Some(p) => p.clone(),
+            None => {
+                let files = workspace_slice_files(root, &crate_rel, &other_packages, &extras)?;
+                let name = units[i]
+                    .cargo_envs
+                    .iter()
+                    .find(|(k, _)| k == "CARGO_PKG_NAME")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("source");
+                let p = add(&SliceSource {
+                    dir: root,
+                    name,
+                    files: Some(&files),
+                })?;
+                per_crate.insert(key, p.clone());
                 p
             }
         };
-        // Rewrite the unit's source paths from `{root}/{crate_rel}` onto the
-        // crate-rooted store, and reference it as this unit's src_store.
-        let old_prefix = format!("{}/{}", root, crate_rel);
-        let u = &mut units[i];
-        if let Some(rest) = source_file.strip_prefix(&old_prefix) {
-            u.source_file = format!("{}{}", crate_store, rest);
-        }
-        if manifest_dir == old_prefix {
-            u.manifest_dir = crate_store.clone();
-        } else if let Some(rest) = manifest_dir.strip_prefix(&old_prefix) {
-            u.manifest_dir = format!("{}{}", crate_store, rest);
-        }
-        // Record the crate's project-src-relative directory for local crates
-        // so the remap builder can keep their diagnostics rooted at the real
-        // workspace path. Vendored crates slice off the vendor dir, not the
-        // project-src root the path_prefix_remaps describe, so they keep None.
-        if is_local {
-            u.sliced_crate_rel = Some(crate_rel.clone());
-        }
-        unit_src_store[i] = crate_store;
+        rebase_unit(&mut units[i], root, &store);
+        unit_src_store[i] = store;
     }
     Ok(unit_src_store)
+}
+
+/// Move `unit`'s source paths from below `from` onto `to`.
+fn rebase_unit(unit: &mut NixUnit, from: &str, to: &str) {
+    if let Some(rest) = unit.source_file.strip_prefix(from) {
+        unit.source_file = format!("{to}{rest}");
+    }
+    if let Some(rest) = unit.manifest_dir.strip_prefix(from) {
+        unit.manifest_dir = format!("{to}{rest}");
+    }
+}
+
+/// Directories, relative to `src`, of every package in the workspace other
+/// than one at the root: the workspace members the root manifest declares,
+/// and every local package the plan names.
+fn local_package_dirs(units: &[NixUnit], src: &str) -> HashSet<PathBuf> {
+    let root = Path::new(src);
+    let members = crate::workspace_member_manifests(&root.join("Cargo.toml"), root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            m.parent()
+                .and_then(|d| d.strip_prefix(root).ok())
+                .map(Path::to_path_buf)
+        });
+    let planned = units.iter().filter(|u| u.is_local).filter_map(|u| {
+        Path::new(&u.manifest_dir)
+            .strip_prefix(root)
+            .ok()
+            .map(Path::to_path_buf)
+    });
+    members
+        .chain(planned)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect()
+}
+
+/// Files, relative to `src`, of the workspace-shaped slice of the package at
+/// `crate_rel`: every file below the package directory, without the
+/// directories in `other_packages` when the package is the root, plus the
+/// files matching `extras`, globs relative to the package directory.
+fn workspace_slice_files(
+    src: &str,
+    crate_rel: &str,
+    other_packages: &HashSet<PathBuf>,
+    extra_files: &HashSet<PathBuf>,
+) -> Result<HashSet<PathBuf>> {
+    let excluded: HashSet<PathBuf> = if crate_rel.is_empty() {
+        other_packages.clone()
+    } else {
+        HashSet::new()
+    };
+    let mut files = extra_files.clone();
+    collect_tree_files(Path::new(src), Path::new(crate_rel), &excluded, &mut files)?;
+    Ok(files)
+}
+
+/// Files, relative to `src`, that match `patterns`, globs relative to the
+/// package at `crate_rel`.
+fn extra_include_files(
+    src: &str,
+    crate_rel: &str,
+    patterns: &[String],
+) -> Result<HashSet<PathBuf>> {
+    let root = Path::new(src);
+    let mut files = HashSet::new();
+    for pattern in patterns {
+        let full = root.join(util::project_relative_pattern(crate_rel, pattern));
+        let paths = glob::glob(&full.to_string_lossy())
+            .with_context(|| format!("invalid extra-includes pattern '{pattern}'"))?;
+        for path in paths.flatten() {
+            if path.is_file()
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                files.insert(rel.to_path_buf());
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Add every regular file below `root/rel` to `out`, relative to `root`,
+/// skipping the directories in `excluded`.
+fn collect_tree_files(
+    root: &Path,
+    rel: &Path,
+    excluded: &HashSet<PathBuf>,
+    out: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let dir = root.join(rel);
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("Failed to read dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let child = rel.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() && !excluded.contains(&child) {
+            collect_tree_files(root, &child, excluded, out)?;
+        } else if kind.is_file() {
+            out.insert(child);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1352,7 +1515,6 @@ mod slice_tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
-            self_contained_build_script: false,
             sliced_crate_rel: None,
             profile: Default::default(),
             drv_path: None,
@@ -1360,13 +1522,12 @@ mod slice_tests {
         }
     }
 
-    /// The real per-crate content-addressed add, minus the store insertion:
-    /// NAR-hash the crate subtree. Used so the test exercises actual addressing.
-    fn ca_add(p: &str) -> Result<String> {
-        let nar = crate::nar::serialize_nar(Path::new(p), None)?;
-        let name = Path::new(p).file_name().unwrap().to_string_lossy();
+    /// The real content-addressed add, minus the store insertion: NAR-hash
+    /// the slice. Used so the test exercises actual addressing.
+    fn ca_add(s: &SliceSource) -> Result<String> {
+        let nar = crate::nar::serialize_nar(Path::new(s.dir), s.files)?;
         Ok(crate::nar::compute_nar_store_path(
-            &format!("{name}-src"),
+            &format!("{}-src", s.name),
             &nar,
         ))
     }
@@ -1405,162 +1566,191 @@ mod slice_tests {
         h
     }
 
-    /// Changes 1 and 2 wiring end-to-end with real per-crate NAR addressing.
-    ///
-    /// Change 1: editing local crate-b leaves crate-a's compile unit's assigned
-    /// store byte-identical; the local build-script-run unit keeps the whole
-    /// tree.
-    ///
-    /// Change 2: a vendored dep's units are sliced off the aggregate vendor dir
-    /// onto a per-crate store, and bumping an unrelated vendored crate leaves it
-    /// byte-identical — the lock-axis decoupling.
-    #[test]
-    fn assign_decouples_local_and_vendored_crates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src").to_string_lossy().to_string();
-        let vendor = tmp.path().join("vendor").to_string_lossy().to_string();
-        let store = tmp.path().join("store").to_string_lossy().to_string();
+    /// A unit of the package at the project root `root`.
+    fn root_unit(kind: UnitKind, root: &str) -> NixUnit {
+        let mut u = unit(true, kind, "", root);
+        u.manifest_dir = root.to_string();
+        u.source_file = format!("{root}/src/main.rs");
+        u.cargo_envs = vec![("CARGO_PKG_NAME".into(), "app".into())];
+        u
+    }
+
+    /// A workspace with a root package `app`, members `crate-a` and
+    /// `crate-b`, and a `spec` directory that `crate-b`'s build script reads
+    /// through its package-level `extra-includes`. Also vendors `serde` and
+    /// `once_cell`.
+    fn workspace(tmp: &Path) -> (String, String, String) {
+        let src = tmp.join("src").to_string_lossy().to_string();
+        let vendor = tmp.join("vendor").to_string_lossy().to_string();
+        let store = tmp.join("store").to_string_lossy().to_string();
+        let s = Path::new(&src);
         write(
-            &Path::new(&src).join("crate-a/Cargo.toml"),
+            &s.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[workspace]\nmembers = [\"crate-a\", \"crate-b\"]\n",
+        );
+        write(&s.join("src/main.rs"), "fn main() {}\n");
+        write(&s.join("README.md"), "app\n");
+        write(
+            &s.join("crate-a/Cargo.toml"),
             "[package]\nname = \"crate-a\"\n",
         );
+        write(&s.join("crate-a/src/lib.rs"), "pub fn a() {}\n");
         write(
-            &Path::new(&src).join("crate-a/src/lib.rs"),
-            "pub fn a() {}\n",
+            &s.join("crate-b/Cargo.toml"),
+            "[package]\nname = \"crate-b\"\n\n\
+             [package.metadata.schnee]\nextra-includes = [\"../spec/**\"]\n",
         );
-        write(
-            &Path::new(&src).join("crate-b/Cargo.toml"),
-            "[package]\nname = \"crate-b\"\n",
-        );
-        write(
-            &Path::new(&src).join("crate-b/src/lib.rs"),
-            "pub fn b() {}\n",
-        );
+        write(&s.join("crate-b/src/lib.rs"), "pub fn b() {}\n");
+        write(&s.join("crate-b/build.rs"), "fn main() {}\n");
+        write(&s.join("spec/api.json"), "{}\n");
         vendor_symlink(&vendor, &store, "serde", "pub fn s() {}\n");
         vendor_symlink(&vendor, &store, "once_cell", "pub fn o() {}\n");
+        (src, vendor, store)
+    }
 
-        let mk = || {
-            let mut self_contained = unit(true, UnitKind::BuildScriptRun, "crate-b", &src);
-            self_contained.self_contained_build_script = true;
-            vec![
-                unit(true, UnitKind::Compile, "crate-a", &src),
-                unit(true, UnitKind::Compile, "crate-b", &src),
-                unit(true, UnitKind::BuildScriptRun, "crate-a", &src),
-                unit(false, UnitKind::Compile, "serde", &vendor),
-                unit(false, UnitKind::BuildScriptRun, "once_cell", &vendor),
-                self_contained, // index 5: Change 3 — local self-contained build-script-run.
-            ]
-        };
+    fn units(src: &str, vendor: &str) -> Vec<NixUnit> {
+        let mut b_run = unit(true, UnitKind::BuildScriptRun, "crate-b", src);
+        b_run.cargo_envs = vec![("CARGO_PKG_NAME".into(), "crate-b".into())];
+        vec![
+            unit(true, UnitKind::Compile, "crate-a", src),
+            unit(true, UnitKind::Compile, "crate-b", src),
+            unit(true, UnitKind::BuildScriptRun, "crate-a", src),
+            unit(false, UnitKind::Compile, "serde", vendor),
+            unit(false, UnitKind::BuildScriptRun, "once_cell", vendor),
+            b_run,
+            root_unit(UnitKind::Compile, src),
+            root_unit(UnitKind::BuildScriptRun, src),
+        ]
+    }
 
-        let mut units = mk();
-        let s1 = assign_per_crate_src_stores(&mut units, &src, &vendor, ca_add).unwrap();
+    #[test]
+    fn every_local_unit_gets_a_package_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, vendor, store) = workspace(tmp.path());
+        let mut us = units(&src, &vendor);
+        let s = assign_per_crate_src_stores(&mut us, &src, &vendor, ca_add).unwrap();
 
-        // Local compile unit: sliced off the whole tree, paths rewritten onto it.
-        assert_ne!(
-            s1[0], src,
-            "crate-a compile unit must be sliced off the whole tree"
-        );
-        assert!(
-            units[0].source_file.starts_with(&s1[0]),
-            "source_file rewritten onto per-crate store"
-        );
+        assert!(s.iter().all(|p| *p != src), "no unit keeps the whole tree");
+        assert_eq!(us[0].manifest_dir, s[0]);
+        assert!(us[0].source_file.starts_with(&s[0]));
+        assert_eq!(us[0].sliced_crate_rel.as_deref(), Some("crate-a"));
         assert_eq!(
-            units[0].manifest_dir, s1[0],
-            "manifest_dir rewritten onto per-crate store"
+            s[2], s[0],
+            "a build-script run without extras shares its package slice"
         );
-        // A sliced local unit records its project-src-relative dir so the
-        // remap builder can keep diagnostics rooted at the real workspace path.
+        assert!(s[3].starts_with(&store) && s[4].starts_with(&store));
+        assert_eq!(us[3].sliced_crate_rel, None);
         assert_eq!(
-            units[0].sliced_crate_rel.as_deref(),
-            Some("crate-a"),
-            "sliced local unit must record its crate_rel"
+            us[5].manifest_dir,
+            format!("{}/crate-b", s[5]),
+            "a build-script run with extras sits at its place in a workspace-shaped slice"
         );
-        // Local build-script-run unit keeps the whole tree (sibling reads).
-        assert_eq!(
-            s1[2], src,
-            "local build-script-run unit keeps the whole-tree src_store"
-        );
-        assert_eq!(
-            units[2].sliced_crate_rel, None,
-            "non-sliced local unit must not record a crate_rel"
-        );
-        // Vendored units slice off the vendor dir, not the project-src root the
-        // path_prefix_remaps describe, so they keep None (their remap, if any,
-        // must not be crate_rel-adjusted against the project-src replacement).
-        assert_eq!(
-            units[3].sliced_crate_rel, None,
-            "vendored sliced unit must not record a crate_rel"
-        );
-        assert_eq!(
-            units[2].source_file,
-            format!("{src}/crate-a/src/lib.rs"),
-            "local build-script unit not rewritten"
-        );
-        // Change 3: a local build-script-run that opts into self-contained IS
-        // sliced to its own per-crate source, so it stops re-keying on unrelated
-        // workspace edits.
-        assert_ne!(
-            s1[5], src,
-            "self-contained local build-script-run unit must be sliced off the whole tree"
-        );
-        assert_eq!(
-            units[5].manifest_dir, s1[5],
-            "self-contained build-script unit manifest_dir rewritten onto per-crate store"
-        );
-        // Vendored units: resolved through the symlink farm onto their per-crate
-        // store target, including the vendored build-script-run unit (a vendored
-        // crate is self-contained). The assigned store is the symlink TARGET, so
-        // the unit's paths point at real content, not the unmounted symlink.
-        assert!(
-            s1[3].starts_with(&store),
-            "vendored serde resolves to its per-crate store target"
-        );
-        assert_eq!(
-            units[3].manifest_dir, s1[3],
-            "vendored serde manifest_dir rewritten onto per-crate target"
-        );
-        assert!(
-            units[3].source_file.starts_with(&s1[3]),
-            "vendored serde source_file rewritten onto its target"
-        );
-        assert!(
-            s1[4].starts_with(&store),
-            "vendored once_cell build-script-run unit resolves to its target"
-        );
-        assert_eq!(
-            units[4].manifest_dir, s1[4],
-            "vendored once_cell manifest_dir rewritten onto per-crate target"
-        );
+        assert_eq!(us[5].sliced_crate_rel, None);
+        assert_eq!(us[6].manifest_dir, s[6]);
+        assert_eq!(s[7], s[6], "the root package's units share one slice");
+    }
 
-        let a_store_before = s1[0].clone();
-        let b_store_before = s1[1].clone();
-        let serde_store_before = s1[3].clone();
-        let once_cell_before = s1[4].clone();
+    #[test]
+    fn a_member_edit_leaves_other_packages_slices_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, vendor, store) = workspace(tmp.path());
+        let before =
+            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
 
-        // Edit ONLY local crate-b and vendored once_cell; re-run on fresh units.
         write(
-            &Path::new(&src).join("crate-b/src/lib.rs"),
-            "pub fn b() { let _ = 1; }\n",
+            &Path::new(&src).join("crate-a/src/lib.rs"),
+            "pub fn a() { let _ = 1; }\n",
         );
         vendor_symlink(&vendor, &store, "once_cell", "pub fn o() { let _ = 1; }\n");
-        let mut units2 = mk();
-        let s2 = assign_per_crate_src_stores(&mut units2, &src, &vendor, ca_add).unwrap();
+        let after =
+            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
 
-        assert_eq!(
-            s2[0], a_store_before,
-            "editing crate-b must NOT change crate-a's assigned source store"
-        );
+        assert_ne!(after[0], before[0], "crate-a's own slice moves");
+        assert_ne!(after[2], before[2], "crate-a's build-script run moves");
+        assert_eq!(after[1], before[1], "crate-b's compile slice stays");
+        assert_eq!(after[5], before[5], "crate-b's build-script run stays");
+        assert_eq!(after[6], before[6], "the root package's slice stays");
+        assert_eq!(after[3], before[3], "serde stays when once_cell is bumped");
+        assert_ne!(after[4], before[4], "once_cell moves");
+    }
+
+    #[test]
+    fn extra_includes_reach_only_the_build_script_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, vendor, _) = workspace(tmp.path());
+        let before =
+            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+
+        write(&Path::new(&src).join("spec/api.json"), "{\"v\": 2}\n");
+        let after =
+            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+
         assert_ne!(
-            s2[1], b_store_before,
-            "crate-b's own assigned source store changes"
+            after[5], before[5],
+            "crate-b's build-script run sees the spec"
         );
-        assert_eq!(
-            s2[3], serde_store_before,
-            "bumping once_cell must NOT change serde's per-crate vendor target"
-        );
+        assert_eq!(after[1], before[1], "crate-b's compile slice does not");
         assert_ne!(
-            s2[4], once_cell_before,
-            "once_cell's own per-crate vendor target changes"
+            after[6], before[6],
+            "the root package owns spec, because no member directory holds it"
+        );
+        assert_eq!(after[0], before[0], "crate-a's slice does not move");
+    }
+
+    #[test]
+    fn workspace_level_includes_outside_packages_reach_every_build_script_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, vendor, _) = workspace(tmp.path());
+        let s = Path::new(&src);
+        write(
+            &s.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[workspace]\nmembers = [\"crate-a\", \"crate-b\"]\n\n\
+             [workspace.metadata.schnee]\n\
+             extra-includes = [\"../shared/**\", \"crate-b/gen/**\"]\n",
+        );
+        write(&s.join(".parent/shared/data.txt"), "1\n");
+        write(&s.join("crate-b/gen/out.rs"), "\n");
+        let run = || {
+            let mut us = units(&src, &vendor);
+            let stores = assign_per_crate_src_stores(&mut us, &src, &vendor, ca_add).unwrap();
+            (stores, us)
+        };
+        let (before, us) = run();
+        assert_eq!(
+            us[2].manifest_dir,
+            format!("{}/crate-a", before[2]),
+            "crate-a's build-script run gets a workspace-shaped slice"
+        );
+
+        write(&s.join(".parent/shared/data.txt"), "2\n");
+        let (after, _) = run();
+        assert_ne!(
+            after[2], before[2],
+            "the shared input reaches crate-a's run"
+        );
+        assert_eq!(after[0], before[0], "but not crate-a's compile unit");
+
+        write(&s.join("crate-b/gen/out.rs"), "// changed\n");
+        let (last, _) = run();
+        assert_eq!(
+            last[2], after[2],
+            "a workspace-level include inside crate-b stays crate-b's input"
+        );
+    }
+
+    #[test]
+    fn the_root_slice_leaves_out_member_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, _, _) = workspace(tmp.path());
+        let others = local_package_dirs(&[], &src);
+        let files = workspace_slice_files(&src, "", &others, &HashSet::new()).unwrap();
+        let mut files: Vec<_> = files.into_iter().collect();
+        files.sort();
+        assert_eq!(
+            files,
+            ["Cargo.toml", "README.md", "spec/api.json", "src/main.rs"]
+                .map(PathBuf::from)
+                .to_vec()
         );
     }
 }
@@ -1595,7 +1785,6 @@ mod unit_setup_tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
-            self_contained_build_script: false,
             sliced_crate_rel: None,
             profile: Default::default(),
             drv_path: None,
@@ -2392,9 +2581,12 @@ pub fn run_plan_nix(
     // recursive-nix.
     let vendor_str = vendor_dir.to_string_lossy().to_string();
     let slice_span = tracing::info_span!("slice_sources").entered();
-    let unit_src_store = assign_per_crate_src_stores(&mut nix_units, &src_str, &vendor_str, |p| {
-        let _s = tracing::info_span!("add_slice", path = p).entered();
-        add_source_dir(&mut daemon, p)
+    let unit_src_store = assign_per_crate_src_stores(&mut nix_units, &src_str, &vendor_str, |s| {
+        let _s = tracing::info_span!("add_slice", name = s.name).entered();
+        match s.files {
+            None => add_source_dir(&mut daemon, s.dir),
+            Some(files) => add_source_files(&mut daemon, s.dir, s.name, files),
+        }
     })?;
     drop(slice_span);
 
@@ -3022,7 +3214,6 @@ mod narrow_tests {
             target_name: pkg.to_string(),
             for_host: false,
             compile_test: false,
-            self_contained_build_script: false,
             sliced_crate_rel: None,
             profile: Default::default(),
             drv_path: None,

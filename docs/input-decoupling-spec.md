@@ -320,6 +320,11 @@ bumping one vendored crate leaves a sibling's target byte-identical) and by
 nix-mode builds of ci-robot and app-backend (the latter with a large
 vendored closure including ring, rustls, wasmtime), exit 0.
 
+**Change 3 — superseded.** Every local build-script run is now sliced to its
+package directory by default, plus the files its package-level `extra-includes`
+names, and the `self-contained-build-script` opt-in below no longer exists. See
+"Inputs of a build script" in the README. The record of the opt-in follows.
+
 **Change 3 — wired and build-proven (cargo-schnee + consumer).** cargo-schnee
 side: a crate opts in via `[package.metadata.schnee] self-contained-build-script
 = true`; `assign_per_crate_src_stores` then slices its local BuildScriptRun unit

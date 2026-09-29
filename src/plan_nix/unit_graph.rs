@@ -473,7 +473,6 @@ pub(super) fn extract_units_from_bcx(
             target_name,
             for_host,
             compile_test,
-            self_contained_build_script: package_self_contained_build_script(&unit.pkg),
             sliced_crate_rel: None,
             profile,
             drv_path: None,
@@ -660,26 +659,6 @@ pub(super) fn target_kind_to_crate_types(unit: &Unit) -> Vec<String> {
 }
 
 /// Map a filesystem path to a nix store path reference.
-/// Read `[package.metadata.schnee] self-contained-build-script` from a
-/// package's manifest. Defaults to false. When true, the crate's build script
-/// reads only its own directory and env-provided inputs, so its BuildScriptRun
-/// unit may be sliced to per-crate source (Change 3).
-fn package_self_contained_build_script(pkg: &cargo::core::Package) -> bool {
-    let Ok(content) = std::fs::read_to_string(pkg.manifest_path()) else {
-        return false;
-    };
-    let Ok(value) = content.parse::<toml::Value>() else {
-        return false;
-    };
-    value
-        .get("package")
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("schnee"))
-        .and_then(|s| s.get("self-contained-build-script"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 pub(super) fn map_to_store_path(
     path: &str,
     src_str: &str,
@@ -1426,7 +1405,6 @@ mod tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
-            self_contained_build_script: false,
             sliced_crate_rel: None,
             profile: Default::default(),
             drv_path: None,

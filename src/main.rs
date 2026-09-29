@@ -1117,12 +1117,28 @@ fn add_project_source_to_store(
         tracing::info_span!("collect_git_files").in_scope(|| collect_git_files(project_dir))?;
 
     // Include extra gitignored files specified in [*.metadata.schnee.extra-includes]
-    let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
+    // The root manifest's patterns are relative to the project, and a
+    // member's package-level patterns to the member's directory.
+    let mut extra_patterns: Vec<(PathBuf, String)> =
+        read_extra_includes(&project_dir.join("Cargo.toml"))
+            .into_iter()
+            .map(|p| (project_dir.to_path_buf(), p))
+            .collect();
+    if let Some(ref files) = allowed_files {
+        for manifest in files.iter().filter(|f| {
+            f.file_name().is_some_and(|n| n == "Cargo.toml") && f.parent() != Some(Path::new(""))
+        }) {
+            let base = project_dir.join(manifest.parent().unwrap_or(Path::new("")));
+            for p in plan_nix::util::package_extra_includes(&project_dir.join(manifest)) {
+                extra_patterns.push((base.clone(), p));
+            }
+        }
+    }
     let mut extra_outside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, store_rel_path)
     if !extra_patterns.is_empty() {
         let canon_proj = project_dir.canonicalize().ok();
         let mut count = 0usize;
-        for pattern in &extra_patterns {
+        for (base, pattern) in &extra_patterns {
             // glob crate: `dir/**` only matches the dir itself (zero components).
             // Normalise to `dir/**/*` so files are matched recursively.
             let pat = if pattern.ends_with("**") {
@@ -1130,7 +1146,7 @@ fn add_project_source_to_store(
             } else {
                 pattern.clone()
             };
-            let full = project_dir.join(&pat).to_string_lossy().to_string();
+            let full = base.join(&pat).to_string_lossy().to_string();
             match glob::glob(&full) {
                 Ok(paths) => {
                     for entry in paths.flatten() {
@@ -1346,7 +1362,11 @@ fn write_skeleton(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) -> 
 /// Copy `files`, relative to `project_dir`, into `dest`. A file that is not
 /// a regular file after following symlinks is skipped, but its parent
 /// directories are still created.
-fn copy_allowed_files(project_dir: &Path, dest: &Path, files: &HashSet<PathBuf>) -> Result<()> {
+pub(crate) fn copy_allowed_files(
+    project_dir: &Path,
+    dest: &Path,
+    files: &HashSet<PathBuf>,
+) -> Result<()> {
     for file in files {
         let src_path = project_dir.join(file);
         let dest_path = dest.join(file);
@@ -1675,7 +1695,10 @@ fn hash_file(path: &Path) -> Result<String> {
 /// the root manifest, sorted for deterministic iteration.  Non-workspace
 /// projects yield an empty list.  Invalid glob patterns are warned about
 /// and skipped.
-fn workspace_member_manifests(manifest_path: &Path, project_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn workspace_member_manifests(
+    manifest_path: &Path,
+    project_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let content = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let doc: toml::Value = toml::from_str(&content)
