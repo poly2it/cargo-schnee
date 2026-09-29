@@ -2038,7 +2038,8 @@ mod tests {
 
 #[cfg(test)]
 mod build_script_dep_tests {
-    use super::super::{ProfileConfig, TargetConfig, fresh_unit_graph};
+    use super::super::profile::tests::PLANNER;
+    use super::super::{TargetConfig, fresh_unit_graph};
     use super::*;
 
     const FILES: &[(&str, &str)] = &[
@@ -2084,10 +2085,11 @@ mod build_script_dep_tests {
             std::fs::write(path, body).unwrap();
         }
         let vendor = tempfile::tempdir().unwrap();
+        let _planner = PLANNER.lock().unwrap_or_else(|e| e.into_inner());
         let (units, _, _) = fresh_unit_graph(
             dir.path(),
             vendor.path(),
-            &ProfileConfig::release(),
+            "release",
             &TargetConfig::native(),
             UserIntent::Build,
             &[],

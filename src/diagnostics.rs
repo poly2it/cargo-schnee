@@ -168,7 +168,7 @@ mod tests {
         .unwrap();
         let out = Captured::default();
         let mut shell = Shell::from_write(Box::new(out.clone()));
-        replay_diagnostics_from_file(&mut shell, &path, "/nix/store/src/", "/home/user/");
+        replay_diagnostics_from_file(&mut shell, &path, &remaps());
         let printed = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         assert_eq!(printed, "warning: unused /home/user/lib.rs\n");
     }

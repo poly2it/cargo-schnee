@@ -231,7 +231,7 @@ fn calculate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::derivation::build_compile_script;
     use super::super::{NixUnit, TargetConfig, UnitKind, fresh_unit_graph};
     use cargo::util::command_prelude::UserIntent;
@@ -441,8 +441,9 @@ shared = { path = "../shared" }
     }
 
     /// `fresh_unit_graph` sets `CARGO_HOME` and the working directory of the
-    /// whole process, so two planners must not overlap.
-    static PLANNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// whole process, so two planners must not overlap. Every test that plans
+    /// takes this lock.
+    pub(in crate::plan_nix) static PLANNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn schnee_invocations(dir: &Path, profile: &str) -> (Invocations, ScriptEnvs) {
         let vendor = tempfile::tempdir().unwrap();
