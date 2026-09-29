@@ -187,46 +187,47 @@ impl SourceTree {
     /// Serialise the tree to a NAR, as `nix-store --add` would serialise a
     /// copy of it on disk.
     pub(crate) fn nar(&self) -> Result<Vec<u8>> {
+        // Entry names by parent directory. `String` orders by bytes, which
+        // is the order NAR requires.
+        let mut children: BTreeMap<&Path, BTreeSet<String>> = BTreeMap::new();
+        for path in self.files.keys().chain(self.dirs.iter()) {
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                children
+                    .entry(parent)
+                    .or_default()
+                    .insert(name.to_string_lossy().into_owned());
+            }
+        }
         let mut buf = Vec::with_capacity(1024 * 1024);
         nar_string(&mut buf, "nix-archive-1");
-        self.write_dir(&mut buf, Path::new(""))?;
+        self.write_dir(&mut buf, Path::new(""), &children)?;
         Ok(buf)
     }
 
-    fn write_dir(&self, buf: &mut Vec<u8>, dir: &Path) -> Result<()> {
+    fn write_dir(
+        &self,
+        buf: &mut Vec<u8>,
+        dir: &Path,
+        children: &BTreeMap<&Path, BTreeSet<String>>,
+    ) -> Result<()> {
         nar_string(buf, "(");
         nar_string(buf, "type");
         nar_string(buf, "directory");
-        for name in self.children(dir) {
-            let child = dir.join(&name);
+        for name in children.get(dir).into_iter().flatten() {
+            let child = dir.join(name);
             nar_string(buf, "entry");
             nar_string(buf, "(");
             nar_string(buf, "name");
-            nar_string(buf, &name);
+            nar_string(buf, name);
             nar_string(buf, "node");
             match self.files.get(&child) {
                 Some(source) => write_file(buf, source)?,
-                None => self.write_dir(buf, &child)?,
+                None => self.write_dir(buf, &child, children)?,
             }
             nar_string(buf, ")");
         }
         nar_string(buf, ")");
         Ok(())
-    }
-
-    /// Names of the entries directly in `dir`, in NAR order.
-    fn children(&self, dir: &Path) -> BTreeSet<String> {
-        let direct = |p: &PathBuf| {
-            (p.parent() == Some(dir))
-                .then(|| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .flatten()
-        };
-        // `String` orders by bytes, which is the order NAR requires.
-        self.files
-            .keys()
-            .filter_map(direct)
-            .chain(self.dirs.iter().filter_map(direct))
-            .collect()
     }
 
     /// Write the tree below `dest`, as a copy of the source would look.
