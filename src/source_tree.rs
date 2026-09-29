@@ -172,6 +172,30 @@ impl SourceTree {
         }
     }
 
+    /// The same tree with every file but the manifests emptied, see
+    /// `nar::is_manifest`. Cargo plans the same unit graph from it, and it
+    /// only changes when a manifest does or a file appears or disappears.
+    pub(crate) fn manifests_only(&self) -> SourceTree {
+        SourceTree {
+            files: self
+                .files
+                .iter()
+                .map(|(rel, source)| {
+                    let kept = if crate::nar::is_manifest(rel) {
+                        source.clone()
+                    } else {
+                        FileSource::Bytes {
+                            data: Vec::new(),
+                            executable: false,
+                        }
+                    };
+                    (rel.clone(), kept)
+                })
+                .collect(),
+            dirs: self.dirs.clone(),
+        }
+    }
+
     /// The files in `keep`, with only the directories on the way to them.
     pub(crate) fn select(&self, keep: &HashSet<PathBuf>) -> SourceTree {
         let mut tree = SourceTree::default();
@@ -321,6 +345,28 @@ impl ProjectSource {
         let source = Self::new(tree, path.to_string_lossy().into_owned(), Vec::new(), None);
         source.in_store.set(true);
         Ok(source)
+    }
+
+    /// A store directory with the project's manifests at their places, to
+    /// plan the unit graph from: the whole tree when the store holds it, the
+    /// skeleton when there is one, and otherwise the manifests-only form of
+    /// the tree, added under the name `project-src-manifests`.
+    pub(crate) fn graph_source(&self) -> Result<String> {
+        if self.in_store() {
+            return Ok(self.store_path.clone());
+        }
+        if let Some(skeleton) = &self.skeleton {
+            return Ok(skeleton.clone());
+        }
+        let manifests = self.tree.manifests_only();
+        let _span = tracing::info_span!("store_add_manifests").entered();
+        crate::plan_nix::add_source_nar("project-src-manifests", &manifests.nar()?).or_else(|e| {
+            tracing::info!("Daemon add of the manifests failed: {}, using a copy", e);
+            let scratch = tempfile::tempdir().context("Failed to create temp dir for manifests")?;
+            let dest = scratch.path().join("project-src-manifests");
+            manifests.materialise(&dest)?;
+            crate::add_to_nix_store(&dest.to_string_lossy())
+        })
     }
 
     /// Whether the store holds the whole tree.

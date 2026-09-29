@@ -1484,34 +1484,88 @@ fn added_sources(stderr: &str) -> Vec<String> {
         .collect()
 }
 
+/// Plan `project` with `--plan-only` and return the sources the plan added.
+/// The roots file goes outside the project, where it cannot join the
+/// source.
+fn plan_added_sources(project: &Path, label: &str) -> Vec<String> {
+    let roots = project.with_extension(format!("{label}.roots"));
+    let output = Command::new(cargo_schnee_bin())
+        .args(["schnee", "build", "--manifest-path"])
+        .arg(project.join("Cargo.toml"))
+        .arg("--plan-only")
+        .arg(&roots)
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "plan failed:\n{stderr}");
+    added_sources(&stderr)
+}
+
+/// Append a comment unique to this run to `file`, so the store cannot hold
+/// the edited source from an earlier run.
+fn unique_edit(file: &Path) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let body = std::fs::read_to_string(file).unwrap();
+    std::fs::write(file, format!("{body}// {nanos}\n")).unwrap();
+}
+
+/// A project with an external path dependency plans its unit graph from its
+/// manifests alone, so an edit keeps the whole project source out of the
+/// store there too.
+#[test]
+#[ignore]
+fn fixture_edit_with_external_dep_adds_only_its_slice() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("external-{nanos}"));
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["external-path-dep", "external-dep-lib"] {
+        let status = Command::new("cp")
+            .arg("-r")
+            .arg(fixtures.join(name))
+            .arg(root.join(name))
+            .status()
+            .expect("Failed to run cp");
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(root.join(name).join("target"));
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.join(name))
+            .status()
+            .expect("Failed to run git init");
+        assert!(status.success());
+    }
+    let project = root.join("external-path-dep");
+    plan_added_sources(&project, "first");
+
+    unique_edit(&project.join("src/main.rs"));
+    let added = plan_added_sources(&project, "edited");
+
+    assert!(
+        !added.iter().any(|p| p.ends_with("-project-src")),
+        "the whole project source reached the store: {added:?}"
+    );
+    assert_eq!(added.len(), 1, "one source added: {added:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An edit to one crate adds only that crate's slice to the store. The
 /// whole project source stays out of it.
 #[test]
 #[ignore]
 fn fixture_edit_adds_only_its_crate_slice() {
     let project = fresh_fixture_copy("workspace-bins");
-    let plan = |label: &str| {
-        let output = Command::new(cargo_schnee_bin())
-            .args(["schnee", "build", "--manifest-path"])
-            .arg(project.join("Cargo.toml"))
-            .arg("--plan-only")
-            .arg(project.join(format!("{label}.roots")))
-            .env("RUST_LOG", "info")
-            .output()
-            .expect("Failed to execute cargo-schnee");
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        assert!(output.status.success(), "plan failed:\n{stderr}");
-        added_sources(&stderr)
-    };
-    plan("first");
+    plan_added_sources(&project, "first");
 
-    // A unique edit, so the store cannot hold the edited slice from an
-    // earlier run.
-    let main = project.join("bin-a/src/main.rs");
-    let body = std::fs::read_to_string(&main).unwrap();
-    let stamp = project.file_name().unwrap().to_string_lossy().into_owned();
-    std::fs::write(&main, format!("{body}// {stamp}\n")).unwrap();
-    let added = plan("edited");
+    unique_edit(&project.join("bin-a/src/main.rs"));
+    let added = plan_added_sources(&project, "edited");
 
     assert_eq!(added.len(), 1, "one source added: {added:?}");
     assert!(added[0].ends_with("-bin-a"), "{added:?}");

@@ -2034,13 +2034,7 @@ pub fn run_plan_nix(
         } else {
             // Cargo reads only manifests to plan, so the skeleton serves as
             // well as the whole tree and keeps the tree out of the store.
-            let graph_src = match &project.skeleton {
-                Some(skeleton) if !project.in_store() => skeleton.clone(),
-                _ => {
-                    project.ensure_in_store()?;
-                    src_str.clone()
-                }
-            };
+            let graph_src = project.graph_source()?;
             let (mut units, cfg, host_cfg) = fresh_unit_graph(
                 Path::new(&graph_src),
                 vendor_dir,
