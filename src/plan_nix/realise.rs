@@ -42,6 +42,31 @@ pub fn realise_local_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Output paths of every unit of a finished build, for its GC root.
+/// Errors when a unit has no build trace entry, because a root that left
+/// an output out would let a collection force a rebuild.
+pub fn realise_unit_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
+    let mut conn = NixDaemonConn::connect()?;
+    anyhow::ensure!(
+        conn.has_path_keyed_build_trace(),
+        "the Nix daemon does not key its build trace by derivation path"
+    );
+    let jsons: HashMap<&str, &serde_json::Value> = units
+        .iter()
+        .filter_map(|u| Some((u.drv_path.as_deref()?, u.drv_json.as_ref()?)))
+        .collect();
+    let all = units.iter().filter_map(|u| u.drv_path.as_deref());
+    let (out, miss) = local_outputs(all, jsons, |key| conn.query_realisation(key, "out"))?;
+    if let Some(miss) = miss {
+        anyhow::bail!(
+            "no build trace entry for {}, looked up as {}",
+            miss.drv_path,
+            miss.key
+        );
+    }
+    Ok(out)
+}
+
 /// Local units left without a build trace entry. The build has just
 /// succeeded, so every unit's resolved derivation has one, and a miss means
 /// this module resolves differently from Nix.

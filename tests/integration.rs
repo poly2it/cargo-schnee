@@ -343,13 +343,22 @@ fn fixture_build_roots_derivations_and_outputs() {
         drvs.iter().any(|d| d.ends_with("-build-aggregator.drv")),
         "the aggregator derivation is not rooted: {kept:?}"
     );
-    let outputs: Vec<String> = drvs.iter().map(|d| format!("{d}^out")).collect();
-    let mut args = vec!["path-info"];
-    args.extend(outputs.iter().map(String::as_str));
-    for output in nix_lines("nix", &args) {
+    // A content-addressed output carries its derivation's name, so every
+    // rooted derivation must come with a rooted path of the same name.
+    // Matching names keeps the check independent of how the Nix client on
+    // `PATH` looks up the realisation of a derivation with inputs.
+    let name = |path: &str| path.get("/nix/store/".len() + 33..).map(str::to_string);
+    let output_names: Vec<String> = kept
+        .iter()
+        .filter(|p| !p.ends_with(".drv"))
+        .filter_map(|p| name(p))
+        .collect();
+    for drv in &drvs {
+        let wanted = name(drv).unwrap();
+        let wanted = wanted.strip_suffix(".drv").unwrap();
         assert!(
-            kept.contains(&output),
-            "output {output} is not rooted: {kept:?}"
+            output_names.iter().any(|n| n == wanted),
+            "the output of {drv} is not rooted: {kept:?}"
         );
     }
 }

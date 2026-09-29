@@ -66,48 +66,6 @@ pub(crate) fn store_dir() -> String {
     std::env::var("NIX_STORE_DIR").unwrap_or_else(|_| "/nix/store".into())
 }
 
-/// The output paths of the derivations in `drvs`, as a set.
-///
-/// Content-addressed outputs have no path until they are built, so this
-/// asks the store for the realisation of each `<drv>^out`. One
-/// `nix path-info` call covers the whole list.
-pub(crate) fn realised_outputs(drvs: &[String]) -> Result<Vec<String>> {
-    if drvs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut child = Command::new("nix")
-        .args([
-            "path-info",
-            "--extra-experimental-features",
-            "nix-command ca-derivations dynamic-derivations",
-            "--stdin",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to spawn nix path-info")?;
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().context("stdin not piped")?;
-        for drv in drvs {
-            writeln!(stdin, "{drv}^out")?;
-        }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "nix path-info failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
-}
-
 /// The references of the store path that `link` points at, or `None`
 /// when `link` does not point at a valid store path.
 pub(crate) fn references_of_link(link: &Path) -> Option<HashSet<String>> {
@@ -126,35 +84,43 @@ pub(crate) fn references_of_link(link: &Path) -> Option<HashSet<String>> {
 /// what it kept alive becomes collectable again. Returns the text store
 /// path.
 pub(crate) fn register_gc_root(link: &Path, name: &str, paths: &[String]) -> Result<String> {
+    let mut conn = NixDaemonConn::connect().context("Connecting to the Nix daemon")?;
+    register_gc_root_over(&mut conn, link, name, paths)
+}
+
+/// [`register_gc_root`] over an open connection. The connection holds a
+/// temporary root on the text path until it closes, so the path survives
+/// until `link` roots it.
+fn register_gc_root_over(
+    conn: &mut NixDaemonConn,
+    link: &Path,
+    name: &str,
+    paths: &[String],
+) -> Result<String> {
     let mut refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     refs.sort_unstable();
     refs.dedup();
     let content = refs.join("\n");
-
-    // The connection holds a temporary root on the text path until it
-    // closes, so the path survives until `link` roots it.
-    let mut conn = NixDaemonConn::connect().context("Connecting to the Nix daemon")?;
     let root_path = conn
         .add_text_to_store(name, content.as_bytes(), &refs)
         .context("Registering the GC root store path")?;
 
-    if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let output = Command::new("nix-store")
-        .arg("--add-root")
-        .arg(link)
-        .arg("--realise")
-        .arg(&root_path)
-        .output()
-        .context("Failed to run nix-store --add-root")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "nix-store --add-root failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    drop(conn);
+    let dir = link.parent().context("GC root link has no parent")?;
+    std::fs::create_dir_all(dir)?;
+    // Renaming a fresh symlink over the old one replaces the root in one
+    // step, so a collection never sees the link missing.
+    let tmp = dir.join(format!(
+        ".{}.{}",
+        link.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&root_path, &tmp)
+        .with_context(|| format!("Creating {}", tmp.display()))?;
+    std::fs::rename(&tmp, link).with_context(|| format!("Replacing {}", link.display()))?;
+    let absolute = std::path::absolute(link)?;
+    conn.add_indirect_root(&absolute.to_string_lossy())
+        .context("Registering the indirect GC root")?;
     Ok(root_path)
 }
 
@@ -186,5 +152,34 @@ mod tests {
         assert_eq!(store_path_of("/nix/storefront/x", "/nix/store"), None);
         assert_eq!(store_path_of("/nix/store/", "/nix/store"), None);
         assert_eq!(store_path_of("/nix/store", "/nix/store"), None);
+    }
+
+    /// The root must reach the daemon as `wopAddIndirectRoot` over the
+    /// connection, since a `nix-store` spawn would trip the check that a
+    /// warm build realises nothing.
+    #[test]
+    fn registers_the_root_over_the_daemon_connection() {
+        use crate::plan_nix::daemon::fake::{self, Request};
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("target/.schnee-roots/dev-x-build");
+        let paths = vec![
+            "/nix/store/00000000000000000000000000000000-app".to_string(),
+            "/nix/store/11111111111111111111111111111111-app.drv".to_string(),
+        ];
+        let (mut conn, handle) = fake::connect(HashSet::new());
+        let root = register_gc_root_over(&mut conn, &link, "app-build-gc-root", &paths).unwrap();
+        drop(conn);
+
+        assert_eq!(std::fs::read_link(&link).unwrap().to_string_lossy(), root);
+        assert_eq!(
+            handle.join().unwrap(),
+            vec![
+                Request::AddTextToStore {
+                    name: "app-build-gc-root".into(),
+                    references: paths,
+                },
+                Request::AddIndirectRoot(link.to_string_lossy().into_owned()),
+            ]
+        );
     }
 }

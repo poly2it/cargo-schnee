@@ -24,7 +24,7 @@ use derivation::{
     construct_derivation, downstream_placeholder, nix_derivation_add, nix_store_closure,
     self_placeholder,
 };
-pub use realise::realise_local_outputs;
+pub use realise::{realise_local_outputs, realise_unit_outputs};
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_bash, which_clippy_driver, which_command_no_deref,

@@ -11,6 +11,7 @@ const STDERR_ERROR: u64 = 0x63787470;
 // `nix/src/libstore/worker-protocol.hh` enum.
 const WOP_ADD_TO_STORE: u64 = 7;
 const WOP_ADD_TEXT_TO_STORE: u64 = 8;
+const WOP_ADD_INDIRECT_ROOT: u64 = 12;
 const WOP_QUERY_PATH_INFO: u64 = 26;
 const WOP_QUERY_VALID_PATHS: u64 = 31;
 const WOP_QUERY_REALISATION: u64 = 43;
@@ -269,6 +270,19 @@ impl NixDaemonConn {
         Ok(references)
     }
 
+    /// Register `link`, a symlink into the store, as an indirect GC root
+    /// via `wopAddIndirectRoot`. The daemon keeps whatever `link` points
+    /// at for as long as `link` exists.
+    pub(super) fn add_indirect_root(&mut self, link: &str) -> Result<()> {
+        self.write_u64(WOP_ADD_INDIRECT_ROOT)?;
+        self.write_string(link)?;
+        self.flush()?;
+
+        self.process_stderr()?;
+        let _ok = self.read_u64()?;
+        Ok(())
+    }
+
     /// Whether the daemon keys build trace entries by derivation path, so
     /// that [`Self::query_realisation`] can be used.
     pub(super) fn has_path_keyed_build_trace(&self) -> bool {
@@ -502,8 +516,9 @@ mod tests {
 }
 
 /// An in-process stand-in for the Nix daemon on one end of a socket pair.
-/// It speaks the handshake, `wopQueryValidPaths` and `wopAddToStore`, and
-/// records every request it serves.
+/// It speaks the handshake, `wopQueryValidPaths`, `wopAddToStore`,
+/// `wopAddTextToStore` and `wopAddIndirectRoot`, and records every request
+/// it serves.
 #[cfg(test)]
 pub(super) mod fake {
     use super::*;
@@ -520,6 +535,11 @@ pub(super) mod fake {
             references: Vec<String>,
             nar: Vec<u8>,
         },
+        AddTextToStore {
+            name: String,
+            references: Vec<String>,
+        },
+        AddIndirectRoot(String),
     }
 
     /// Connect to a fake daemon that reports `valid` as the valid paths and
@@ -658,6 +678,28 @@ pub(super) mod fake {
                         references,
                         nar,
                     });
+                }
+                WOP_ADD_TEXT_TO_STORE => {
+                    let (Some(name), Some(content), Some(references)) = (
+                        wire.read_string(),
+                        wire.read_bytes(),
+                        wire.read_string_list(),
+                    ) else {
+                        break;
+                    };
+                    let refs: Vec<&str> = references.iter().map(String::as_str).collect();
+                    let path = super::super::aterm::compute_drv_store_path(&name, &content, &refs);
+                    wire.write_u64(STDERR_LAST);
+                    wire.write_string(&path);
+                    requests.push(Request::AddTextToStore { name, references });
+                }
+                WOP_ADD_INDIRECT_ROOT => {
+                    let Some(link) = wire.read_string() else {
+                        break;
+                    };
+                    wire.write_u64(STDERR_LAST);
+                    wire.write_u64(1);
+                    requests.push(Request::AddIndirectRoot(link));
                 }
                 _ => panic!("unexpected opcode {op}"),
             }

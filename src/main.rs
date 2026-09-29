@@ -1828,13 +1828,10 @@ fn root_last_build(
     aggregator_out: &str,
     memoised: &[String],
 ) -> Result<bool> {
-    use plan_nix::store_paths::{
-        realised_outputs, references_of_link, register_gc_root, store_dir, store_path_of,
-    };
+    use plan_nix::store_paths::{references_of_link, register_gc_root, store_dir, store_path_of};
     // The aggregator derivation's path covers every unit derivation, so a
     // root that already names it and the memoised inputs keeps this build.
-    // Skipping the re-registration spares `realised_outputs`, which resolves
-    // every unit.
+    // Skipping the re-registration spares resolving every unit's output.
     let mut identity: Vec<String> = vec![aggregator_drv.to_string(), aggregator_out.to_string()];
     identity.extend(memoised.iter().cloned());
     if let Some(existing) = references_of_link(link)
@@ -1844,7 +1841,7 @@ fn root_last_build(
     }
     let store_dir = store_dir();
     let unit_drvs: Vec<String> = units.iter().filter_map(|u| u.drv_path.clone()).collect();
-    let mut kept: Vec<String> = realised_outputs(&unit_drvs)?;
+    let mut kept: Vec<String> = plan_nix::realise_unit_outputs(units)?;
     kept.extend(unit_drvs);
     kept.extend(identity);
     kept.extend(
