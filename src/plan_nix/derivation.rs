@@ -1,12 +1,17 @@
-use super::util::{collect_store_paths, shell_quote};
-use super::{NixUnit, ProfileConfig, TargetConfig, UnitKind};
-use crate::nix_encoding::{extract_hash_part, hex_lower, nix_base32_encode};
+use super::pipeline::PipelineRole;
+use super::util::{TEST_MANIFEST_DIR_FD, collect_store_paths, shell_quote, test_manifest_dir};
+use super::{NixUnit, TargetConfig, UnitKind};
+use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
 use anyhow::{Context, Result};
-use log::debug;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tracing::debug;
+
+/// The `--json` value for rustc and rustdoc: rendered diagnostics plus one
+/// notice per written artefact.
+const JSON_FLAGS: &str = "--json=diagnostic-rendered-ansi,artifacts";
 
 /// Built-in lookup table mapping `links` values to env vars that tell -sys crates
 /// to use pkg-config instead of building bundled C code.
@@ -21,6 +26,75 @@ const SYS_PKG_CONFIG_ENVS: &[(&str, &str)] = &[
     ("zstd", "ZSTD_SYS_USE_PKG_CONFIG"),
 ];
 
+/// Keys of the build-script-run units whose `cargo:rustc-link-lib` and
+/// `cargo:rustc-link-search` directives reach `unit`'s linker.
+///
+/// Cargo passes a linker only the directives printed by build scripts of the
+/// same compile kind.  `all_dep_keys` crosses that boundary, because a proc
+/// macro is an ordinary `--extern` dep and the closure walk pulls in its
+/// entire host subtree.  Without this filter a cross target unit receives
+/// host library search paths ahead of its own target ones, and rustc resolves
+/// `-l static=foo` against the host directory first, so it hands the target
+/// linker a host-format archive.  The unit's own build script is left out,
+/// because both call sites read it separately.
+fn linked_build_script_keys<'a>(
+    unit: &NixUnit,
+    units: &'a [NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+) -> Vec<&'a str> {
+    unit.all_dep_keys
+        .iter()
+        .filter_map(|dep_key| key_to_idx.get(dep_key))
+        .map(|&dep_idx| &units[dep_idx])
+        .filter(|dep| dep.for_host == unit.for_host)
+        .filter_map(|dep| dep.build_script_dep.as_deref())
+        .filter(|bs_key| unit.build_script_dep.as_deref() != Some(*bs_key))
+        .collect()
+}
+
+/// Packages whose presence among a build script's dependencies shows that
+/// running the script spawns work that honours a job server.  A crate that
+/// reads `CARGO_MAKEFLAGS` itself, such as `cc` with its `parallel` feature,
+/// does so through `jobserver`.  `cmake` and `autotools` hand
+/// `CARGO_MAKEFLAGS` to the `make` they run without that crate.
+const JOBSERVER_BUILD_DEPS: &[&str] = &["autotools", "cmake", "jobserver"];
+
+/// Whether `unit`'s derivation sets `__jobserver`, which makes a Nix with
+/// the `jobserver` experimental feature hand the builder a job server shared
+/// by all builds on the machine in `CARGO_MAKEFLAGS`.
+///
+/// rustc takes a token for each codegen unit it optimises beyond the first,
+/// so every unit that runs codegen opts in.  Check units emit metadata only
+/// and rustdoc runs no codegen, so neither would ever take a token.  A build
+/// script run opts in only when its dependencies show it spawns work that
+/// takes tokens, because the script binary itself never does.
+fn joins_jobserver(unit: &NixUnit, units: &[NixUnit], key_to_idx: &HashMap<String, usize>) -> bool {
+    if unit.pipeline == PipelineRole::Metadata {
+        return false;
+    }
+    match unit.kind {
+        UnitKind::Compile | UnitKind::TestCompile | UnitKind::BuildScriptCompile => true,
+        UnitKind::Check | UnitKind::Doc => false,
+        UnitKind::BuildScriptRun => unit
+            .build_script_compile_key
+            .as_ref()
+            .and_then(|key| key_to_idx.get(key))
+            .is_some_and(|&idx| {
+                units[idx]
+                    .all_dep_keys
+                    .iter()
+                    .filter_map(|dep_key| key_to_idx.get(dep_key))
+                    .any(|&dep_idx| is_jobserver_build_dep(&units[dep_idx]))
+            }),
+    }
+}
+
+fn is_jobserver_build_dep(unit: &NixUnit) -> bool {
+    unit.cargo_envs
+        .iter()
+        .any(|(k, v)| k == "CARGO_PKG_NAME" && JOBSERVER_BUILD_DEPS.contains(&v.as_str()))
+}
+
 /// Build the derivation JSON for a single unit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn construct_derivation(
@@ -29,6 +103,9 @@ pub(super) fn construct_derivation(
     key_to_idx: &HashMap<String, usize>,
     dep_drv_map: &HashMap<String, String>,
     bash_path: &str,
+    // Store root containing `bash_path`'s binary.  Must be in `inputSrcs`
+    // so the sandbox bind-mounts the builder; see `util::which_bash`.
+    bash_store: &str,
     rustc_path: &str,
     rustdoc_path: &str,
     proc_macro_rlib: &str,
@@ -42,7 +119,6 @@ pub(super) fn construct_derivation(
     pkg_config_bin: &Option<String>,
     pkg_config_path: &str,
     sys_build_closure: &[String],
-    profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     host_cfg_envs: &[(String, String)],
@@ -54,9 +130,48 @@ pub(super) fn construct_derivation(
     src_store: &str,
     document_private_items: bool,
     passthru_closure: &[String],
+    // When `Some`, swap rustc for clippy-driver on local (workspace) compile
+    // units.  Dep units keep using rustc so their per-unit derivations stay
+    // byte-identical to a regular check / build run.
+    clippy_path: Option<&str>,
+    // clippy-driver's nix store closure.  Only added to inputSrcs of units
+    // that actually use clippy_path so dep units are unaffected.
+    clippy_closure: &[String],
+    // Lint args forwarded to clippy-driver after the rustc command line.
+    // Only applied to units that actually run clippy so dep-unit derivation
+    // hashes stay stable when the caller toggles deny-warnings on or off.
+    clippy_lint_args: &[String],
+    // `--remap-path-prefix` rules to inject into every compile unit's rustc
+    // command line.  Each pair is `(src_relative, replacement)` where
+    // `src_relative` is interpreted relative to `src_store` — empty string
+    // remaps the project-src root itself.  Sorted shortest-first inside
+    // `build_compile_script` so rustc's "last matching wins" rule resolves
+    // longer (more specific) entries on top of shorter ones.
+    path_prefix_remaps: &[(String, String)],
+    // Store paths of caller-supplied setup scripts, in rule order, sourced
+    // into the unit's sandbox right before the driver / build-script
+    // invocation.  Empty for units no rule matches, keeping those units'
+    // derivations byte-identical to a run without rules.  The paths land
+    // in `inputSrcs` via the `collect_store_paths` scan of the script
+    // text, so the scripts and their reference closures are mounted with
+    // no extra plumbing.
+    setup_scripts: &[String],
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+
+    // Decide whether this unit should be linted.  Doc and BuildScriptRun
+    // are excluded — Doc runs rustdoc, BuildScriptRun executes a binary.
+    // Only local (workspace) units swap; deps keep their cached rustc drvs.
+    let use_clippy = clippy_path.is_some()
+        && unit.is_local
+        && !matches!(unit.kind, UnitKind::Doc | UnitKind::BuildScriptRun);
+    let effective_rustc = if use_clippy {
+        clippy_path.unwrap()
+    } else {
+        rustc_path
+    };
+
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -69,13 +184,13 @@ pub(super) fn construct_derivation(
             cc_bin_dir,
             pkg_config_bin,
             pkg_config_path,
-            profile,
             target,
             cfg_envs,
             host_cfg_envs,
             custom_sys_env,
             passthru_envs,
             src_store,
+            setup_scripts,
         )?,
         UnitKind::Doc => build_doc_script(
             unit,
@@ -86,20 +201,26 @@ pub(super) fn construct_derivation(
             resolved_sysroot,
             &coreutils_bin_dir,
             document_private_items,
+            path_prefix_remaps,
+            src_store,
+            setup_scripts,
         )?,
         _ => build_compile_script(
             unit,
             units,
             key_to_idx,
             dep_drv_map,
-            rustc_path,
+            effective_rustc,
             proc_macro_rlib,
             resolved_sysroot,
             &coreutils_bin_dir,
             cc_bin_dir,
-            profile,
             target,
             win_sdk_lib_dirs,
+            if use_clippy { clippy_lint_args } else { &[] },
+            path_prefix_remaps,
+            src_store,
+            setup_scripts,
         )?,
     };
 
@@ -117,6 +238,13 @@ pub(super) fn construct_derivation(
         "allowSubstitutes".into(),
         serde_json::Value::String("".into()),
     );
+    // Set on every machine, so that a unit keeps one derivation path whether
+    // or not the daemon that builds it knows the attribute.  A Nix without
+    // the `jobserver` experimental feature passes it through as a plain
+    // environment variable.
+    if joins_jobserver(unit, units, key_to_idx) {
+        env.insert("__jobserver".into(), serde_json::Value::String("1".into()));
+    }
 
     // inputDrvs
     let mut input_drvs = serde_json::Map::new();
@@ -156,15 +284,12 @@ pub(super) fn construct_derivation(
                 .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
         }
     }
-    // For linking: add all transitive build script run outputs to inputDrvs.
-    // Their `cargo:rustc-link-lib` and `cargo:rustc-link-search` directives need
-    // to be read at build time and passed to the linker.
+    // For linking: add every build-script-run output whose link directives
+    // this unit replays.  The script builder walks the same set, so an output
+    // that cannot change the compiler invocation is not an input either.
     if unit.needs_linker && unit.kind != UnitKind::BuildScriptRun {
-        for dep_key in &unit.all_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key)
-                && let Some(ref bs_key) = units[dep_idx].build_script_dep
-                && let Some(drv) = dep_drv_map.get(bs_key)
-            {
+        for bs_key in linked_build_script_keys(unit, units, key_to_idx) {
+            if let Some(drv) = dep_drv_map.get(bs_key) {
                 input_drvs.entry(drv.clone()).or_insert_with(
                     || serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}),
                 );
@@ -178,7 +303,18 @@ pub(super) fn construct_derivation(
     for path in rustc_closure {
         input_srcs.insert(path.clone());
     }
+    // clippy-driver's closure is added only to local units that actually run
+    // clippy.  Adding it unconditionally would invalidate dep unit caches.
+    if use_clippy {
+        for path in clippy_closure {
+            input_srcs.insert(path.clone());
+        }
+    }
     input_srcs.insert(coreutils_store.to_string());
+    // The builder shells out via `bash_path`; its containing store root
+    // must be bind-mounted into the sandbox or the build fails before any
+    // user code runs.
+    input_srcs.insert(bash_store.to_string());
 
     if unit.needs_linker || unit.kind == UnitKind::BuildScriptRun {
         for path in cc_closure {
@@ -231,9 +367,70 @@ pub(super) fn construct_derivation(
     }))
 }
 
+/// Build the `--remap-path-prefix` argument tokens for a unit.
+///
+/// `path_prefix_remaps` are `(src_relative, replacement)` pairs expressed
+/// relative to the *project-src* root, so callers need not know the build's
+/// content-addressed hash. `src_store` is the unit's actual source store: the
+/// project-src store for non-sliced units, or a flat per-crate
+/// `<hash>-<member>` store for sliced ones (`assign_per_crate_src_stores`).
+///
+/// rustc resolves overlapping remaps "last matching wins", so emit shortest
+/// `src_relative` first and let longer (more specific) entries override.
+///
+/// `sliced_crate_rel` re-roots the project-src-root remap for a sliced local
+/// crate. Without it, `--remap-path-prefix <crate_store>=<replacement>`
+/// collapses `<crate_store>/src/x` to `<replacement>/src/x`, dropping the
+/// `<member>/` directory and colliding every crate's `src/lib.rs`. With it the
+/// root remap targets `<replacement>/<crate_rel>` so the crate keeps its real
+/// workspace path. Only the root remap (`src_relative == ""`) is adjusted; a
+/// non-root remap names a subpath that, for a sliced crate, refers to an
+/// external source not under this crate store and simply will not match.
+fn remap_args(
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
+    sliced_crate_rel: Option<&str>,
+) -> Vec<String> {
+    let mut sorted: Vec<&(String, String)> = path_prefix_remaps.iter().collect();
+    sorted.sort_by_key(|(src_relative, _)| src_relative.len());
+    let mut out = Vec::new();
+    for (src_relative, replacement) in sorted {
+        let from = if src_relative.is_empty() {
+            src_store.to_string()
+        } else {
+            format!("{}/{}", src_store, src_relative)
+        };
+        let to = match sliced_crate_rel {
+            Some(rel) if src_relative.is_empty() => format!("{}/{}", replacement, rel),
+            _ => replacement.clone(),
+        };
+        out.push("--remap-path-prefix".into());
+        out.push(shell_quote(&format!("{}={}", from, to)));
+    }
+    out
+}
+
+/// Shell fragment sourcing each caller-supplied setup script in rule
+/// order, with `SCHNEE_AUX_DIR` — the unit's auxiliary output channel —
+/// exported first.  Callers place it after the cargo env exports and the
+/// `mkdir` that creates `$out`, immediately before the driver invocation,
+/// so a script's exports persist into the driver and an EXIT trap it sets
+/// fires after the work completes.  Empty when no rule matched, keeping
+/// non-matching units byte-identical to a run without rules.
+fn setup_source_fragment(setup_scripts: &[String]) -> String {
+    if setup_scripts.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("export SCHNEE_AUX_DIR=$out/schnee-aux && ");
+    for script in setup_scripts {
+        s.push_str(&format!(". {} && ", shell_quote(script)));
+    }
+    s
+}
+
 /// Build the shell script for a regular compilation or build-script compilation.
 #[allow(clippy::too_many_arguments)]
-fn build_compile_script(
+pub(super) fn build_compile_script(
     unit: &NixUnit,
     units: &[NixUnit],
     key_to_idx: &HashMap<String, usize>,
@@ -243,9 +440,19 @@ fn build_compile_script(
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
     cc_bin_dir: &str,
-    profile: &ProfileConfig,
     target: &TargetConfig,
     win_sdk_lib_dirs: &[String],
+    // Extra rustc / clippy-driver flags appended after every other
+    // arg.  Used to forward post-`--` clippy lint flags such as
+    // `--deny warnings`; empty for normal compile units.
+    extra_rustc_args: &[String],
+    // `--remap-path-prefix` rules.  See `construct_derivation` doc.
+    path_prefix_remaps: &[(String, String)],
+    // Project-src store path; remaps with `src_relative = ""` rewrite this
+    // root, longer entries rewrite subdirectories.
+    src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -311,8 +518,12 @@ fn build_compile_script(
         parts.push("prefer-dynamic".into());
     }
 
-    // --test for test harness units (test and bench both use CompileMode::Test)
-    if unit.kind == UnitKind::TestCompile {
+    // --test for test harness units (test and bench both use
+    // CompileMode::Test) AND for any Check unit pulled in via
+    // `--all-targets` whose mode is `CompileMode::Check { test: true }`
+    // — integration tests need rustc to synthesise a `main` and the
+    // harness even in check/clippy intent.
+    if unit.kind == UnitKind::TestCompile || unit.compile_test {
         parts.push("--test".into());
     }
 
@@ -345,8 +556,10 @@ fn build_compile_script(
 
     // Emit JSON diagnostics with ANSI colors pre-baked by rustc.
     // cargo-schnee parses these and renders via cargo's Shell::print_ansi_stderr().
+    // The artifact notices mark when the `.rmeta` is written, which a build
+    // profile shows inside the unit's span, and the renderer skips them.
     parts.push("--error-format=json".into());
-    parts.push("--json=diagnostic-rendered-ansi".into());
+    parts.push(JSON_FLAGS.into());
 
     // -C extra-filename and -C metadata
     parts.push("-C".into());
@@ -355,14 +568,10 @@ fn build_compile_script(
     // metadata = extra_filename without leading dash
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
 
-    // Profile optimization flags
-    if profile.opt_level != "0" {
-        parts.push("-C".into());
-        parts.push(format!("opt-level={}", profile.opt_level));
-    }
-    if !profile.debug_info {
-        parts.push("-C".into());
-        parts.push("debuginfo=0".into());
+    parts.extend(unit.profile.rustc_args.iter().cloned());
+    if unit.pipeline == PipelineRole::Metadata {
+        parts.push("-Z".into());
+        parts.push("no-codegen".into());
     }
 
     // --extern deps
@@ -374,7 +583,7 @@ fn build_compile_script(
             parts.push("--extern".into());
             parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
         } else {
-            log::warn!(
+            tracing::warn!(
                 "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
                 unit.key,
                 extern_name,
@@ -390,6 +599,28 @@ fn build_compile_script(
             parts.push("-L".into());
             parts.push(format!("dependency={}", placeholder));
         }
+    }
+
+    // `--remap-path-prefix`: rewrite source paths in diagnostics, debug
+    // info, and macro expansions.  Each `(src_relative, replacement)` is
+    // interpreted relative to `src_store` so callers don't have to know the
+    // per-build content-addressed hash; empty `src_relative` rewrites the
+    // project-src root itself.  rustc resolves multiple remaps with
+    // "last matching wins" — sort shortest-first so longer (more specific)
+    // entries override shorter ones for paths that match both.
+    parts.extend(remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    ));
+
+    // Caller-supplied flags forwarded to clippy-driver (or rustc).  For
+    // clippy units this is e.g. `["--deny", "warnings"]` from
+    // `cargo schnee clippy -- --deny warnings`; empty for regular
+    // compile units.  Appended last so the deny level applies on top of
+    // any allow level set by earlier flags.
+    for arg in extra_rustc_args {
+        parts.push(shell_quote(arg));
     }
 
     // Build the script
@@ -415,25 +646,17 @@ fn build_compile_script(
         ));
     }
 
-    // For linking: read cargo:rustc-link-lib and cargo:rustc-link-search from
-    // ALL transitive dependencies' build script outputs. Cargo propagates these
-    // to the final linker invocation.
+    // For linking: read `cargo:rustc-link-lib` and `cargo:rustc-link-search`
+    // from the transitive dependencies of this unit's own compile kind, which
+    // is the set cargo propagates to the final linker invocation.
     if unit.needs_linker {
-        for dep_key in &unit.all_dep_keys {
-            if let Some(&dep_idx) = key_to_idx.get(dep_key)
-                && let Some(ref bs_key) = units[dep_idx].build_script_dep
-            {
-                // Skip own build script (already handled above)
-                if unit.build_script_dep.as_ref() == Some(bs_key) {
-                    continue;
-                }
-                if let Some(bs_drv) = dep_drv_map.get(bs_key) {
-                    let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
-                    script.push_str(&format!(
-                        r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
-                        ph = bs_placeholder,
-                    ));
-                }
+        for bs_key in linked_build_script_keys(unit, units, key_to_idx) {
+            if let Some(bs_drv) = dep_drv_map.get(bs_key) {
+                let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
+                script.push_str(&format!(
+                    r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
+                    ph = bs_placeholder,
+                ));
             }
         }
     }
@@ -442,53 +665,56 @@ fn build_compile_script(
     for (k, v) in &unit.cargo_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
-    // For TestCompile units, use a deterministic /tmp symlink as
-    // CARGO_MANIFEST_DIR. At compile time the symlink points to the store
-    // path so proc macros (e.g. sqlx::migrate!) can read files. At test
-    // runtime the same path is re-symlinked to the writable project dir,
-    // so both env!("CARGO_MANIFEST_DIR") and std::env::var() resolve to
-    // a readable+writable location.
-    let tmp_manifest_path;
-    let manifest_dir_for_compile =
-        if unit.kind == UnitKind::TestCompile && !unit.original_manifest_dir.is_empty() {
-            let hash = {
-                let mut hasher = Sha256::new();
-                hasher.update(unit.original_manifest_dir.as_bytes());
-                hex_lower(&hasher.finalize()[..8])
-            };
-            tmp_manifest_path = format!("/tmp/_schnee_md_{}", hash);
-            let ln_path = format!("{}/ln", coreutils_bin_dir);
-            script.push_str(&format!(
-                "{} -sfn {} {} && ",
-                shell_quote(&ln_path),
-                shell_quote(&unit.manifest_dir),
-                shell_quote(&tmp_manifest_path),
-            ));
-            &tmp_manifest_path
-        } else {
-            &unit.manifest_dir
-        };
+    // A test binary bakes in `test_manifest_dir()`, which the test runner
+    // later points at the writable checkout. Here it resolves to the store
+    // path for rustc and the proc macros it loads.
+    let test_manifest_path;
+    let manifest_dir_for_compile = if unit.kind == UnitKind::TestCompile {
+        test_manifest_path = test_manifest_dir();
+        script.push_str(&format!(
+            "exec {TEST_MANIFEST_DIR_FD}<{} && ",
+            shell_quote(&unit.manifest_dir),
+        ));
+        &test_manifest_path
+    } else {
+        &unit.manifest_dir
+    };
     script.push_str(&format!(
         "export CARGO_MANIFEST_DIR={} && ",
         shell_quote(manifest_dir_for_compile)
     ));
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
-    let cat_path = format!("{}/cat", coreutils_bin_dir);
+    // The mkdir stays ahead of the setup hook so `$out` (and thereby
+    // SCHNEE_AUX_DIR's parent) exists before the first script sources.
+    script.push_str(&format!("{} -p $out && ", shell_quote(&mkdir_path)));
+    script.push_str(&setup_source_fragment(setup_scripts));
+    if unit.pipeline != PipelineRole::Off {
+        script.push_str("export RUSTC_BOOTSTRAP=1 && ");
+    }
+    // `$out/diagnostics` keeps rustc's `stderr` for replay on cached builds.
+    // `tee` also passes each line on as rustc writes it, because the build
+    // log's timestamps are what a profile reads the `rmeta` notification of
+    // `--json=artifacts` from.  rustc's `stdout` goes around the pipe on
+    // descriptor 3.
     script.push_str(&format!(
-        "{} -p $out && {} {}",
-        shell_quote(&mkdir_path),
+        "{{ {} {} $EXTRA_ARGS 2>&1 1>&3 3>&- | {} $out/diagnostics >&2 3>&-; __rs=${{PIPESTATUS[0]}}; }} 3>&1; ",
         shell_quote(rustc_path),
         parts.join(" "),
+        shell_quote(&format!("{}/tee", coreutils_bin_dir)),
     ));
-
-    // Append $EXTRA_ARGS (own + transitive build script link directives)
-    // Capture stderr to $out/diagnostics for replay on cached builds,
-    // then replay to stderr for live display. Preserve rustc exit code.
-    script.push_str(&format!(
-        " $EXTRA_ARGS 2>$out/diagnostics; __rs=$?; {} $out/diagnostics >&2; exit $__rs",
-        shell_quote(&cat_path),
-    ));
+    // `-Z no-codegen` still writes an `.rlib` without object code.  A
+    // consumer resolving a transitive crate through `-L dependency=` could
+    // pick it over the `.rmeta`, so it must not reach `$out`.
+    if unit.pipeline == PipelineRole::Metadata {
+        script.push_str(&format!(
+            "{} -f $out/lib{}{}.rlib; ",
+            shell_quote(&format!("{}/rm", coreutils_bin_dir)),
+            unit.crate_name,
+            unit.extra_filename,
+        ));
+    }
+    script.push_str("exit $__rs");
 
     Ok(script)
 }
@@ -504,6 +730,10 @@ fn build_doc_script(
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
     document_private_items: bool,
+    path_prefix_remaps: &[(String, String)],
+    src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -543,7 +773,7 @@ fn build_doc_script(
 
     // JSON diagnostics
     parts.push("--error-format=json".into());
-    parts.push("--json=diagnostic-rendered-ansi".into());
+    parts.push(JSON_FLAGS.into());
 
     // --document-private-items if requested
     if document_private_items && unit.is_local {
@@ -553,6 +783,26 @@ fn build_doc_script(
     // -C metadata (rustdoc uses this for cross-crate link stability)
     parts.push("-C".into());
     parts.push(format!("metadata={}", &unit.extra_filename[1..]));
+
+    // `--remap-path-prefix`: rewrite source paths in rustdoc diagnostics so
+    // they match the repo, same as the compile path. Without this, doc lints
+    // surface raw `<store>/...` paths no downstream mapper can resolve.
+    //
+    // Unlike rustc, where `--remap-path-prefix` is stable, rustdoc gates the
+    // flag behind `-Z unstable-options`. The pinned toolchain reports as
+    // stable, so `RUSTC_BOOTSTRAP` is exported below to let rustdoc accept the
+    // unstable flag. Only emit the gate when there are remaps to apply.
+    let remap = remap_args(
+        path_prefix_remaps,
+        src_store,
+        unit.sliced_crate_rel.as_deref(),
+    );
+    let needs_unstable_options = !remap.is_empty();
+    if needs_unstable_options {
+        parts.push("-Z".into());
+        parts.push("unstable-options".into());
+    }
+    parts.extend(remap);
 
     // --extern deps — point to .rmeta/.rlib from dependency compile outputs
     for (extern_name, dep_key) in &unit.dep_extern {
@@ -580,6 +830,12 @@ fn build_doc_script(
     // Initialize EXTRA_ARGS for build script directives
     script.push_str(r#"EXTRA_ARGS="" && "#);
 
+    // Let the stable-reporting toolchain accept the `-Z unstable-options`
+    // gate that rustdoc requires for `--remap-path-prefix`.
+    if needs_unstable_options {
+        script.push_str("export RUSTC_BOOTSTRAP=1 && ");
+    }
+
     // Parse build script output if we depend on one
     if let Some(ref bs_key) = unit.build_script_dep
         && let Some(bs_drv) = dep_drv_map.get(bs_key)
@@ -602,9 +858,12 @@ fn build_doc_script(
 
     let mkdir_path = format!("{}/mkdir", coreutils_bin_dir);
     let cat_path = format!("{}/cat", coreutils_bin_dir);
+    // The mkdir stays ahead of the setup hook so `$out` (and thereby
+    // SCHNEE_AUX_DIR's parent) exists before the first script sources.
+    script.push_str(&format!("{} -p $out/doc && ", shell_quote(&mkdir_path)));
+    script.push_str(&setup_source_fragment(setup_scripts));
     script.push_str(&format!(
-        "{} -p $out/doc && {} {}",
-        shell_quote(&mkdir_path),
+        "{} {}",
         shell_quote(rustdoc_path),
         parts.join(" "),
     ));
@@ -617,6 +876,21 @@ fn build_doc_script(
 
     Ok(script)
 }
+
+/// Shell fragment that follows a local build script's run. A local build
+/// script sees only its package directory and the files its package's
+/// `extra-includes` names, so for each path the script names in
+/// `rerun-if-changed` that its sandbox lacks, it prints the path and the
+/// key that would provide it. It then exits with the script's status.
+const MISSING_INPUT_REPORT: &str = concat!(
+    r#"; _bs_rc=$?; if [ -f $out/output ]; then while IFS= read -r _line; do"#,
+    r#" case "$_line" in cargo:rerun-if-changed=*|cargo::rerun-if-changed=*)"#,
+    r#" _p="${_line#*rerun-if-changed=}"; [ -e "$_p" ] ||"#,
+    r#" echo "cargo-schnee: the build script of $CARGO_PKG_NAME names $_p, which is not in"#,
+    r#" its sandbox. A build script sees only its package directory and the files that"#,
+    r#" [package.metadata.schnee] extra-includes in its Cargo.toml names." >&2 ;;"#,
+    r#" esac; done < $out/output; fi; [ $_bs_rc -eq 0 ]"#,
+);
 
 /// Build the shell script for running a build script.
 #[allow(clippy::too_many_arguments)]
@@ -631,13 +905,14 @@ fn build_run_script(
     cc_bin_dir: &str,
     pkg_config_bin: &Option<String>,
     pkg_config_path: &str,
-    profile: &ProfileConfig,
     target: &TargetConfig,
     cfg_envs: &[(String, String)],
     host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
     src_store: &str,
+    // Matched setup script store paths.  See `construct_derivation` doc.
+    setup_scripts: &[String],
 ) -> Result<String> {
     // The build script compile derivation provides the binary
     let bs_compile_key = unit
@@ -712,12 +987,9 @@ fn build_run_script(
     script.push_str(&format!("export HOST={} && ", target.host_triple));
     script.push_str(&format!("export TARGET={} && ", effective_target));
     script.push_str("export NUM_JOBS=1 && ");
-    script.push_str(&format!("export OPT_LEVEL={} && ", profile.opt_level));
-    script.push_str(&format!(
-        "export DEBUG={} && ",
-        if profile.debug_info { "true" } else { "false" }
-    ));
-    script.push_str(&format!("export PROFILE={} && ", profile.name));
+    script.push_str(&format!("export OPT_LEVEL={} && ", unit.profile.opt_level));
+    script.push_str(&format!("export DEBUG={} && ", unit.profile.debug));
+    script.push_str(&format!("export PROFILE={} && ", unit.profile.root));
 
     // Cargo target cfg vars (extracted from rustc --print cfg via cargo internals).
     // Host-compiled crates use the host's cfg values, not the cross target's.
@@ -861,10 +1133,18 @@ fn build_run_script(
         "WDIRS_EOF\n",
     ));
     script.push_str("cc -shared -fPIC -o $TMPDIR/_wdirs.so $TMPDIR/_wdirs.c -ldl && ");
+    // Setup hook: `$out` already exists (mkdir at the top of this script)
+    // and every cargo env export — including the workdir-rewritten
+    // CARGO_MANIFEST_DIR — is in place, so scripts see the same
+    // environment the build script binary is about to run under.
+    script.push_str(&setup_source_fragment(setup_scripts));
     script.push_str(&format!(
         "cd $_bs_workdir && LD_PRELOAD=$TMPDIR/_wdirs.so {}/{} > $out/output",
         bs_placeholder, bs_binary,
     ));
+    if unit.is_local {
+        script.push_str(MISSING_INPUT_REPORT);
+    }
     // Rewrite workdir paths back to the original Nix store path so that
     // cargo:rustc-link-search directives survive to the linking derivation.
     // Use pure bash (no sed) since gnused isn't in the sandbox PATH.
@@ -897,8 +1177,12 @@ pub(super) fn nix_store_closure(store_path: &str) -> Result<Vec<String>> {
 }
 
 pub(super) fn nix_derivation_add(json: &serde_json::Value) -> Result<String> {
-    let json_str = serde_json::to_string(json)?;
-    debug!("nix derivation add input: {}", json_str);
+    use super::derivation_format::{NixDerivation, StoreDir, TargetNix};
+    let target = TargetNix::detect()?;
+    let store = StoreDir::detect();
+    let derivation = NixDerivation::from_ir(json, target, &store)?;
+    let json_str = serde_json::to_string(&derivation)?;
+    debug!("nix derivation add input ({:?}): {}", target, json_str);
     let mut child = Command::new("nix")
         .args([
             "derivation",
@@ -961,6 +1245,119 @@ pub(super) fn self_placeholder(output_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_input_report_names_the_absent_path_and_keeps_the_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("build.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.join("output"),
+            "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-changed=../spec/api.json\n",
+        )
+        .unwrap();
+        let run = |status: i32| {
+            Command::new("bash")
+                .arg("-c")
+                .arg(format!("(exit {status}){MISSING_INPUT_REPORT}"))
+                .current_dir(dir)
+                .env("out", dir)
+                .env("CARGO_PKG_NAME", "app")
+                .output()
+                .unwrap()
+        };
+
+        let failed = run(101);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(!failed.status.success());
+        assert!(
+            stderr.contains("the build script of app names ../spec/api.json"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("extra-includes"), "{stderr}");
+        assert!(!stderr.contains("names build.rs"), "{stderr}");
+        assert!(run(0).status.success());
+    }
+
+    // The project-src root remap that the consumer expresses via
+    // `sourceRootPrefix = "crates"`: rewrite the project-src store root to
+    // `crates`.
+    fn root_remap() -> Vec<(String, String)> {
+        vec![(String::new(), "crates".to_string())]
+    }
+
+    #[test]
+    fn remap_non_sliced_root_maps_store_to_replacement() {
+        let args = remap_args(&root_remap(), "/nix/store/h-project-src", None);
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-project-src=crates"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_root_preserves_member_dir() {
+        // A per-crate-sliced unit's src_store is the flat `<hash>-<member>`
+        // store. The root remap must target `crates/<member>`, not bare
+        // `crates`, or the member directory is dropped and every crate's
+        // `src/lib.rs` collapses to `crates/src/lib.rs`.
+        let args = remap_args(&root_remap(), "/nix/store/h-app-common", Some("app-common"));
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-app-common=crates/app-common"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sliced_member_under_subdir() {
+        // crate_rel carries the full project-src-relative path, including any
+        // parent dirs (a non-flat `crates/<member>` workspace layout).
+        let args = remap_args(
+            &root_remap(),
+            "/nix/store/h-browser-shim",
+            Some("crates/app-browser-shim"),
+        );
+        assert_eq!(
+            args[1],
+            shell_quote("/nix/store/h-browser-shim=crates/crates/app-browser-shim"),
+        );
+    }
+
+    #[test]
+    fn remap_non_root_entry_not_crate_rel_adjusted() {
+        // Non-root remaps (e.g. extraSources identity remaps) target a
+        // specific subpath; for a sliced crate they reference an external
+        // source not under this crate store, so they keep `replacement`
+        // verbatim and simply will not match this crate's paths.
+        let remaps = vec![("sub/dir".to_string(), "X".to_string())];
+        let args = remap_args(&remaps, "/nix/store/h-crate", Some("member"));
+        assert_eq!(
+            args,
+            vec![
+                "--remap-path-prefix".to_string(),
+                shell_quote("/nix/store/h-crate/sub/dir=X"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_sorts_shortest_src_relative_first() {
+        // rustc resolves overlapping remaps "last matching wins", so the
+        // most specific (longest src_relative) must be emitted last.
+        let remaps = vec![
+            ("aa/bb".to_string(), "deep".to_string()),
+            (String::new(), "root".to_string()),
+        ];
+        let args = remap_args(&remaps, "/nix/store/h-src", None);
+        assert_eq!(args[1], shell_quote("/nix/store/h-src=root"));
+        assert_eq!(args[3], shell_quote("/nix/store/h-src/aa/bb=deep"));
+    }
 
     #[test]
     fn self_placeholder_format() {
@@ -1035,7 +1432,12 @@ mod tests {
             is_root: true,
             target_name: name.to_string(),
             for_host: false,
+            compile_test: false,
+            sliced_crate_rel: None,
+            profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
+            drv_json: None,
         }
     }
 
@@ -1055,6 +1457,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1082,6 +1487,39 @@ mod tests {
         assert!(script.contains("diagnostics"));
         // Must NOT have --document-private-items
         assert!(!script.contains("--document-private-items"));
+        // With no remaps there is nothing to gate, so no unstable opt-in.
+        assert!(!script.contains("-Z unstable-options"));
+        assert!(!script.contains("RUSTC_BOOTSTRAP"));
+    }
+
+    #[test]
+    fn build_doc_script_remap_opts_into_unstable_options() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let dep_drv_map = HashMap::new();
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &root_remap(),
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
+        )
+        .unwrap();
+
+        // rustdoc gates `--remap-path-prefix` behind `-Z unstable-options`,
+        // which the stable-reporting toolchain only accepts with
+        // `RUSTC_BOOTSTRAP` set.
+        assert!(script.contains("--remap-path-prefix"));
+        assert!(script.contains("-Z unstable-options"));
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 &&"));
     }
 
     #[test]
@@ -1100,6 +1538,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1122,6 +1563,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             true,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1145,6 +1589,9 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
@@ -1168,10 +1615,237 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
         assert!(script.contains("--cap-lints allow"));
+    }
+
+    // -- unit setup script tests ---------------------------------------------
+
+    const SETUP_A: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-setup-a.sh";
+    const SETUP_B: &str = "/nix/store/cccccccccccccccccccccccccccccccc-setup-b.sh";
+    const SRC_STORE: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src";
+
+    fn make_check_unit(name: &str) -> NixUnit {
+        let mut unit = make_doc_unit(name, &[], &[], true);
+        unit.kind = UnitKind::Check;
+        unit.key = format!("{}-check", name);
+        unit
+    }
+
+    fn check_script(setup_scripts: &[String]) -> String {
+        let units = vec![make_check_unit("my-lib")];
+        let key_to_idx = HashMap::from([("my-lib-check".to_string(), 0_usize)]);
+        build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            setup_scripts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compile_script_requests_artifact_notices() {
+        assert!(check_script(&[]).contains(" --json=diagnostic-rendered-ansi,artifacts "));
+    }
+
+    #[test]
+    fn check_script_sources_setup_between_envs_and_driver() {
+        // The sourcing fragment sits after the CARGO_MANIFEST_DIR export
+        // and before the driver invocation, with `mkdir -p $out` and the
+        // SCHNEE_AUX_DIR export preceding it — so a script's exports are
+        // readable, $out exists, and its exports reach the driver.
+        let script = check_script(&[SETUP_A.to_string()]);
+        let manifest = script.find("export CARGO_MANIFEST_DIR=").unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out && ")
+            .unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let driver = script.find("/nix/store/rustc-bin/bin/rustc").unwrap();
+        assert!(manifest < mkdir, "mkdir must follow the cargo env exports");
+        assert!(mkdir < aux, "$out must exist before SCHNEE_AUX_DIR is set");
+        assert!(
+            aux < source,
+            "SCHNEE_AUX_DIR must be exported before sourcing"
+        );
+        assert!(
+            source < driver,
+            "scripts must source before the driver runs"
+        );
+    }
+
+    #[test]
+    fn check_script_sources_two_scripts_in_list_order() {
+        let script = check_script(&[SETUP_A.to_string(), SETUP_B.to_string()]);
+        let a = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let b = script.find(&format!(". {} && ", SETUP_B)).unwrap();
+        assert!(a < b, "matched scripts must source in rule order");
+    }
+
+    #[test]
+    fn check_script_without_setup_is_byte_identical_to_pre_feature_shape() {
+        // No matched scripts: no hook artefacts at all, and the mkdir
+        // stays directly adjacent to the driver invocation — the exact
+        // pre-feature byte layout.
+        let script = check_script(&[]);
+        assert!(!script.contains("SCHNEE_AUX_DIR"));
+        assert!(script.contains(
+            "/nix/store/coreutils/bin/mkdir -p $out && { /nix/store/rustc-bin/bin/rustc"
+        ));
+        // And the with-scripts variant differs only by the inserted
+        // fragment: removing it restores the byte-identical script.
+        let with = check_script(&[SETUP_A.to_string()]);
+        let fragment = format!("export SCHNEE_AUX_DIR=$out/schnee-aux && . {} && ", SETUP_A);
+        assert_eq!(with.replacen(&fragment, "", 1), script);
+    }
+
+    #[test]
+    fn doc_script_sources_setup_between_mkdir_and_rustdoc() {
+        let unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-lib-doc".to_string(), 0_usize)]);
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &[],
+            SRC_STORE,
+            &[SETUP_A.to_string()],
+        )
+        .unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out/doc && ")
+            .unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let driver = script.find("/nix/store/rustdoc-bin/bin/rustdoc").unwrap();
+        assert!(mkdir < aux && aux < source && source < driver);
+    }
+
+    #[test]
+    fn run_script_sources_setup_before_build_script_binary() {
+        let mut bs_compile = make_doc_unit("my-lib", &[], &[], true);
+        bs_compile.kind = UnitKind::BuildScriptCompile;
+        bs_compile.key = "my-lib-bsc".into();
+        bs_compile.crate_name = "build_script_build".into();
+        bs_compile.crate_types = vec!["bin".into()];
+        let mut run = make_doc_unit("my-lib", &[], &[], true);
+        run.kind = UnitKind::BuildScriptRun;
+        run.key = "my-lib-bsr".into();
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        let units = vec![bs_compile, run];
+        let key_to_idx = HashMap::from([
+            ("my-lib-bsc".to_string(), 0_usize),
+            ("my-lib-bsr".to_string(), 1_usize),
+        ]);
+        let dep_drv_map = HashMap::from([(
+            "my-lib-bsc".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
+        )]);
+        let script = build_run_script(
+            &units[1],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/cc/bin",
+            &None,
+            "",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[SETUP_A.to_string()],
+        )
+        .unwrap();
+        let mkdir = script
+            .find("/nix/store/coreutils/bin/mkdir -p $out $out/out_dir && ")
+            .unwrap();
+        let manifest = script.rfind("export CARGO_MANIFEST_DIR=").unwrap();
+        let aux = script
+            .find("export SCHNEE_AUX_DIR=$out/schnee-aux && ")
+            .unwrap();
+        let source = script.find(&format!(". {} && ", SETUP_A)).unwrap();
+        let exec = script.find("cd $_bs_workdir && LD_PRELOAD=").unwrap();
+        assert!(mkdir < aux, "$out must exist before SCHNEE_AUX_DIR is set");
+        assert!(
+            manifest < aux,
+            "the hook must follow the workdir-rewritten CARGO_MANIFEST_DIR export"
+        );
+        assert!(aux < source && source < exec);
+    }
+
+    #[test]
+    fn run_script_without_setup_has_no_hook_artefacts() {
+        let mut bs_compile = make_doc_unit("my-lib", &[], &[], true);
+        bs_compile.kind = UnitKind::BuildScriptCompile;
+        bs_compile.key = "my-lib-bsc".into();
+        bs_compile.crate_types = vec!["bin".into()];
+        let mut run = make_doc_unit("my-lib", &[], &[], true);
+        run.kind = UnitKind::BuildScriptRun;
+        run.key = "my-lib-bsr".into();
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        let units = vec![bs_compile, run];
+        let key_to_idx = HashMap::from([
+            ("my-lib-bsc".to_string(), 0_usize),
+            ("my-lib-bsr".to_string(), 1_usize),
+        ]);
+        let dep_drv_map = HashMap::from([(
+            "my-lib-bsc".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
+        )]);
+        let script = build_run_script(
+            &units[1],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/cc/bin",
+            &None,
+            "",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+        assert!(!script.contains("SCHNEE_AUX_DIR"));
+        assert!(script.contains("_wdirs.c -ldl && cd $_bs_workdir"));
     }
 
     #[test]
@@ -1190,9 +1864,707 @@ mod tests {
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
             false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
         )
         .unwrap();
 
         assert!(!script.contains("--cap-lints"));
+    }
+
+    // -- TestCompile CARGO_MANIFEST_DIR symlink tests ----------------------------
+
+    fn make_test_compile_unit(name: &str, project_root: &str) -> NixUnit {
+        NixUnit {
+            key: format!("{}-test", name),
+            drv_name: format!("{}-0.1.0-{}-test", name, name),
+            kind: UnitKind::TestCompile,
+            source_file: format!(
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}/src/lib.rs",
+                name
+            ),
+            crate_name: name.replace('-', "_"),
+            crate_types: vec!["lib".to_string()],
+            edition: "2021".into(),
+            features: Vec::new(),
+            dep_extern: Vec::new(),
+            all_dep_keys: Vec::new(),
+            build_script_dep: None,
+            build_script_compile_key: None,
+            manifest_dir: format!("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-{}", name),
+            original_manifest_dir: format!("{}/{}", project_root, name),
+            cargo_envs: vec![("CARGO_PKG_NAME".into(), name.into())],
+            extra_filename: "-abc123".into(),
+            needs_linker: true,
+            is_local: true,
+            links: None,
+            links_dep_keys: Vec::new(),
+            is_root: true,
+            target_name: name.to_string(),
+            for_host: false,
+            compile_test: true,
+            sliced_crate_rel: Some(name.to_string()),
+            profile: Default::default(),
+            pipeline: Default::default(),
+            drv_path: None,
+            drv_json: None,
+        }
+    }
+
+    fn test_compile_script(unit: &NixUnit) -> String {
+        let units = vec![unit.clone()];
+        build_compile_script(
+            &units[0],
+            &units,
+            &HashMap::new(),
+            &HashMap::new(),
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-my-lib",
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The manifest dir a test binary bakes in must not depend on
+    /// where the checkout happens to live, or the same source compiled from
+    /// two directories produces two derivations and neither can reuse the
+    /// other's build.
+    #[test]
+    fn test_compile_script_ignores_checkout_location() {
+        let a = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let b = make_test_compile_unit("my-lib", "/home/dev/workspace-2");
+        assert_eq!(test_compile_script(&a), test_compile_script(&b));
+    }
+
+    /// The compile step reaches the crate's store path through the
+    /// descriptor, and never writes outside the sandbox's own tree.
+    #[test]
+    fn test_compile_script_opens_the_store_path_on_the_descriptor() {
+        let unit = make_test_compile_unit("my-lib", "/home/dev/workspace-1");
+        let script = test_compile_script(&unit);
+        assert!(
+            script.contains(&format!(
+                "exec {TEST_MANIFEST_DIR_FD}<{} && ",
+                shell_quote(&unit.manifest_dir)
+            )),
+            "{script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "export CARGO_MANIFEST_DIR={} && ",
+                shell_quote(&test_manifest_dir())
+            )),
+            "{script}"
+        );
+        assert!(!script.contains("/tmp"), "{script}");
+    }
+
+    // -- cross-compile link directive scoping ------------------------------
+
+    const HOST_BS_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-sys-host-bs.drv";
+    const TARGET_BS_DRV: &str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-sys-target-bs.drv";
+
+    /// A cross build in which a `-sys` crate is planned twice, once for the
+    /// host because a proc macro needs it and once for the requested target.
+    /// The target bin reaches the host build-script-run unit through
+    /// `all_dep_keys`, because the proc macro is an ordinary `--extern` dep
+    /// and the closure walk does not stop at it.
+    ///
+    /// The two build scripts print different directives, since the host one
+    /// resolves the system library through the host pkg-config while the
+    /// target one builds the bundled copy.
+    fn cross_units() -> (
+        Vec<NixUnit>,
+        HashMap<String, usize>,
+        HashMap<String, String>,
+    ) {
+        let mut host_sys = make_doc_unit("sys-host", &[], &[], false);
+        host_sys.key = "sys-host".into();
+        host_sys.kind = UnitKind::Compile;
+        host_sys.for_host = true;
+        host_sys.build_script_dep = Some("sys-host-bs".into());
+
+        let mut target_sys = make_doc_unit("sys-target", &[], &[], false);
+        target_sys.key = "sys-target".into();
+        target_sys.kind = UnitKind::Compile;
+        target_sys.build_script_dep = Some("sys-target-bs".into());
+
+        let mut app = make_doc_unit("app", &[], &[("mymacro", "sys-host")], true);
+        app.key = "app".into();
+        app.kind = UnitKind::Compile;
+        app.crate_types = vec!["bin".into()];
+        app.needs_linker = true;
+        app.all_dep_keys = vec!["sys-host".into(), "sys-target".into()];
+
+        let units = vec![app, host_sys, target_sys];
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map = HashMap::from([
+            ("sys-host-bs".to_string(), HOST_BS_DRV.to_string()),
+            ("sys-target-bs".to_string(), TARGET_BS_DRV.to_string()),
+        ]);
+        (units, key_to_idx, dep_drv_map)
+    }
+
+    fn cross_link_script(units: &[NixUnit], dep_drv_map: &HashMap<String, String>) -> String {
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        build_compile_script(
+            &units[0],
+            units,
+            &key_to_idx,
+            dep_drv_map,
+            "/nix/store/rustc-bin/bin/rustc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+            &TargetConfig::with_target("aarch64-unknown-linux-gnu"),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// A host build script's `cargo:rustc-link-search` must not reach the
+    /// cross linker, because rustc searches `-L` directories in the order it
+    /// receives them and would resolve the archive out of the host one.
+    #[test]
+    fn cross_link_unit_skips_host_build_script_directives() {
+        let (units, _, dep_drv_map) = cross_units();
+        let script = cross_link_script(&units, &dep_drv_map);
+        let host = downstream_placeholder(HOST_BS_DRV, "out").unwrap();
+        let target = downstream_placeholder(TARGET_BS_DRV, "out").unwrap();
+        assert!(
+            script.contains(&target),
+            "the target build script's directives must still be read"
+        );
+        assert!(
+            !script.contains(&host),
+            "a host build script's link directives must not reach the cross linker"
+        );
+    }
+
+    /// The inputs and the script must name the same build scripts, or the
+    /// derivation depends on an output it never reads and rebuilds when that
+    /// output changes.
+    #[test]
+    fn linked_build_script_keys_scopes_to_compile_kind() {
+        let (units, key_to_idx, _) = cross_units();
+        assert_eq!(
+            linked_build_script_keys(&units[0], &units, &key_to_idx),
+            vec!["sys-target-bs"]
+        );
+    }
+
+    /// A native build plans one compile kind, so every build script in the
+    /// closure still reaches the linker and no derivation hash moves.
+    #[test]
+    fn native_link_unit_keeps_every_build_script() {
+        let (mut units, key_to_idx, _) = cross_units();
+        for unit in &mut units {
+            unit.for_host = true;
+        }
+        assert_eq!(
+            linked_build_script_keys(&units[0], &units, &key_to_idx),
+            vec!["sys-host-bs", "sys-target-bs"]
+        );
+    }
+
+    // -- job server opt-in tests ------------------------------------------------
+
+    const BS_COMPILE_DRV: &str = "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv";
+
+    fn jobserver_attr(units: &[NixUnit], idx: usize) -> Option<String> {
+        let key_to_idx: HashMap<String, usize> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::BuildScriptCompile)
+            .map(|u| (u.key.clone(), BS_COMPILE_DRV.to_string()))
+            .collect();
+        let drv = construct_derivation(
+            units,
+            idx,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/bash/bin/bash",
+            "/nix/store/bash",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/cc/bin",
+            &[],
+            "x86_64-linux",
+            &[],
+            &None,
+            "",
+            &[],
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            &[],
+            &[],
+            SRC_STORE,
+            false,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        drv["env"]["__jobserver"].as_str().map(str::to_string)
+    }
+
+    fn unit_of_kind(name: &str, kind: UnitKind) -> NixUnit {
+        let mut unit = make_doc_unit(name, &[], &[], true);
+        unit.key = name.to_string();
+        unit.kind = kind;
+        unit
+    }
+
+    /// A build script's compile and run units, preceded by one dependency of
+    /// the script for each package in `build_deps`.
+    fn build_script_units(build_deps: &[&str]) -> Vec<NixUnit> {
+        let mut units: Vec<NixUnit> = build_deps
+            .iter()
+            .map(|dep| unit_of_kind(dep, UnitKind::Compile))
+            .collect();
+        let mut bs_compile = unit_of_kind("my-lib-bsc", UnitKind::BuildScriptCompile);
+        bs_compile.crate_types = vec!["bin".into()];
+        bs_compile.all_dep_keys = build_deps.iter().map(|dep| dep.to_string()).collect();
+        let mut run = unit_of_kind("my-lib-bsr", UnitKind::BuildScriptRun);
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        units.push(bs_compile);
+        units.push(run);
+        units
+    }
+
+    #[test]
+    fn codegen_units_opt_into_jobserver() {
+        for kind in [
+            UnitKind::Compile,
+            UnitKind::TestCompile,
+            UnitKind::BuildScriptCompile,
+        ] {
+            let units = vec![unit_of_kind("my-lib", kind)];
+            assert_eq!(jobserver_attr(&units, 0).as_deref(), Some("1"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn units_without_codegen_stay_out_of_jobserver() {
+        for kind in [UnitKind::Check, UnitKind::Doc] {
+            let units = vec![unit_of_kind("my-lib", kind)];
+            assert_eq!(jobserver_attr(&units, 0), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn build_script_run_opts_in_through_its_dependencies() {
+        for dep in ["jobserver", "cmake", "autotools"] {
+            let units = build_script_units(&["cc", dep]);
+            let run = units.len() - 1;
+            assert_eq!(jobserver_attr(&units, run).as_deref(), Some("1"), "{dep}");
+        }
+    }
+
+    /// `cc` without its `parallel` feature compiles one object at a time and
+    /// never reads the job server.
+    #[test]
+    fn build_script_run_without_jobserver_dependency_stays_out() {
+        for deps in [&[][..], &["cc"][..]] {
+            let units = build_script_units(deps);
+            let run = units.len() - 1;
+            assert_eq!(jobserver_attr(&units, run), None, "{deps:?}");
+        }
+    }
+
+    fn find_on_path(name: &str) -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("{name} is not on PATH"))
+    }
+
+    /// Runs a generated compile script with a real rustc against a job server
+    /// FIFO in the form a Nix job server passes, and watches the FIFO with inotify.  rustc
+    /// reads a token for its second codegen unit, so a read proves rustc
+    /// joined the pool, and the byte count afterwards proves it gave every
+    /// token back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compile_script_rustc_takes_tokens_from_jobserver() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const TOKENS: &[u8] = b"++++";
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        let body: String = (0..64)
+            .map(|i| {
+                format!(
+                    "pub mod m{i} {{ pub fn f(x: u64) -> u64 {{ (0..x).map(|v| v.wrapping_mul({i})).sum() }} }}\n"
+                )
+            })
+            .collect();
+        std::fs::write(&src, body).unwrap();
+
+        let fifo = dir.path().join("jobserver");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        // Holding a read-write descriptor keeps the tokens in the FIFO while
+        // no other process has it open.
+        let mut pool = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        std::io::Write::write_all(&mut pool, TOKENS).unwrap();
+
+        let inotify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(inotify >= 0);
+        assert!(unsafe { libc::inotify_add_watch(inotify, fifo_c.as_ptr(), libc::IN_ACCESS) } >= 0);
+
+        let rustc = find_on_path("rustc");
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        let sysroot = String::from_utf8(sysroot.stdout).unwrap();
+        let coreutils = find_on_path("cat").parent().unwrap().to_path_buf();
+
+        let mut unit = unit_of_kind("pool-probe", UnitKind::Compile);
+        unit.source_file = src.to_string_lossy().into_owned();
+        unit.manifest_dir = dir.path().to_string_lossy().into_owned();
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("pool-probe".to_string(), 0_usize)]);
+        let script = build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            rustc.to_str().unwrap(),
+            "",
+            sysroot.trim(),
+            coreutils.to_str().unwrap(),
+            "/nix/store/cc/bin",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let status = Command::new(find_on_path("bash"))
+            .current_dir(dir.path())
+            .arg("-c")
+            .arg(&script)
+            .env("out", &out)
+            .env(
+                "CARGO_MAKEFLAGS",
+                format!("--jobserver-auth=fifo:{}", fifo.display()),
+            )
+            .status()
+            .unwrap();
+        let diagnostics = std::fs::read_to_string(out.join("diagnostics")).unwrap_or_default();
+        assert!(status.success(), "rustc failed:\n{diagnostics}");
+        assert!(
+            !diagnostics.contains("failed to connect to jobserver"),
+            "rustc rejected the job server:\n{diagnostics}"
+        );
+
+        let mut events = [0_u8; 4096];
+        let n = unsafe { libc::read(inotify, events.as_mut_ptr().cast(), events.len()) };
+        unsafe { libc::close(inotify) };
+        assert!(n > 0, "rustc never read a token from the job server");
+
+        let mut returned = Vec::new();
+        let _ = pool.read_to_end(&mut returned);
+        assert_eq!(returned, TOKENS, "rustc kept or forged tokens");
+    }
+
+    /// A stand-in rustc writes one line to `stderr` and then waits until the
+    /// test has read that line from the script's `stderr`.  The line must
+    /// therefore arrive while rustc still runs, and it must also land in
+    /// `$out/diagnostics` exactly once, next to rustc's exit status.
+    #[test]
+    fn compile_script_streams_stderr_while_rustc_runs() {
+        use std::io::BufRead;
+
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        let rustc = dir.path().join("rustc");
+        std::fs::write(
+            &rustc,
+            format!(
+                "#!{}\necho '{{\"artifact\":\"x.rmeta\",\"emit\":\"metadata\"}}' >&2\nwhile [ ! -e {} ]; do sleep 0.05; done\necho out\nexit 3\n",
+                find_on_path("bash").display(),
+                go.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rustc, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let coreutils = find_on_path("tee").parent().unwrap().to_path_buf();
+
+        let units = vec![unit_of_kind("stream-probe", UnitKind::Compile)];
+        let key_to_idx = HashMap::from([("stream-probe".to_string(), 0_usize)]);
+        let script = build_compile_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            rustc.to_str().unwrap(),
+            "",
+            "/nix/store/rust-sysroot",
+            coreutils.to_str().unwrap(),
+            "/nix/store/cc/bin",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+
+        let out = dir.path().join("out");
+        let mut child = Command::new(find_on_path("bash"))
+            .current_dir(dir.path())
+            .arg("-c")
+            .arg(&script)
+            .env("out", &out)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Releases the stand-in if the line never streams, so a regression
+        // fails the test instead of hanging it.
+        let watchdog_go = go.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = std::fs::write(watchdog_go, "");
+        });
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        assert!(!go.exists(), "the line arrived only after rustc exited");
+        assert!(line.contains("x.rmeta"), "{line:?}");
+        std::fs::write(&go, "").unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(
+            std::fs::read_to_string(out.join("diagnostics")).unwrap(),
+            "{\"artifact\":\"x.rmeta\",\"emit\":\"metadata\"}\n"
+        );
+    }
+
+    // -- pipelined compilation tests --------------------------------------------
+
+    fn compile_script_of(
+        units: &[NixUnit],
+        idx: usize,
+        dep_drv_map: &HashMap<String, String>,
+    ) -> String {
+        compile_script_with(
+            units,
+            idx,
+            dep_drv_map,
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            "/nix/store/cc/bin",
+        )
+    }
+
+    fn compile_script_with(
+        units: &[NixUnit],
+        idx: usize,
+        dep_drv_map: &HashMap<String, String>,
+        rustc: &str,
+        sysroot: &str,
+        coreutils: &str,
+        cc: &str,
+    ) -> String {
+        let key_to_idx = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        build_compile_script(
+            &units[idx],
+            units,
+            &key_to_idx,
+            dep_drv_map,
+            rustc,
+            "",
+            sysroot,
+            coreutils,
+            cc,
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn metadata_half_skips_codegen_and_drops_the_rlib_stub() {
+        let mut unit = unit_of_kind("my-lib", UnitKind::Compile);
+        unit.pipeline = PipelineRole::Metadata;
+        let script = compile_script_of(&[unit], 0, &HashMap::new());
+        assert!(script.contains(" -Z no-codegen "));
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 && "));
+        assert!(
+            script
+                .contains("/nix/store/coreutils/bin/rm -f $out/libmy_lib-abc123.rlib; exit $__rs")
+        );
+    }
+
+    #[test]
+    fn whole_unit_of_pipelined_build_sets_rustc_bootstrap_only() {
+        let mut unit = unit_of_kind("my-lib", UnitKind::Compile);
+        unit.pipeline = PipelineRole::Whole;
+        let script = compile_script_of(&[unit.clone()], 0, &HashMap::new());
+        assert!(script.contains("export RUSTC_BOOTSTRAP=1 && "));
+        assert!(!script.contains("no-codegen"));
+        assert!(!script.contains("/rm "));
+
+        unit.pipeline = PipelineRole::Off;
+        let script = compile_script_of(&[unit], 0, &HashMap::new());
+        assert!(!script.contains("RUSTC_BOOTSTRAP"));
+    }
+
+    /// Builds a split library's halves, a library against the metadata half
+    /// and a binary against the link halves, with the real rustc and the
+    /// scripts cargo-schnee generates, and runs the binary.  The crate hash
+    /// of both halves must agree, or the final link fails with E0460.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_library_links_into_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let mut a = unit_of_kind("a", UnitKind::Compile);
+        a.source_file = write(
+            "a.rs",
+            "pub fn f() -> u32 { 40 }\n#[inline] pub fn g<T: Into<u32>>(x: T) -> u32 { x.into() }\n",
+        );
+        a.pipeline = PipelineRole::Whole;
+        let mut a_meta = a.clone();
+        a_meta.key = "a#meta".into();
+        a_meta.pipeline = PipelineRole::Metadata;
+        let mut b = unit_of_kind("b", UnitKind::Compile);
+        b.source_file = write("b.rs", "pub fn h() -> u32 { a::f() + a::g(2u8) }\n");
+        b.dep_extern = vec![("a".into(), "a#meta".into())];
+        b.all_dep_keys = vec!["a#meta".into()];
+        b.pipeline = PipelineRole::Whole;
+        let mut c = unit_of_kind("c", UnitKind::Compile);
+        c.source_file = write("c.rs", "fn main() { println!(\"{}\", b::h()); }\n");
+        c.crate_types = vec!["bin".into()];
+        c.needs_linker = true;
+        c.dep_extern = vec![("b".into(), "b".into())];
+        c.all_dep_keys = vec!["a".into(), "b".into()];
+        c.pipeline = PipelineRole::Whole;
+        let units = vec![a, a_meta, b, c];
+
+        let drv = |n: char| format!("/nix/store/{}-{n}.drv", n.to_string().repeat(32));
+        let dep_drv_map: HashMap<String, String> = [("a", 'a'), ("a#meta", 'm'), ("b", 'b')]
+            .into_iter()
+            .map(|(k, n)| (k.to_string(), drv(n)))
+            .collect();
+        let rustc = find_on_path("rustc");
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        let sysroot = String::from_utf8(sysroot.stdout).unwrap();
+        let coreutils = find_on_path("tee").parent().unwrap().to_path_buf();
+        let cc = find_on_path("cc").parent().unwrap().to_path_buf();
+
+        let mut outs: HashMap<String, PathBuf> = HashMap::new();
+        for idx in [1, 2, 0, 3] {
+            let mut script = compile_script_with(
+                &units,
+                idx,
+                &dep_drv_map,
+                rustc.to_str().unwrap(),
+                sysroot.trim(),
+                coreutils.to_str().unwrap(),
+                cc.to_str().unwrap(),
+            );
+            for (key, path) in &outs {
+                let placeholder = downstream_placeholder(&dep_drv_map[key], "out").unwrap();
+                script = script.replace(&placeholder, &path.to_string_lossy());
+            }
+            let out = dir.path().join(format!("out-{idx}"));
+            // `fresh_unit_graph` tests move the process's working directory
+            // into a temporary directory that may already be gone.
+            let status = Command::new(find_on_path("bash"))
+                .current_dir(dir.path())
+                .arg("-c")
+                .arg(&script)
+                .env("out", &out)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            let diagnostics = std::fs::read_to_string(out.join("diagnostics")).unwrap_or_default();
+            assert!(
+                status.success(),
+                "{} failed:\n{diagnostics}",
+                units[idx].key
+            );
+            outs.insert(units[idx].key.clone(), out);
+        }
+
+        assert!(!outs["a#meta"].join("liba-abc123.rlib").exists());
+        assert!(outs["a#meta"].join("liba-abc123.rmeta").exists());
+        let run = Command::new(outs["c"].join("c-abc123")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
     }
 }

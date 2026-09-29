@@ -1,8 +1,10 @@
+use super::profile::{UnitProfile, lto_modes};
 use super::util::sanitize_drv_name;
 use super::{NixUnit, UnitKind};
 use anyhow::Result;
 use cargo::core::FeatureValue;
 use cargo::core::compiler::{CompileKind, CompileMode, Unit};
+use cargo::core::dependency::DepKind;
 use cargo::util::command_prelude::UserIntent;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -42,7 +44,18 @@ pub(super) fn extract_units_from_bcx(
         })
         .cloned()
         .collect();
-    all_units.sort_by_key(unit_sort_key);
+    let lto = lto_modes(bcx)?;
+    let profiles = all_units
+        .iter()
+        .map(|u| match lto.get(u) {
+            Some(&mode) => Ok((u.clone(), UnitProfile::new(bcx, u, mode))),
+            None => Err(anyhow::anyhow!(
+                "Cargo computed no LTO mode for {}",
+                u.pkg.name()
+            )),
+        })
+        .collect::<Result<HashMap<Unit, UnitProfile>>>()?;
+    all_units.sort_by_cached_key(|u| compilation_identity(u, &profiles[u]));
 
     // Group units by their "compilation identity" (what affects rustc output).
     // Cargo can produce multiple Unit entries with the same identity but different
@@ -55,7 +68,7 @@ pub(super) fn extract_units_from_bcx(
     let mut identity_all_units: HashMap<String, Vec<Unit>> = HashMap::new();
 
     for unit in &all_units {
-        let identity = compilation_identity(unit);
+        let identity = compilation_identity(unit, &profiles[unit]);
         identity_all_units
             .entry(identity.clone())
             .or_default()
@@ -64,7 +77,7 @@ pub(super) fn extract_units_from_bcx(
             // Duplicate — map to the same key as the existing unit
             key_map.insert(unit.clone(), existing_key.clone());
         } else {
-            let key = make_unit_key(unit);
+            let key = make_unit_key(unit, &profiles[unit]);
             identity_to_key.insert(identity, key.clone());
             key_map.insert(unit.clone(), key.clone());
             if deduped_set.insert(key) {
@@ -78,15 +91,6 @@ pub(super) fn extract_units_from_bcx(
         .iter()
         .filter_map(|u| key_map.get(u).cloned())
         .collect();
-    // Map root keys to their target names
-    let root_target_names: HashMap<String, String> = roots
-        .iter()
-        .filter_map(|u| {
-            key_map
-                .get(u)
-                .map(|k| (k.clone(), u.target.name().to_string()))
-        })
-        .collect();
 
     // Topological sort on deduplicated units
     let topo_units = toposort(&deduped_units, &bcx.unit_graph, &key_map)?;
@@ -95,7 +99,8 @@ pub(super) fn extract_units_from_bcx(
 
     for unit in &topo_units {
         let key = key_map[unit].clone();
-        let identity = compilation_identity(unit);
+        let profile = profiles[unit].clone();
+        let identity = compilation_identity(unit, &profile);
 
         // Determine unit kind
         let kind = if unit.mode == CompileMode::RunCustomBuild {
@@ -111,6 +116,23 @@ pub(super) fn extract_units_from_bcx(
         } else {
             UnitKind::Compile
         };
+
+        // `cargo check --all-targets` pulls integration tests and
+        // benches into the unit graph as `CompileMode::Check { test: true }`,
+        // and ALSO emits a `Check { test: true }` lib unit alongside the
+        // existing `Check { test: false }` lib so cargo can link the
+        // integration tests against the test variant (cfg(test) active,
+        // dev-deps in scope) while bins keep linking the non-test
+        // variant.  These are two distinct cargo units with different
+        // dep sets and rmeta outputs; cargo-schnee must mirror them as
+        // two distinct NixUnits.  `make_unit_key` /
+        // `compilation_identity` distinguish them via the test bool so
+        // cargo's edges resolve to the right side.
+        //
+        // `--test` then applies whenever `Check { test: true }`: it's
+        // what activates `#[cfg(test)]` and the test harness, regardless
+        // of target kind.
+        let compile_test = matches!(unit.mode, CompileMode::Check { test: true });
 
         // Source file
         let source_file = unit
@@ -216,16 +238,17 @@ pub(super) fn extract_units_from_bcx(
             }
         }
 
-        if log::log_enabled!(log::Level::Debug) {
-            let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
-            dep_names.sort();
-            log::debug!(
-                "dep_extern_map for {} after first pass ({} entries): {:?}",
-                key,
-                dep_extern_map.len(),
-                dep_names,
-            );
-        }
+        // tracing's macros are lazy — the format args are not evaluated
+        // unless the event is enabled — so the explicit log_enabled
+        // gate that the `log` crate needed is no longer required.
+        let mut dep_names: Vec<&str> = dep_extern_map.keys().map(|s| s.as_str()).collect();
+        dep_names.sort();
+        tracing::debug!(
+            "dep_extern_map for {} after first pass ({} entries): {:?}",
+            key,
+            dep_extern_map.len(),
+            dep_names,
+        );
 
         // Fix missing optional deps activated by features but absent from the
         // unit graph edge list.  This happens when optional deps are declared
@@ -238,6 +261,11 @@ pub(super) fn extract_units_from_bcx(
             let mut feature_dep_activations: HashMap<String, Vec<(String, String)>> =
                 HashMap::new();
             let summary = unit.pkg.manifest().summary();
+            let linked_dep_kind = if unit.target.is_custom_build() {
+                DepKind::Build
+            } else {
+                DepKind::Normal
+            };
             for feat in &unit.features {
                 let fvs = match summary.features().get(feat) {
                     Some(v) => v,
@@ -255,55 +283,89 @@ pub(super) fn extract_units_from_bcx(
                     };
                     let extern_name = dep_toml_name.as_str().replace('-', "_");
                     // Look up the actual crate name (may differ with
-                    // `package = "..."` in the dep spec).
-                    let dep_spec = unit
-                        .pkg
-                        .dependencies()
-                        .iter()
-                        .find(|d| d.name_in_toml() == dep_toml_name);
-                    let pkg_name = dep_spec.map(|d| d.package_name()).unwrap_or(dep_toml_name);
-                    let is_platform_gated = dep_spec.is_some_and(|d| d.platform().is_some());
-                    // Find the matching lib Unit in the full graph.
-                    if let Some(candidate) = all_units.iter().find(|c| {
-                        c.pkg.name() == pkg_name
-                            && c.target.is_lib()
-                            && !c.target.is_custom_build()
-                            && c.mode != CompileMode::RunCustomBuild
-                    }) {
-                        let dep_key = key_map[candidate].clone();
-                        let already_present = dep_extern_map.contains_key(&extern_name);
-                        log::debug!(
-                            "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
-                             already_in_dep_extern={}",
-                            dep_toml_name,
-                            key,
-                            extern_name,
-                            pkg_name,
-                            dep_key,
-                            already_present,
-                        );
-                        feature_dep_activations
-                            .entry(feat.to_string())
-                            .or_default()
-                            .push((extern_name, dep_key));
-                    } else if is_platform_gated {
-                        // Dep is behind a target-specific gate (e.g.
-                        // cfg(windows)) and absent from the unit graph on
-                        // this platform — expected, not actionable.
-                        log::debug!(
-                            "Feature-activated dep {} (dep:{}) not in unit graph for {} \
-                             (platform-gated, expected)",
-                            extern_name,
-                            dep_toml_name,
-                            key,
-                        );
-                    } else {
-                        log::warn!(
-                            "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
-                            extern_name,
-                            dep_toml_name,
-                            key,
-                        );
+                    // `package = "..."` in the dep spec).  Features are
+                    // package-wide, but a build script links only the
+                    // `[build-dependencies]` and every other target only the
+                    // `[dependencies]`.  A dep of the other table is not this
+                    // unit's dep, whatever the feature activates.
+                    let Some(dep_spec) =
+                        unit.pkg.dependencies().iter().find(|d| {
+                            d.name_in_toml() == dep_toml_name && d.kind() == linked_dep_kind
+                        })
+                    else {
+                        continue;
+                    };
+                    let pkg_name = dep_spec.package_name();
+                    let is_platform_gated = dep_spec.platform().is_some();
+                    // Find the matching lib Unit in the full graph, honouring
+                    // the consumer's compile kind.
+                    match find_linkable_lib_unit(&all_units, pkg_name.as_str(), unit) {
+                        LibUnitLookup::Found(candidate) => {
+                            let dep_key = key_map[candidate].clone();
+                            let already_present = dep_extern_map.contains_key(&extern_name);
+                            tracing::debug!(
+                                "Feature dep:{} for {} → extern={}, pkg={}, dep_key={}, \
+                                 already_in_dep_extern={}",
+                                dep_toml_name,
+                                key,
+                                extern_name,
+                                pkg_name,
+                                dep_key,
+                                already_present,
+                            );
+                            feature_dep_activations
+                                .entry(feat.to_string())
+                                .or_default()
+                                .push((extern_name, dep_key));
+                        }
+                        LibUnitLookup::WrongKind => {
+                            // The crate is in the graph, but only compiled for
+                            // a compile kind this unit cannot link.  A host
+                            // consumer reaching it stays quiet.  A target
+                            // consumer reaching this arm
+                            // is not routine: the unit compiles with no
+                            // `--extern` for a dep its features activated, and
+                            // the only symptom is E0463 inside the unit's own
+                            // derivation, where this planner's reasoning is no
+                            // longer visible.
+                            if matches!(unit.kind, CompileKind::Target(_)) {
+                                tracing::warn!(
+                                    "Feature-activated dep {} (dep:{}) exists only as a host \
+                                     unit, so {} gets no --extern for it",
+                                    extern_name,
+                                    dep_toml_name,
+                                    key,
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Feature-activated dep {} (dep:{}) is only built for another \
+                                     compile kind, not linkable into {}",
+                                    extern_name,
+                                    dep_toml_name,
+                                    key,
+                                );
+                            }
+                        }
+                        LibUnitLookup::Absent if is_platform_gated => {
+                            // Dep is behind a target-specific gate (e.g.
+                            // cfg(windows)) and absent from the unit graph on
+                            // this platform — expected, not actionable.
+                            tracing::debug!(
+                                "Feature-activated dep {} (dep:{}) not in unit graph for {} \
+                                 (platform-gated, expected)",
+                                extern_name,
+                                dep_toml_name,
+                                key,
+                            );
+                        }
+                        LibUnitLookup::Absent => {
+                            tracing::warn!(
+                                "Feature-activated dep {} (dep:{}) not found in unit graph for {}",
+                                extern_name,
+                                dep_toml_name,
+                                key,
+                            );
+                        }
                     }
                 }
             }
@@ -311,7 +373,7 @@ pub(super) fn extract_units_from_bcx(
             for (extern_name, dep_key) in
                 find_missing_feature_deps(&dep_extern_map, &features, &feature_dep_activations)
             {
-                log::info!(
+                tracing::info!(
                     "Adding missing optional dep {} -> {} for {} \
                      (feature-activated, possibly behind platform gate)",
                     extern_name,
@@ -343,6 +405,7 @@ pub(super) fn extract_units_from_bcx(
             unit.target.name(),
             &features,
             &crate_types,
+            &profile.identity(),
         );
 
         // Manifest dir — map to store path
@@ -365,17 +428,28 @@ pub(super) fn extract_units_from_bcx(
                 }));
 
         let is_root = root_keys.contains(&key);
-        let target_name = root_target_names.get(&key).cloned().unwrap_or_default();
+        // Populated for every unit, not only roots: a scope-wide graph is
+        // narrowed to a caller's roots after the fact, and a unit that is
+        // a non-root here can be a root for a sibling invocation reading
+        // the same cached graph.  Nothing in `derivation.rs` reads this,
+        // so filling it in moves no derivation hash.
+        let target_name = unit.target.name().to_string();
         let for_host = matches!(unit.kind, CompileKind::Host);
 
+        // For `Check { test: true }` units, append `-test` to the drv
+        // name so the test and non-test variants of the same target
+        // don't collide in diagnostics or `$out` filenames.  Compilation
+        // identity already distinguishes them, so the keys differ; this
+        // just keeps human-readable names unique too.
         nix_units.push(NixUnit {
             key,
             drv_name: sanitize_drv_name(&format!(
-                "{}-{}-{}{}",
+                "{}-{}-{}{}{}",
                 unit.pkg.name(),
                 unit.pkg.version(),
                 unit.target.name(),
                 mode_suffix_for_drv_name(&kind),
+                check_test_suffix(compile_test, kind),
             )),
             kind,
             source_file: source_file_str,
@@ -398,7 +472,12 @@ pub(super) fn extract_units_from_bcx(
             is_root,
             target_name,
             for_host,
+            compile_test,
+            sliced_crate_rel: None,
+            profile,
+            pipeline: Default::default(),
             drv_path: None,
+            drv_json: None,
         });
     }
 
@@ -415,7 +494,7 @@ pub(super) fn extract_units_from_bcx(
         for u in &nix_units {
             for (ext_name, dep_key) in &u.dep_extern {
                 if !valid_keys.contains(dep_key.as_str()) {
-                    log::warn!(
+                    tracing::warn!(
                         "Stale dep_extern after unification: {} has {} -> key {} \
                          which does NOT match any NixUnit",
                         u.key,
@@ -473,13 +552,30 @@ pub(super) fn mode_suffix_for_drv_name(kind: &UnitKind) -> &'static str {
     }
 }
 
+/// Returns "-test" when this is a `Check { test: true }` unit, "" otherwise.
+/// Used everywhere a key, drv name, or grouping identity needs to distinguish
+/// the two `Check` variants (see `compilation_identity` for the full
+/// rationale).  Returns "" for non-`Check` units even when `compile_test` is
+/// set, since the test bit only collapses semantically inside `Check` mode —
+/// `TestCompile` and others already encode their test-ness in the kind.
+fn check_test_suffix(compile_test: bool, kind: UnitKind) -> &'static str {
+    if compile_test && kind == UnitKind::Check {
+        "-test"
+    } else {
+        ""
+    }
+}
+
 /// Compute a "compilation identity" for a unit — units with the same identity
-/// produce identical rustc output and can be deduplicated.
-fn compilation_identity(unit: &Unit) -> String {
+/// produce identical rustc output and can be deduplicated. The profile is part
+/// of it because Cargo compiles a crate shared by a proc macro and a library
+/// twice, once with the build-override profile and once with the main one.
+fn compilation_identity(unit: &Unit, profile: &UnitProfile) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -502,7 +598,7 @@ fn compilation_identity(unit: &Unit) -> String {
     let mut feats: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
     feats.sort();
     format!(
-        "{}-{}-{}{}{}-{}-{:?}-{}",
+        "{}-{}-{}{}{}-{}-{:?}-{}-{}",
         unit.pkg.name(),
         unit.pkg.version(),
         unit.target.name(),
@@ -511,19 +607,15 @@ fn compilation_identity(unit: &Unit) -> String {
         unit.target.edition(),
         crate_types,
         feats.join(","),
+        profile.identity(),
     )
-}
-
-/// Create a stable sort key for a unit (must be deterministic across runs).
-fn unit_sort_key(unit: &Unit) -> String {
-    compilation_identity(unit)
 }
 
 /// Generate a deterministic unique key for a unit.
 /// Uses SHA-256 of the compilation identity to guarantee stability across runs
 /// (DefaultHasher uses randomized SipHash seeds, breaking nix derivation caching).
-fn make_unit_key(unit: &Unit) -> String {
-    let identity = compilation_identity(unit);
+fn make_unit_key(unit: &Unit, profile: &UnitProfile) -> String {
+    let identity = compilation_identity(unit, profile);
     let hash = Sha256::digest(identity.as_bytes());
     let short_hash = format!(
         "{:016x}",
@@ -533,7 +625,8 @@ fn make_unit_key(unit: &Unit) -> String {
     let mode_suffix = match unit.mode {
         CompileMode::RunCustomBuild => "-run",
         CompileMode::Test => "-test",
-        CompileMode::Check { .. } => "-check",
+        CompileMode::Check { test: true } => "-check-test",
+        CompileMode::Check { test: false } => "-check",
         CompileMode::Doc => "-doc",
         CompileMode::Doctest => "-doctest",
         CompileMode::Docscrape => "-docscrape",
@@ -589,23 +682,64 @@ pub(super) fn map_to_store_path(
     path.to_string()
 }
 
+/// A vendored crate's stable identity: name + version + source checksum.
+/// Referencing each unit's dependency by this per-crate identity — one
+/// content-addressed FOD per crate — decouples the lock axis: a `Cargo.lock`
+/// bump that changes one crate leaves every other crate's identity, and thus
+/// every non-dependent unit's input, untouched.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Change 2 of docs/input-decoupling-spec.md, proven by its test but not wired in yet"
+    )
+)]
+pub(super) fn per_crate_vendor_id(name: &str, version: &str, checksum: &str) -> String {
+    format!("{name}-{version}-{checksum}")
+}
+
+/// The aggregate vendor identity cargo-schnee references today: a hash over the
+/// whole lock. Any single entry change moves it, so every dependency unit's
+/// input moves — the coupling the per-crate identity replaces.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Change 2 of docs/input-decoupling-spec.md, the baseline its test compares against"
+    )
+)]
+pub(super) fn aggregate_vendor_id(entries: &[(String, String, String)]) -> String {
+    let mut h = Sha256::new();
+    for (name, version, checksum) in entries {
+        for field in [name, version, checksum] {
+            h.update(field.as_bytes());
+            h.update(b"\0");
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
 /// Compute deterministic extra-filename hash for a unit.
-/// Includes features and crate types to avoid StableCrateId collisions
-/// when the same crate is compiled with different configurations.
+/// Includes features, crate types and the profile to avoid StableCrateId
+/// collisions when the same crate is compiled with different configurations.
+/// A consumer can see both profile variants of a crate through
+/// `-L dependency=`, one through a proc macro and one through a library.
 pub(super) fn compute_extra_filename(
     pkg_name: &str,
     pkg_version: &str,
     target_name: &str,
     features: &[String],
     crate_types: &[String],
+    profile_identity: &str,
 ) -> String {
     let input = format!(
-        "{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}-{}",
         pkg_name,
         pkg_version,
         target_name,
         features.join(","),
-        crate_types.join(",")
+        crate_types.join(","),
+        profile_identity,
     );
     let hash = Sha256::digest(input.as_bytes());
     format!(
@@ -766,6 +900,61 @@ pub(super) fn toposort(
     Ok(result)
 }
 
+/// Outcome of looking up the lib unit a feature-activated optional dependency
+/// resolves to.
+enum LibUnitLookup<'a> {
+    /// A lib unit exists that the consumer may legitimately link.
+    Found(&'a Unit),
+    /// A lib unit exists, but only for a compile kind the consumer cannot
+    /// link.
+    WrongKind,
+    /// No lib unit for that package is in the graph at all.
+    Absent,
+}
+
+/// Find the lib unit of `pkg_name` that `consumer` is allowed to link.
+///
+/// Cargo's unit graphs contain no host-to-target edges.  A unit compiled for
+/// the host links host artefacts only, and a unit compiled for a target links
+/// target artefacts plus host-built proc macros — the one direction in which
+/// the kinds legitimately mix.  Matching `consumer.kind` exactly, with that
+/// single exception, reproduces cargo's own rule.  There is deliberately no
+/// fallback to the other kind: rustc cannot open an rlib built for a
+/// different target, so an inexact match is never better than no match.
+///
+/// The proc-macro exception matters because callers reach here for both
+/// `Host` build-script compiles and `Target` lib compiles, and the latter
+/// must still be able to pick up a proc macro, which cargo always builds for
+/// the host.
+///
+/// Without the kind filter, sort order decides instead.  `all_units` is
+/// sorted by [`compilation_identity`], whose `-host` infix sorts *after* the
+/// target form, so a plain `find` returns the target unit on every cross
+/// build and hands host build-script compiles rlibs rustc cannot load.
+fn find_linkable_lib_unit<'a>(
+    all_units: &'a [Unit],
+    pkg_name: &str,
+    consumer: &Unit,
+) -> LibUnitLookup<'a> {
+    let is_lib_of_pkg = |c: &Unit| {
+        c.pkg.name().as_str() == pkg_name
+            && c.target.is_lib()
+            && !c.target.is_custom_build()
+            && c.mode != CompileMode::RunCustomBuild
+    };
+    let linkable_by =
+        |c: &Unit| c.kind == consumer.kind || (c.target.for_host() && c.kind == CompileKind::Host);
+
+    let mut candidates = all_units.iter().filter(|c| is_lib_of_pkg(c)).peekable();
+    if candidates.peek().is_none() {
+        return LibUnitLookup::Absent;
+    }
+    match candidates.find(|c| linkable_by(c)) {
+        Some(candidate) => LibUnitLookup::Found(candidate),
+        None => LibUnitLookup::WrongKind,
+    }
+}
+
 /// Return `(extern_name, dep_key)` pairs for optional deps that are activated
 /// by features but missing from `dep_extern`.
 ///
@@ -828,7 +1017,16 @@ pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
         for i in 0..nix_units.len() {
             let unit = &nix_units[i];
             let mut max_dep: usize = 0;
-            for (_, dep_key) in &unit.dep_extern {
+            // A linking unit whose libraries were compiled against split
+            // metadata halves reaches their link halves only through
+            // `all_dep_keys`, and each is an input that must be registered
+            // before it.
+            let lib_deps = unit
+                .dep_extern
+                .iter()
+                .map(|(_, k)| k)
+                .chain(&unit.all_dep_keys);
+            for dep_key in lib_deps {
                 if let Some(&dep_idx) = key_to_idx.get(dep_key) {
                     max_dep = max_dep.max(unit_level[dep_idx] + 1);
                 }
@@ -879,12 +1077,25 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
         UnitKind::Doc => "-doc",
         UnitKind::Compile => "",
     };
+    // For Check units the test bool distinguishes two distinct cargo
+    // unit graph nodes (lib in `cfg(test)` mode vs without).  They must
+    // not unify across that split — see compilation_identity.
     let kind_suffix = if u.for_host { "-host" } else { "" };
     let mut ct = u.crate_types.clone();
     ct.sort();
+    // Variants with different profiles stay apart, as they do in Cargo, so
+    // a build dependency keeps its build-override profile.
     format!(
-        "{}/{}/{}{}{}/{}:{:?}",
-        u.crate_name, u.edition, u.source_file, mode_suffix, kind_suffix, u.manifest_dir, ct,
+        "{}/{}/{}{}{}{}/{}:{:?}:{}",
+        u.crate_name,
+        u.edition,
+        u.source_file,
+        mode_suffix,
+        check_test_suffix(u.compile_test, u.kind),
+        kind_suffix,
+        u.manifest_dir,
+        ct,
+        u.profile.identity(),
     )
 }
 
@@ -893,7 +1104,7 @@ fn feature_agnostic_group_key(u: &NixUnit) -> String {
 /// cargo's v2 resolver produces separate host/target feature sets for the same
 /// crate (e.g. proc_macro2 with and without `span-locations`).
 fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
-    use log::info;
+    use tracing::info;
 
     // Group indices by a feature-agnostic key.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
@@ -965,6 +1176,7 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             target_name_field,
             &unified,
             &u.crate_types,
+            &u.profile.identity(),
         );
 
         // Compute new key from a synthetic identity string.
@@ -976,19 +1188,25 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             UnitKind::Doc => "-doc",
             UnitKind::Compile => "",
         };
+        // Mirrors compilation_identity: a Check unit's `test: true` mode
+        // is distinct from `test: false`.  Without this the two groups'
+        // survivors would collide on the new key.
+        let test_suffix = check_test_suffix(u.compile_test, u.kind);
         let kind_suffix = if u.for_host { "-host" } else { "" };
         let mut crate_types_sorted = u.crate_types.clone();
         crate_types_sorted.sort();
         let unified_identity = format!(
-            "{}-{}-{}{}{}-{}-{:?}-{}",
+            "{}-{}-{}{}{}{}-{}-{:?}-{}-{}",
             pkg_name,
             pkg_version,
             target_name_field,
             mode_suffix,
+            test_suffix,
             kind_suffix,
             u.edition,
             crate_types_sorted,
             unified.join(","),
+            u.profile.identity(),
         );
         let hash = Sha256::digest(unified_identity.as_bytes());
         let short_hash = format!(
@@ -1003,8 +1221,14 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         // Use target_name_field directly (not .replace('_', "-")) to match
         // make_unit_key which uses unit.target.name() without conversion.
         let new_key = sanitize_drv_name(&format!(
-            "{}-{}-{}{}{}-{}",
-            pkg_name, pkg_version, target_name_field, mode_suffix, type_suffix, short_hash,
+            "{}-{}-{}{}{}{}-{}",
+            pkg_name,
+            pkg_version,
+            target_name_field,
+            mode_suffix,
+            test_suffix,
+            type_suffix,
+            short_hash,
         ));
 
         // Update redirect map with the actual new key.
@@ -1014,17 +1238,11 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             redirect.insert(nix_units[idx].key.clone(), new_key.clone());
         }
 
-        // Merge is_root and target_name from all variants.
-        let mut merged_is_root = false;
-        let mut merged_target_name = String::new();
-        for &idx in indices {
-            if nix_units[idx].is_root {
-                merged_is_root = true;
-                if merged_target_name.is_empty() {
-                    merged_target_name = nix_units[idx].target_name.clone();
-                }
-            }
-        }
+        // Merge is_root from all variants.  `target_name` needs no merge:
+        // `feature_agnostic_group_key` keys on crate name, source file and
+        // manifest dir, so every variant in a group is the same cargo
+        // target and already carries the same name.
+        let merged_is_root = indices.iter().any(|&idx| nix_units[idx].is_root);
 
         // Merge dep_extern: union across all variants, preferring the smallest key
         // (which will be redirected later).
@@ -1051,9 +1269,6 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         u.features = unified;
         u.extra_filename = new_extra_filename;
         u.is_root = merged_is_root;
-        if merged_is_root && !merged_target_name.is_empty() {
-            u.target_name = merged_target_name;
-        }
         u.dep_extern = merged_dep_extern_vec;
     }
 
@@ -1113,12 +1328,46 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
 mod tests {
     use super::*;
 
+    /// Change 2 (lock axis): a vendored crate's per-crate identity is a function
+    /// of only its own (name, version, checksum), so a `Cargo.lock` bump that
+    /// touches one crate leaves the others' identities — and any unit that does
+    /// not depend on the changed crate — untouched. The aggregate identity
+    /// cargo-schnee references today moves on any entry change, coupling all.
+    #[test]
+    fn vendor_identity_decouples_per_crate() {
+        let lock_v1 = vec![
+            ("serde".to_string(), "1.0.0".to_string(), "aaa".to_string()),
+            ("tokio".to_string(), "1.0.0".to_string(), "bbb".to_string()),
+        ];
+        // Bump only tokio.
+        let lock_v2 = vec![
+            ("serde".to_string(), "1.0.0".to_string(), "aaa".to_string()),
+            ("tokio".to_string(), "1.1.0".to_string(), "ccc".to_string()),
+        ];
+
+        let serde_before = per_crate_vendor_id("serde", "1.0.0", "aaa");
+        let serde_after = per_crate_vendor_id("serde", "1.0.0", "aaa");
+        let tokio_before = per_crate_vendor_id("tokio", "1.0.0", "bbb");
+        let tokio_after = per_crate_vendor_id("tokio", "1.1.0", "ccc");
+
+        assert_eq!(
+            serde_before, serde_after,
+            "serde's vendor identity is unchanged by a tokio bump"
+        );
+        assert_ne!(tokio_before, tokio_after, "tokio's own identity changes");
+        assert_ne!(
+            aggregate_vendor_id(&lock_v1),
+            aggregate_vendor_id(&lock_v2),
+            "the aggregate vendor id couples every crate to any lock change (the bug being fixed)"
+        );
+    }
+
     /// Build a minimal NixUnit for testing.  Only the fields relevant to
     /// feature-unification and dependency tracking are populated.
     fn make_unit(name: &str, version: &str, features: &[&str], deps: &[(&str, &str)]) -> NixUnit {
         let feats: Vec<String> = features.iter().map(|f| f.to_string()).collect();
         let crate_types = vec!["lib".to_string()];
-        let extra_filename = compute_extra_filename(name, version, name, &feats, &crate_types);
+        let extra_filename = compute_extra_filename(name, version, name, &feats, &crate_types, "");
         let identity = format!(
             "{}-{}-{}-{}-{:?}-{}",
             name,
@@ -1165,7 +1414,12 @@ mod tests {
             is_root: false,
             target_name: String::new(),
             for_host: false,
+            compile_test: false,
+            sliced_crate_rel: None,
+            profile: Default::default(),
+            pipeline: Default::default(),
             drv_path: None,
+            drv_json: None,
         }
     }
 
@@ -1400,13 +1654,14 @@ mod tests {
 
     #[test]
     fn extra_filename_differs_with_features() {
-        let a = compute_extra_filename("foo", "1.0.0", "foo", &["a".into()], &["lib".into()]);
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["a".into()], &["lib".into()], "");
         let b = compute_extra_filename(
             "foo",
             "1.0.0",
             "foo",
             &["a".into(), "b".into()],
             &["lib".into()],
+            "",
         );
         assert_ne!(
             a, b,
@@ -1414,10 +1669,28 @@ mod tests {
         );
     }
 
+    /// A consumer can reach the build-override and the main variant of one
+    /// crate through `-L dependency=`, so they need distinct filenames.
+    #[test]
+    fn extra_filename_differs_with_profile() {
+        let feats = ["x".to_string()];
+        let types = ["lib".to_string()];
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &feats, &types, "|0|false|release");
+        let b = compute_extra_filename(
+            "foo",
+            "1.0.0",
+            "foo",
+            &feats,
+            &types,
+            "-C opt-level=3|3|false|release",
+        );
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn extra_filename_deterministic() {
-        let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
-        let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()]);
+        let a = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()], "");
+        let b = compute_extra_filename("foo", "1.0.0", "foo", &["x".into()], &["lib".into()], "");
         assert_eq!(a, b);
     }
 
@@ -1702,6 +1975,20 @@ mod tests {
         );
     }
 
+    /// A crate built with the build-override profile for a proc macro and
+    /// with the main profile for a library stays two units, as in Cargo.
+    #[test]
+    fn unify_keeps_profile_variants_apart() {
+        let a = make_unit("syn", "2.0.0", &["full"], &[]);
+        let mut b = make_unit("syn", "2.0.0", &["full", "visit"], &[]);
+        b.profile.rustc_args = vec!["-C".into(), "opt-level=3".into()];
+        b.key = "syn-opt".into();
+        let mut units = vec![a, b];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 2);
+        assert_ne!(units[0].extra_filename, units[1].extra_filename);
+    }
+
     // -- Doc kind tests ---------------------------------------------------------
 
     #[test]
@@ -1735,5 +2022,100 @@ mod tests {
         u.kind = UnitKind::Doc;
         let filename = u.output_lib_filename();
         assert_eq!(filename, "doc/my_lib");
+    }
+}
+
+#[cfg(test)]
+mod build_script_dep_tests {
+    use super::super::profile::tests::PLANNER;
+    use super::super::{TargetConfig, fresh_unit_graph};
+    use super::*;
+
+    const FILES: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nserde = { path = \"serde\", features = [\"derive\"] }\n",
+        ),
+        ("src/main.rs", "fn main() {}\n"),
+        (
+            "serde/Cargo.toml",
+            "[package]\nname = \"serde\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nserde_derive = { path = \"../serde_derive\", optional = true }\n\n\
+             [features]\nderive = [\"serde_derive\"]\n",
+        ),
+        ("serde/build.rs", "fn main() {}\n"),
+        ("serde/src/lib.rs", ""),
+        (
+            "serde_derive/Cargo.toml",
+            "[package]\nname = \"serde_derive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [lib]\nproc-macro = true\n",
+        ),
+        ("serde_derive/src/lib.rs", ""),
+        (
+            "Cargo.lock",
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"serde\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"0.1.0\"\ndependencies = [\n \"serde_derive\",\n]\n\n\
+             [[package]]\nname = \"serde_derive\"\nversion = \"0.1.0\"\n",
+        ),
+    ];
+
+    /// serde's `derive` feature activates `serde_derive`, a regular dependency.
+    /// Cargo compiles serde's build script against its `[build-dependencies]`
+    /// only, so the build script must not wait for `serde_derive` and its
+    /// closure.
+    #[test]
+    fn feature_activated_regular_dep_stays_out_of_build_script() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in FILES {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vendor = tempfile::tempdir().unwrap();
+        let _planner = PLANNER.lock().unwrap_or_else(|e| e.into_inner());
+        let (units, _, _) = fresh_unit_graph(
+            dir.path(),
+            vendor.path(),
+            "release",
+            &TargetConfig::native(),
+            UserIntent::Build,
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let serde_unit = |kind: UnitKind| {
+            units
+                .iter()
+                .find(|u| {
+                    u.kind == kind
+                        && u.cargo_envs
+                            .iter()
+                            .any(|(k, v)| k == "CARGO_PKG_NAME" && v == "serde")
+                })
+                .unwrap()
+        };
+        let names_derive = |key: &String| key.starts_with("serde_derive-");
+
+        let build_script = serde_unit(UnitKind::BuildScriptCompile);
+        assert!(
+            !build_script.dep_extern.iter().any(|(_, k)| names_derive(k)),
+            "{:?}",
+            build_script.dep_extern
+        );
+        assert!(
+            !build_script.all_dep_keys.iter().any(names_derive),
+            "{:?}",
+            build_script.all_dep_keys
+        );
+
+        let lib = serde_unit(UnitKind::Compile);
+        assert!(lib.dep_extern.iter().any(|(_, k)| names_derive(k)));
     }
 }

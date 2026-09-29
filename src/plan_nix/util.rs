@@ -15,7 +15,13 @@ pub(crate) fn collect_store_paths(s: &str, paths: &mut HashSet<String>) {
             let hash_part = &after_prefix[..32];
             if hash_part.bytes().all(|b| NIX_BASE32.contains(&b)) {
                 let rest = &after_prefix[33..];
-                let name_end = rest.find(['/', ' ', '"', '\'', ')']).unwrap_or(rest.len());
+                // `=` terminates the name so `--remap-path-prefix
+                // <store-path>=<replacement>` doesn't accidentally extend the
+                // captured path past the literal store entry.  `=` is not a
+                // valid character in Nix store names so this is loss-free.
+                let name_end = rest
+                    .find(['/', ' ', '"', '\'', ')', '='])
+                    .unwrap_or(rest.len());
                 let root = &s[start..start + "/nix/store/".len() + 32 + 1 + name_end];
                 paths.insert(root.to_string());
             }
@@ -30,6 +36,26 @@ pub(super) fn which_rustc() -> Result<PathBuf> {
 
 pub(super) fn which_rustdoc() -> Result<PathBuf> {
     which_command("rustdoc")
+}
+
+pub(super) fn which_clippy_driver() -> Result<PathBuf> {
+    which_command("clippy-driver")
+}
+
+/// Resolve `bash` on PATH and return the canonical binary path together
+/// with the containing store root.  Derivations that name `bash` as
+/// `"builder"` must list the store root in `inputSrcs`; otherwise the
+/// sandbox does not bind-mount it and the build fails with
+/// `executing '/nix/store/.../bin/bash': No such file or directory`.
+pub(super) fn which_bash() -> Result<(String, String)> {
+    let bash_path = which_command("bash")?.to_string_lossy().to_string();
+    let bash_store = PathBuf::from(&bash_path)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive bash store path from {}", bash_path))?
+        .to_string_lossy()
+        .to_string();
+    Ok((bash_path, bash_store))
 }
 
 pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
@@ -48,7 +74,7 @@ pub(super) fn which_command_no_deref(name: &str) -> Result<PathBuf> {
     );
 }
 
-pub(super) fn which_command(name: &str) -> Result<PathBuf> {
+pub(crate) fn which_command(name: &str) -> Result<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
             let candidate = PathBuf::from(dir).join(name);
@@ -157,6 +183,25 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Descriptor on which every process that compiles or runs a `TestCompile`
+/// unit holds the crate directory open. It sits below the common soft
+/// `RLIMIT_NOFILE` of 1024.
+pub(crate) const TEST_MANIFEST_DIR_FD: i32 = 1000;
+
+/// The `CARGO_MANIFEST_DIR` a `TestCompile` unit is compiled with and its
+/// binary runs with.
+///
+/// `/proc/self/fd/<n>` resolves in each process to whatever that process
+/// holds open on descriptor `n`. The compile derivation opens the crate's
+/// read-only store path there, so proc macros such as `sqlx::migrate!` read
+/// the crate's files. The test runner opens the writable checkout there, so
+/// the `env!` value baked into the binary resolves to that run's own
+/// checkout. The path is the same on every machine, so it adds nothing to the
+/// derivation, and no run shares it with another or leaves a file behind.
+pub(crate) fn test_manifest_dir() -> String {
+    format!("/proc/self/fd/{TEST_MANIFEST_DIR_FD}")
+}
+
 pub(crate) fn sanitize_drv_name(name: &str) -> String {
     let s: String = name
         .chars()
@@ -175,9 +220,93 @@ pub(crate) fn sanitize_drv_name(name: &str) -> String {
     }
 }
 
+/// The `[package.metadata.schnee] extra-includes` globs of the manifest
+/// text `manifest`, written relative to the package directory. Empty when
+/// the manifest does not parse or declares none.
+pub(crate) fn package_extra_includes(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["package", "metadata", "schnee", "extra-includes"],
+    )
+}
+
+/// The `[workspace.metadata.schnee] extra-includes` globs of the manifest
+/// text `manifest`, written relative to the workspace root.
+pub(crate) fn workspace_extra_includes(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["workspace", "metadata", "schnee", "extra-includes"],
+    )
+}
+
+/// The `[workspace] members` globs of the manifest text `manifest`.
+pub(crate) fn workspace_member_patterns(manifest: &str) -> Vec<String> {
+    string_array(manifest, &["workspace", "members"])
+}
+
+fn string_array(manifest: &str, keys: &[&str]) -> Vec<String> {
+    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
+        return Vec::new();
+    };
+    keys.iter()
+        .try_fold(&doc, |v, k| v.get(k))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rewrite `pattern`, a glob relative to the package at `crate_rel`, as a
+/// glob relative to the project source root. A `..` that climbs above the
+/// root becomes `.parent`, where the project source keeps files from
+/// outside the project. A trailing `**` becomes `**/*`, because the `glob`
+/// crate matches `dir/**` against the directory alone.
+pub(crate) fn project_relative_pattern(crate_rel: &str, pattern: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in crate_rel.split('/').chain(pattern.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != ".parent") => {
+                parts.pop();
+            }
+            ".." => parts.push(".parent"),
+            _ => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if joined.ends_with("**") {
+        format!("{joined}/*")
+    } else {
+        joined
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_relative_pattern_maps_escapes_to_parent() {
+        assert_eq!(
+            project_relative_pattern("crates/a", "../../spec/**"),
+            "spec/**/*"
+        );
+        assert_eq!(
+            project_relative_pattern("crates/a", "gen/*.rs"),
+            "crates/a/gen/*.rs"
+        );
+        assert_eq!(
+            project_relative_pattern("", "../spec/x.json"),
+            ".parent/spec/x.json"
+        );
+        assert_eq!(
+            project_relative_pattern("a", "../../../other/x"),
+            ".parent/.parent/other/x"
+        );
+    }
     use proptest::prelude::*;
 
     #[test]
@@ -291,6 +420,20 @@ mod tests {
             &mut paths,
         );
         assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-start"));
+    }
+
+    #[test]
+    fn collect_store_paths_terminates_at_equals() {
+        // `--remap-path-prefix <path>=<replacement>` lands a literal
+        // `<store-path>=<replacement>` token in the script.  The replacement
+        // must not be appended to the captured store path.
+        let mut paths = HashSet::new();
+        collect_store_paths(
+            "--remap-path-prefix /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src=crates",
+            &mut paths,
+        );
+        assert!(paths.contains("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src"));
+        assert!(!paths.iter().any(|p| p.contains("=crates")));
     }
 
     #[test]

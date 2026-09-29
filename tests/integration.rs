@@ -13,6 +13,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 static MINIMAL_BIN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static MINIMAL_LIB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static WORKSPACE_ADVANCED_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lock(m: &'static LazyLock<Mutex<()>>) -> MutexGuard<'static, ()> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -189,6 +190,7 @@ fn fixture_workspace_binaries() {
 #[test]
 #[ignore]
 fn fixture_workspace_advanced() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
     let fixture_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -280,6 +282,144 @@ fn fixture_workspace_warm_rebuild() {
 
     assert_eq!(hash_a1, hash_a2, "warm rebuild changed bin-a");
     assert_eq!(hash_b1, hash_b2, "warm rebuild changed bin-b");
+}
+
+/// Run a nix command with the features cargo-schnee's derivations need and
+/// return its stdout lines.
+fn nix_lines(program: &str, args: &[&str]) -> Vec<String> {
+    let output = Command::new(program)
+        .args(args)
+        .env(
+            "NIX_CONFIG",
+            "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+        )
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {program}: {e}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A build leaves a GC root under `target/` that keeps every unit
+/// derivation and every unit output alive, so a garbage collection
+/// between two builds does not force a rebuild.
+#[test]
+#[ignore]
+fn fixture_build_roots_derivations_and_outputs() {
+    let _guard = lock(&WORKSPACE_BINS_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-bins");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let roots_dir = fixture_dir.join("target/.schnee-roots");
+    let links: Vec<PathBuf> = std::fs::read_dir(&roots_dir)
+        .unwrap_or_else(|e| panic!("No GC roots at {}: {}", roots_dir.display(), e))
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(links.len(), 1, "expected one GC root, got {links:?}");
+    let root = std::fs::read_link(&links[0]).expect("GC root is not a symlink");
+    let root = root.to_string_lossy().to_string();
+
+    let kept: Vec<String> = nix_lines("nix-store", &["--query", "--references", &root]);
+    let drvs: Vec<&str> = kept
+        .iter()
+        .map(String::as_str)
+        .filter(|p| p.ends_with(".drv"))
+        .collect();
+    assert!(
+        drvs.iter().any(|d| d.contains("shared-lib")),
+        "the dependency's derivation is not rooted: {kept:?}"
+    );
+    assert!(
+        drvs.iter().any(|d| d.ends_with("-build-aggregator.drv")),
+        "the aggregator derivation is not rooted: {kept:?}"
+    );
+    // A content-addressed output carries its derivation's name, so every
+    // rooted derivation must come with a rooted path of the same name.
+    // Matching names keeps the check independent of how the Nix client on
+    // `PATH` looks up the realisation of a derivation with inputs.
+    let name = |path: &str| path.get("/nix/store/".len() + 33..).map(str::to_string);
+    let output_names: Vec<String> = kept
+        .iter()
+        .filter(|p| !p.ends_with(".drv"))
+        .filter_map(|p| name(p))
+        .collect();
+    for drv in &drvs {
+        let wanted = name(drv).unwrap();
+        let wanted = wanted.strip_suffix(".drv").unwrap();
+        assert!(
+            output_names.iter().any(|n| n == wanted),
+            "the output of {drv} is not rooted: {kept:?}"
+        );
+    }
+}
+
+/// Writes a file's original contents back when dropped, so a test that
+/// edits a fixture leaves it unchanged even when an assertion fails.
+struct RestoreFile {
+    path: PathBuf,
+    original: Vec<u8>,
+}
+
+impl RestoreFile {
+    fn edit(path: PathBuf, from: &str, to: &str) -> Self {
+        let original = std::fs::read(&path).expect("Failed to read fixture file");
+        let edited = String::from_utf8_lossy(&original).replace(from, to);
+        assert_ne!(
+            edited.as_bytes(),
+            original.as_slice(),
+            "edit changed nothing"
+        );
+        std::fs::write(&path, edited).expect("Failed to edit fixture file");
+        Self { path, original }
+    }
+}
+
+impl Drop for RestoreFile {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+    }
+}
+
+/// A warm build must compile the current sources of a workspace member.
+/// The member is sliced onto its own store path, and the removed unit-graph
+/// cache kept the slice of the first build, so the second build ran the
+/// old binary.
+#[test]
+#[ignore]
+fn fixture_workspace_warm_rebuild_sees_member_edit() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
+    let manifest = fixture_dir.join("Cargo.toml");
+    let binary = fixture_dir.join("target/debug/app");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let _restore = RestoreFile::edit(
+        fixture_dir.join("app/src/main.rs"),
+        "answer={}",
+        "answer2={}",
+    );
+    run_schnee_build(&manifest);
+
+    let output = Command::new(&binary).output().expect("Failed to run app");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("answer2=42"),
+        "warm build compiled stale sources: {}",
+        stdout
+    );
 }
 
 // B6: warm build produces identical binary
@@ -726,6 +866,43 @@ fn fixture_extra_includes_parent() {
     );
 }
 
+/// A build script sees only its package directory, so reading a sibling
+/// directory without declaring it fails, and the failure names the path.
+#[test]
+#[ignore]
+fn fixture_build_script_sibling_undeclared() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/build-script-sibling-undeclared");
+    clean_target(&fixture_dir);
+    let output = Command::new(cargo_schnee_bin())
+        .args(["schnee", "build", "--manifest-path"])
+        .arg(fixture_dir.join("Cargo.toml"))
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the build must fail:\n{stderr}");
+    assert!(
+        stderr.contains("the build script of reader names ../spec/api.txt"),
+        "the failure must name the missing path:\n{stderr}"
+    );
+}
+
+/// The same build script succeeds once its package declares the sibling
+/// directory in `[package.metadata.schnee] extra-includes`.
+#[test]
+#[ignore]
+fn fixture_build_script_sibling_declared() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/build-script-sibling-declared");
+    clean_target(&fixture_dir);
+    run_schnee_build(&fixture_dir.join("Cargo.toml"));
+    let output = Command::new(fixture_dir.join("target/debug/reader"))
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("first line of the spec"));
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the
@@ -838,6 +1015,49 @@ fn fixture_cross_build_script_link_search() {
 
     let binary =
         fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/cross-bs-link-search-app");
+    assert!(
+        binary.exists(),
+        "Cross-compiled binary not found at {}",
+        binary.display()
+    );
+}
+
+// Cross-compilation: a host-only crate reached through a proc-macro emits
+// `cargo:rustc-link-search` and `cargo:rustc-link-lib` for a host-format
+// archive its build script compiles. Cargo scopes those directives to the
+// host compile kind, so the cross link of the binary must not see them. When
+// it does, `aarch64-unknown-linux-gnu-ld` skips the x86_64 archive and fails
+// to resolve `-lhostonly`.
+#[test]
+#[ignore]
+fn fixture_cross_host_build_script_link_directives_stay_host_only() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross-bs-host-link");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-gnu")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .output()
+        .expect("Failed to execute cargo-schnee with --target");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "cross build leaked host link directives:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr,
+    );
+
+    let binary = fixture_dir.join("target/aarch64-unknown-linux-gnu/debug/cross-bs-host-link-app");
     assert!(
         binary.exists(),
         "Cross-compiled binary not found at {}",
@@ -1079,6 +1299,21 @@ fn fixture_test_manifest_dir_writable() {
     run_schnee_test(&manifest);
 }
 
+/// A workspace member is sliced to its own per-crate source store, so its
+/// manifest dir no longer sits under the project source store. Each member
+/// must still get its own CARGO_MANIFEST_DIR symlink, pointing at the
+/// checkout rather than at the store path it was compiled against.
+#[test]
+#[ignore]
+fn fixture_workspace_manifest_dir_writable() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/workspace-manifest-dir-writable");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_test(&manifest);
+}
+
 /// Building from a workspace member's manifest should scope the build to
 /// that member only, matching standard `cargo` behaviour.
 /// Regression test for: cargo test from a subcrate builds the entire workspace.
@@ -1125,6 +1360,40 @@ fn fixture_lib_bin_integration_test() {
 
     clean_target(&fixture_dir);
     run_schnee_test(&manifest);
+}
+
+/// Workspace where two crates form a dev-dep cycle: `lib-upper` depends on
+/// `lib-lower` (production), and `lib-lower`'s integration tests pull in
+/// `lib-upper` as a dev-dep.  Cargo plans this as
+/// `lib-lower (Check{test:false}) ← lib-upper (Check{test:false})`
+/// for the production graph and
+/// `lib-lower (Check{test:true}) ← lib-upper` for the integration test
+/// — two distinct units that share a `-check` suffix.  If cargo-schnee's
+/// `compilation_identity` collapses the two `Check` modes into one
+/// NixUnit, the dev-dep edge from the test variant closes a cycle that
+/// breaks topological registration with `Topological sort failed: cycle
+/// detected`.  This fixture exercises that exact shape under
+/// `clippy --all-targets --deny warnings`.
+#[test]
+#[ignore]
+fn fixture_dev_dep_cycle() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dep-cycle");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd(
+        "clippy",
+        &manifest,
+        &[
+            "--release",
+            "--no-deps",
+            "--all-targets",
+            "--",
+            "--deny",
+            "warnings",
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,4 +1444,296 @@ fn fixture_minimal_lib_doc_private_items() {
         doc_content.contains("helper"),
         "Private fn 'helper' should appear in docs with --document-private-items"
     );
+}
+
+/// Copy `fixtures/<name>` into a fresh git repository under the test target
+/// directory, so its sources are new to the store and every unit is cold.
+fn fresh_fixture_copy(name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{nanos}"));
+    let status = Command::new("cp")
+        .arg("-r")
+        .arg(&src)
+        .arg(&dest)
+        .status()
+        .expect("Failed to run cp");
+    assert!(status.success(), "copying {} failed", src.display());
+    let _ = std::fs::remove_dir_all(dest.join("target"));
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&dest)
+        .status()
+        .expect("Failed to run git init");
+    assert!(status.success(), "git init failed in {}", dest.display());
+    dest
+}
+
+/// The store paths a plan added as sources, from its `Added source` lines.
+fn added_sources(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.split("Added source ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(String::from)
+        .collect()
+}
+
+/// Plan `project` with `--plan-only` and return the sources the plan added.
+/// The roots file goes outside the project, where it cannot join the
+/// source.
+fn plan_added_sources(project: &Path, label: &str) -> Vec<String> {
+    let roots = project.with_extension(format!("{label}.roots"));
+    let output = Command::new(cargo_schnee_bin())
+        .args(["schnee", "build", "--manifest-path"])
+        .arg(project.join("Cargo.toml"))
+        .arg("--plan-only")
+        .arg(&roots)
+        .env("RUST_LOG", "info")
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "plan failed:\n{stderr}");
+    added_sources(&stderr)
+}
+
+/// Append a comment unique to this run to `file`, so the store cannot hold
+/// the edited source from an earlier run.
+fn unique_edit(file: &Path) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let body = std::fs::read_to_string(file).unwrap();
+    std::fs::write(file, format!("{body}// {nanos}\n")).unwrap();
+}
+
+/// A project with an external path dependency plans its unit graph from its
+/// manifests alone, so an edit keeps the whole project source out of the
+/// store there too.
+#[test]
+#[ignore]
+fn fixture_edit_with_external_dep_adds_only_its_slice() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("external-{nanos}"));
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["external-path-dep", "external-dep-lib"] {
+        let status = Command::new("cp")
+            .arg("-r")
+            .arg(fixtures.join(name))
+            .arg(root.join(name))
+            .status()
+            .expect("Failed to run cp");
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(root.join(name).join("target"));
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.join(name))
+            .status()
+            .expect("Failed to run git init");
+        assert!(status.success());
+    }
+    let project = root.join("external-path-dep");
+    plan_added_sources(&project, "first");
+
+    unique_edit(&project.join("src/main.rs"));
+    let added = plan_added_sources(&project, "edited");
+
+    assert!(
+        !added.iter().any(|p| p.ends_with("-project-src")),
+        "the whole project source reached the store: {added:?}"
+    );
+    assert_eq!(added.len(), 1, "one source added: {added:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An edit to one crate adds only that crate's slice to the store. The
+/// whole project source stays out of it.
+#[test]
+#[ignore]
+fn fixture_edit_adds_only_its_crate_slice() {
+    let project = fresh_fixture_copy("workspace-bins");
+    plan_added_sources(&project, "first");
+
+    unique_edit(&project.join("bin-a/src/main.rs"));
+    let added = plan_added_sources(&project, "edited");
+
+    assert_eq!(added.len(), 1, "one source added: {added:?}");
+    assert!(added[0].ends_with("-bin-a"), "{added:?}");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+/// Every local crate's warnings appear exactly once, on the build that
+/// compiles it and on a later build that finds it built. `warn-lib` has no
+/// input derivations and `warn-bin` depends on it, so both the unresolved and
+/// the resolved build trace lookups are covered. The replay reads the build
+/// trace over the daemon connection and never spawns `nix-store --realise`.
+#[test]
+#[ignore]
+fn fixture_warnings_replay_once() {
+    let project = fresh_fixture_copy("warnings-workspace");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for member in ["warn-lib/src/lib.rs", "warn-bin/src/main.rs"] {
+        let path = project.join(member);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("\npub const SALT: u128 = {nanos};\n"));
+        std::fs::write(&path, text).unwrap();
+    }
+
+    let real_nix_store = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v nix-store"])
+            .output()
+            .expect("Failed to locate nix-store")
+            .stdout,
+    )
+    .unwrap();
+    let wrapper_dir = project.join(".nix-store-wrapper");
+    let log = wrapper_dir.join("calls");
+    std::fs::create_dir_all(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("nix-store");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_nix_store.trim(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let manifest = project.join("Cargo.toml");
+    for build in ["cold", "warm"] {
+        let output = Command::new(cargo_schnee_bin())
+            .args(["schnee", "build", "--manifest-path"])
+            .arg(&manifest)
+            .env("PATH", &path)
+            .output()
+            .expect("Failed to execute cargo-schnee");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{build} build failed:\n{stderr}");
+        for warning in [
+            "unused variable: `unused_in_lib`",
+            "unused variable: `unused_in_bin`",
+        ] {
+            assert_eq!(
+                stderr.matches(warning).count(),
+                1,
+                "expected `{warning}` once on the {build} build:\n{stderr}",
+            );
+        }
+    }
+
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|l| l.contains("--realise")),
+        "cargo-schnee spawned nix-store --realise:\n{calls}",
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+/// Warnings from per-crate source slices point at the member's directory in
+/// the checkout, not at the slice's store path.
+#[test]
+#[ignore]
+fn fixture_warnings_point_at_checkout() {
+    let project = fresh_fixture_copy("warnings-workspace");
+    let (_, stderr) = run_schnee_build(&project.join("Cargo.toml"));
+    for file in ["warn-lib/src/lib.rs:2:9", "warn-bin/src/main.rs:2:9"] {
+        let expected = format!("--> {}/{file}", project.display());
+        assert!(
+            stderr.contains(&expected),
+            "expected `{expected}` in stderr:\n{stderr}",
+        );
+    }
+    assert!(
+        !stderr.contains("--> /nix/store/"),
+        "a warning points into the store:\n{stderr}",
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+/// Two `cargo schnee test` runs of one crate from two checkouts, alive at
+/// the same time, each see their own checkout through the compile-time
+/// `CARGO_MANIFEST_DIR`, and neither leaves anything behind in `/tmp`. The
+/// crate content is identical, so both runs execute the same test binary.
+#[test]
+#[ignore]
+fn fixture_concurrent_test_runs_see_their_own_checkout() {
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn start(project: &Path) -> Child {
+        Command::new(cargo_schnee_bin())
+            .args(["schnee", "test", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to execute cargo-schnee")
+    }
+
+    fn wait_for(path: &Path, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        while !path.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("run exited with {status} before {}", path.display());
+            }
+            assert!(Instant::now() < deadline, "timed out on {}", path.display());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn tmp_links_into(project: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| std::fs::read_link(p).is_ok_and(|t| t.starts_with(project)))
+            .collect()
+    }
+
+    let a = fresh_fixture_copy("manifest-dir-concurrent");
+    let b = fresh_fixture_copy("manifest-dir-concurrent");
+    let mut run_a = start(&a);
+    wait_for(&a.join("started"), &mut run_a);
+    let mut run_b = start(&b);
+    wait_for(&b.join("started"), &mut run_b);
+    std::fs::write(a.join("release"), "").unwrap();
+    std::fs::write(b.join("release"), "").unwrap();
+
+    for (project, run) in [(&a, run_a), (&b, run_b)] {
+        let output = run.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the run in {} failed:\nstdout:\n{}\nstderr:\n{}",
+            project.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let leaked = tmp_links_into(project);
+        assert!(leaked.is_empty(), "left in /tmp: {leaked:?}");
+    }
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
 }

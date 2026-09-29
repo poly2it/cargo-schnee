@@ -128,6 +128,35 @@
         RESULTS="/results/results.json"
         echo '[]' > "$RESULTS"
 
+        # ── Filter handling ───────────────────────────────────────────────
+        # The host runner may pass `--only <list>` which lands here as
+        # `/results/bench-filter` (one comma-separated line). Empty / no
+        # file means "run everything"; otherwise non-matching systems
+        # are recorded as SKIPPED so the markdown table still renders.
+        BENCH_FILTER=""
+        if [ -f /results/bench-filter ]; then
+          BENCH_FILTER="$(cat /results/bench-filter)"
+        fi
+
+        # Match `name` against the filter list. Returns 0 if `name` should
+        # run, 1 otherwise. The shorthand `schnee` matches `cargo-schnee`.
+        should_run() {
+          local name="$1"
+          if [ -z "$BENCH_FILTER" ]; then
+            return 0
+          fi
+          local IFS=','
+          for item in $BENCH_FILTER; do
+            item="''${item## }"
+            item="''${item%% }"
+            if [ "$item" = "$name" ] || \
+               { [ "$item" = "schnee" ] && [ "$name" = "cargo-schnee" ]; }; then
+              return 0
+            fi
+          done
+          return 1
+        }
+
         add_result() {
           local sys="$1" scenario="$2" status="$3" duration="$4"
           local tmp
@@ -201,6 +230,23 @@
             echo "    === nix log $drv ===" >>/results/build.log
             nix log "$drv" >>/results/build.log 2>&1 || \
               nix-store -l "$drv" >>/results/build.log 2>&1 || true
+
+            # Also extract logs of inner derivations that failed (e.g.
+            # cargo-schnee's per-crate build-script-run drvs). nix-store
+            # --realise reports "Cannot build '/nix/store/xxx.drv'" for
+            # each one; try `nix log` on each so the post-mortem
+            # contains the actual builder stderr (gcc errors, OOM kill
+            # diagnostics, etc.) rather than just the cascading
+            # "1 dependency failed".
+            grep -oE "/nix/store/[a-z0-9]+-[^']*\.drv" "$build_stderr" \
+              | sort -u | while IFS= read -r inner_drv; do
+                # Skip the outer drv we already logged.
+                if [ "$inner_drv" = "$drv" ]; then continue; fi
+                echo "    === nix log $inner_drv ===" >>/results/build.log
+                nix log "$inner_drv" >>/results/build.log 2>&1 || \
+                  nix-store -l "$inner_drv" >>/results/build.log 2>&1 || \
+                  echo "      (no log available)" >>/results/build.log
+              done
           fi
           rm -f "$build_stderr"
 
@@ -228,6 +274,7 @@
         echo ""
 
         # ── 1. cargo build (baseline) ────────────────────────────────────
+        if should_run "cargo-build"; then
         echo ">>> [1/5] cargo build (baseline)"
 
         WORK=$(mktemp -d)
@@ -256,8 +303,14 @@ CARGO_EOF
         cd /
         rm -rf "$WORK"
         echo ""
+        else
+          echo ">>> [1/5] cargo build (baseline) — SKIPPED (filter)"
+          add_result "cargo-build" "clean" "SKIPPED" 0
+          add_result "cargo-build" "incremental" "SKIPPED" 0
+        fi
 
         # ── 2. cargo-schnee (derivation) ──────────────────────────────────
+        if should_run "cargo-schnee"; then
         echo ">>> [2/5] cargo-schnee (derivation)"
         drop_caches
         run_bench_nix "cargo-schnee" "clean" ${schneeCleanDrv}
@@ -265,8 +318,14 @@ CARGO_EOF
         drop_caches
         run_bench_nix "cargo-schnee" "incremental" ${schneeIncrDrv}
         echo ""
+        else
+          echo ">>> [2/5] cargo-schnee — SKIPPED (filter)"
+          add_result "cargo-schnee" "clean" "SKIPPED" 0
+          add_result "cargo-schnee" "incremental" "SKIPPED" 0
+        fi
 
         # ── 3. buildRustPackage ──────────────────────────────────────────
+        if should_run "buildRustPackage"; then
         echo ">>> [3/5] buildRustPackage"
         drop_caches
         run_bench_nix "buildRustPackage" "clean" ${brpCleanDrv}
@@ -275,8 +334,14 @@ CARGO_EOF
         drop_caches
         run_bench_nix "buildRustPackage" "incremental" ${brpIncrDrv}
         echo ""
+        else
+          echo ">>> [3/5] buildRustPackage — SKIPPED (filter)"
+          add_result "buildRustPackage" "clean" "SKIPPED" 0
+          add_result "buildRustPackage" "incremental" "SKIPPED" 0
+        fi
 
         # ── 4. crane ────────────────────────────────────────────────────
+        if should_run "crane"; then
         echo ">>> [4/5] crane"
         drop_caches
         run_bench_nix "crane" "clean" ${craneCleanDrv}
@@ -285,8 +350,14 @@ CARGO_EOF
         drop_caches
         run_bench_nix "crane" "incremental" ${craneIncrDrv}
         echo ""
+        else
+          echo ">>> [4/5] crane — SKIPPED (filter)"
+          add_result "crane" "clean" "SKIPPED" 0
+          add_result "crane" "incremental" "SKIPPED" 0
+        fi
 
         # ── 5. cargo2nix (best-effort) ──────────────────────────────────
+        if should_run "cargo2nix"; then
         echo ">>> [5/5] cargo2nix"
         ${if cargo2nixEval.success then ''
 
@@ -323,6 +394,12 @@ CARGO_EOF
         add_result "cargo2nix" "clean" "SKIPPED" 0
         add_result "cargo2nix" "incremental" "SKIPPED" 0
         ''}
+        else
+          echo ">>> [5/5] cargo2nix — SKIPPED (filter)"
+          add_result "cargo2nix" "generate" "SKIPPED" 0
+          add_result "cargo2nix" "clean" "SKIPPED" 0
+          add_result "cargo2nix" "incremental" "SKIPPED" 0
+        fi
         echo ""
 
         # ── Done ────────────────────────────────────────────────────────
@@ -391,6 +468,46 @@ CARGO_EOF
 
         RESULTS_DIR="/tmp/cargo-schnee-bench-results"
 
+        # ── Argument parsing ──────────────────────────────────────────────
+        # `--only <name>` (repeatable, comma-separated) restricts the
+        # in-VM bench script to a subset of systems. Unmatched systems
+        # are recorded as SKIPPED so the markdown table still renders.
+        # Names accepted: cargo-build, cargo-schnee, buildRustPackage,
+        # crane, cargo2nix. The shorthand `schnee` matches `cargo-schnee`.
+        BENCH_FILTER=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --only)
+              if [ -z "''${2:-}" ]; then
+                echo "ERROR: --only requires an argument" >&2
+                exit 2
+              fi
+              BENCH_FILTER="$2"
+              shift 2
+              ;;
+            --only=*)
+              BENCH_FILTER="''${1#--only=}"
+              shift
+              ;;
+            -h|--help)
+              cat <<'EOF'
+Usage: cargo-schnee-bench [--only <system[,system,...]>]
+
+Options:
+  --only <list>   Comma-separated subset of systems to actually run.
+                  Others are recorded as SKIPPED. Examples:
+                    --only schnee
+                    --only cargo-schnee,crane
+EOF
+              exit 0
+              ;;
+            *)
+              echo "ERROR: unknown argument: $1" >&2
+              exit 2
+              ;;
+          esac
+        done
+
         # Check for KVM support
         if [ ! -e /dev/kvm ]; then
           echo "WARNING: /dev/kvm not found — VM will run without hardware"
@@ -401,6 +518,15 @@ CARGO_EOF
         # Prepare results directory
         rm -rf "$RESULTS_DIR"
         mkdir -p "$RESULTS_DIR"
+
+        # Hand the filter to the in-VM bench script via the 9p mount.
+        # Empty file means "run everything"; anything else is read by
+        # `should_run` inside the bench script.
+        if [ -n "$BENCH_FILTER" ]; then
+          echo "$BENCH_FILTER" > "$RESULTS_DIR/bench-filter"
+          echo "Bench filter: $BENCH_FILTER"
+          echo ""
+        fi
 
         # The VM's Nix DB (via closureInfo/additionalPaths) only knows
         # about runtime closures of pre-built tools.  Build-time paths
@@ -578,6 +704,15 @@ CARGO_EOF
         cp "$RESULTS_DIR"/profile-*.trace_event profiles/ 2>/dev/null || true
         cp "$RESULTS_DIR"/profile-*-crit.txt profiles/ 2>/dev/null || true
         cp "$RESULTS_DIR"/profile-*.log profiles/ 2>/dev/null || true
+        # cargo-schnee's planner spans (one file per variant), emitted
+        # via CARGO_SCHNEE_TRACE — see bench/nix/cargo-schnee.nix.
+        cp "$RESULTS_DIR"/schnee-planner-*.trace_event profiles/ 2>/dev/null || true
+
+        # Combined per-system stderr from inside the VM. The bench script
+        # appends every build's stdout/stderr to /results/build.log, so
+        # this is the place to look when a system FAILED — outer
+        # `cargo-schnee` panics, OOM kills, etc. land here.
+        cp "$RESULTS_DIR/build.log" build.log 2>/dev/null || true
 
         echo "Results written to:"
         echo "  $(pwd)/BENCHMARK.md"

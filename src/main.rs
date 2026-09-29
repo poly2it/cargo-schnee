@@ -7,9 +7,11 @@
 mod diagnostics;
 mod nar;
 mod nix_encoding;
+mod nix_log;
 mod plan;
 mod plan_nix;
 mod shell;
+mod source_tree;
 
 use anyhow::{Context, Result};
 use cargo::core::Workspace;
@@ -17,8 +19,8 @@ use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
 use clap::{Parser, Subcommand};
-use log::LevelFilter;
 use sha2::{Digest, Sha256};
+use source_tree::{ProjectSource, SourceTree};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -48,9 +50,57 @@ struct SchneeArgs {
     #[arg(long, global = true)]
     write_profile_to: Option<PathBuf>,
 
+    /// Split the libraries on the critical path that this pipeline profile
+    /// predicts, where a short frontend precedes a long codegen, into a
+    /// metadata and a link derivation, so that dependent libraries start
+    /// on the metadata.  Without a profile no library is split.
+    #[arg(long, global = true, value_name = "PATH")]
+    pipeline_profile: Option<PathBuf>,
+
+    /// Record every unit's build time, its CPU time where Nix reports it,
+    /// and each library's frontend time from this build's log, and write
+    /// them as a pipeline profile to the given path.  With
+    /// `--pipeline-profile`, the recording starts from that profile and
+    /// replaces the units this build ran.
+    #[arg(long, global = true, value_name = "PATH")]
+    write_pipeline_profile: Option<PathBuf>,
+
     /// Verify in-process .drv path computation against nix derivation add (debug)
     #[arg(long, global = true)]
     verify_drv_paths: bool,
+
+    /// Plan and register derivations, then write the resulting root drv
+    /// paths (one per line) to the given file and exit without realising
+    /// anything.  Used by Nix-side helpers (`lib.buildPackage` etc.) to
+    /// avoid the recursive-nix realise call that causes build-user slot
+    /// inversion under concurrent invocations.  The outer Nix scheduler
+    /// realises the root drv path itself via a dynamic-derivation
+    /// reference.  Incompatible with `run` / `bench` / interactive
+    /// progress.
+    #[arg(long, global = true, value_name = "PATH")]
+    plan_only: Option<PathBuf>,
+
+    /// In `--plan-only` mode, additionally construct and register an
+    /// aggregator derivation that depends on every root drv and
+    /// produces a single output containing one symlink per root.  The
+    /// path of the aggregator drv is written to the given file.
+    /// Downstream `lib.buildPackage` uses the aggregator as the
+    /// `builtins.outputOf` target, which avoids the per-root wrapper
+    /// realisation conflict that hits multi-crate workspaces.
+    #[arg(long, global = true, value_name = "PATH", requires = "plan_only")]
+    plan_aggregator_out: Option<PathBuf>,
+
+    /// Resolve features over the named scope from
+    /// `[workspace.metadata.schnee.resolution]` instead of over the `-p`
+    /// selection.  The table is keyed by target triple with a `default`
+    /// fallback, so the natural value is the target triple.  With a scope
+    /// active, `-p` no longer influences resolution — it only picks which
+    /// of the scope's roots this invocation builds, and the graph is
+    /// pruned to what those roots reach.  Sibling invocations naming the
+    /// same scope therefore share every unit derivation they have in
+    /// common.
+    #[arg(long, global = true, value_name = "KEY")]
+    resolution_scope: Option<String>,
 
     #[command(subcommand)]
     command: SchneeCommand,
@@ -222,8 +272,49 @@ enum SchneeCommand {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Run clippy lints on the project (not yet implemented)
-    Clippy,
+    /// Run clippy lints on the project via dynamic derivations (nix build).
+    /// Local (workspace) compile units run clippy-driver instead of rustc;
+    /// dependency units are compiled with plain rustc and stay shared with
+    /// regular check / build derivations.
+    Clippy {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: Option<PathBuf>,
+        /// Run in release mode
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to lint (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Skip linting dependencies (forwarded as cargo clippy --no-deps)
+        #[arg(long)]
+        no_deps: bool,
+        /// Lint test, example, and bench targets in addition to the
+        /// default lib + bin set (forwarded as cargo clippy --all-targets).
+        #[arg(long)]
+        all_targets: bool,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+        /// Lint args passed to clippy-driver after `--` (e.g. -D warnings)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Build documentation via rustdoc
     Doc {
         /// Path to Cargo.toml
@@ -306,6 +397,54 @@ enum SchneeCommand {
         /// Path to vendored dependencies
         #[arg(long)]
         vendor_dir: PathBuf,
+    },
+    /// Compute the unit graph and write it to a JSON file. Used by
+    /// `nix/unitGraph.nix` to pre-compute the graph as a content-addressed
+    /// derivation that downstream `buildPackage` invocations consume via
+    /// `CARGO_SCHNEE_UNIT_GRAPH`.
+    ComputeGraph {
+        /// Path to Cargo.toml
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Use a pre-vendored dependency directory (nix store path)
+        #[arg(long)]
+        vendor_dir: PathBuf,
+        /// Build artifacts in release mode, with optimizations
+        #[arg(long)]
+        release: bool,
+        /// Build artifacts with the specified profile
+        #[arg(long, conflicts_with = "release")]
+        profile: Option<String>,
+        /// Target triple for cross-compilation (e.g., aarch64-unknown-linux-gnu)
+        #[arg(long)]
+        target: Option<String>,
+        /// Package(s) to plan for (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+        /// Exclude packages from the operation
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Space or comma separated list of features to activate
+        #[arg(long)]
+        features: Vec<String>,
+        /// Do not activate the `default` feature
+        #[arg(long)]
+        no_default_features: bool,
+        /// Cargo subcommand intent the graph is being computed for. Defaults
+        /// to `build`. Affects which units cargo's resolver materialises
+        /// (e.g. `test` and `doc` add additional units).
+        #[arg(long, default_value = "build")]
+        intent: String,
+        /// Plan test, example, and bench targets alongside the default
+        /// lib + bin set.  A graph shared with a clippy gate needs this:
+        /// `cargo clippy --all-targets` plans a strictly larger unit set,
+        /// and the cache key records the difference, so a graph computed
+        /// without it is rejected rather than reused.
+        #[arg(long)]
+        all_targets: bool,
+        /// Where to write the resulting graph JSON.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -450,7 +589,7 @@ fn read_bin_target_name(manifest_path: &Path) -> Result<String> {
 }
 
 /// Add a file or directory to the Nix store, returning the store path.
-fn add_to_nix_store(path: &str) -> Result<String> {
+pub(crate) fn add_to_nix_store(path: &str) -> Result<String> {
     let output = Command::new("nix-store")
         .arg("--add")
         .arg(path)
@@ -569,7 +708,7 @@ fn find_external_path_deps(project_dir: &Path) -> Result<HashMap<PathBuf, String
     }
 
     if !external.is_empty() {
-        log::info!(
+        tracing::info!(
             "Found {} external path dep(s): {:?}",
             external.len(),
             external.values().collect::<Vec<_>>()
@@ -740,36 +879,6 @@ fn find_enclosing_workspace_root(path: &Path, stop_at: &Path) -> Option<PathBuf>
         };
     }
     None
-}
-
-/// Copy git-tracked files from an external source directory into `dest`.
-fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
-    let files = collect_git_files(source_dir)?;
-    match files {
-        Some(files) => {
-            for file in &files {
-                let src_path = source_dir.join(file);
-                let dest_path = dest.join(file);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if src_path.is_file() {
-                    std::fs::copy(&src_path, &dest_path)
-                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-                }
-            }
-            log::info!(
-                "Extra source copy: {} files from {}",
-                files.len(),
-                source_dir.display()
-            );
-        }
-        None => {
-            copy_dir_excluding(source_dir, dest, &["target", ".git", ".direnv", "result"])?;
-            log::info!("Extra source copy (no git): {}", source_dir.display());
-        }
-    }
-    Ok(())
 }
 
 /// Rewrite path dependencies in all Cargo.toml files under `dest` so that
@@ -973,26 +1082,47 @@ fn rewrite_paths_in_table(
     changed
 }
 
-/// Add the project source to the Nix store, respecting .gitignore.
+/// Describe the project source, respecting .gitignore, without adding it to
+/// the store. The result knows the store path the source has, and adds it
+/// only when a caller needs the whole tree, see `ProjectSource`.
 ///
-/// Uses libgit2 to discover tracked + untracked-but-not-ignored files,
-/// then computes the NAR store path in-process. If the path already exists
-/// in the store (warm build), skips the subprocess entirely. Otherwise,
-/// copies files to a temp dir and runs `nix-store --add`.
+/// Uses libgit2 to discover tracked + untracked-but-not-ignored files. When
+/// path dependencies outside `project_dir` are detected, they join the tree
+/// and Cargo.toml paths are rewritten.
 ///
-/// When path dependencies outside `project_dir` are detected, they are
-/// copied into the store tree and Cargo.toml paths are rewritten.
-fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
+/// With `want_skeleton`, also adds the project's skeleton, see
+/// `add_graph_skeleton`, unless the source reaches outside `project_dir` or
+/// is not a git work tree.
+fn project_source(project_dir: &Path, want_skeleton: bool) -> Result<ProjectSource> {
+    let _span = tracing::info_span!("add_project_source").entered();
     // Collect allowed files via git2
-    let mut allowed_files = collect_git_files(project_dir)?;
+    let mut allowed_files =
+        tracing::info_span!("collect_git_files").in_scope(|| collect_git_files(project_dir))?;
 
     // Include extra gitignored files specified in [*.metadata.schnee.extra-includes]
-    let extra_patterns = read_extra_includes(&project_dir.join("Cargo.toml"));
+    // The root manifest's patterns are relative to the project, and a
+    // member's package-level patterns to the member's directory.
+    let mut extra_patterns: Vec<(PathBuf, String)> =
+        read_extra_includes(&project_dir.join("Cargo.toml"))
+            .into_iter()
+            .map(|p| (project_dir.to_path_buf(), p))
+            .collect();
+    if let Some(ref files) = allowed_files {
+        for manifest in files.iter().filter(|f| {
+            f.file_name().is_some_and(|n| n == "Cargo.toml") && f.parent() != Some(Path::new(""))
+        }) {
+            let base = project_dir.join(manifest.parent().unwrap_or(Path::new("")));
+            let text = std::fs::read_to_string(project_dir.join(manifest)).unwrap_or_default();
+            for p in plan_nix::util::package_extra_includes(&text) {
+                extra_patterns.push((base.clone(), p));
+            }
+        }
+    }
     let mut extra_outside: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs_path, store_rel_path)
     if !extra_patterns.is_empty() {
         let canon_proj = project_dir.canonicalize().ok();
         let mut count = 0usize;
-        for pattern in &extra_patterns {
+        for (base, pattern) in &extra_patterns {
             // glob crate: `dir/**` only matches the dir itself (zero components).
             // Normalise to `dir/**/*` so files are matched recursively.
             let pat = if pattern.ends_with("**") {
@@ -1000,7 +1130,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
             } else {
                 pattern.clone()
             };
-            let full = project_dir.join(&pat).to_string_lossy().to_string();
+            let full = base.join(&pat).to_string_lossy().to_string();
             match glob::glob(&full) {
                 Ok(paths) => {
                     for entry in paths.flatten() {
@@ -1050,7 +1180,7 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
                         }
                     }
                 }
-                Err(e) => log::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
+                Err(e) => tracing::warn!("Invalid extra-includes pattern '{}': {}", pattern, e),
             }
         }
         if count > 0 {
@@ -1060,89 +1190,159 @@ fn add_project_source_to_store(project_dir: &Path) -> Result<String> {
 
     // Detect external path dependencies
     let external_deps = find_external_path_deps(project_dir).unwrap_or_else(|e| {
-        log::warn!("Failed to detect external path deps: {}", e);
+        tracing::warn!("Failed to detect external path deps: {}", e);
         HashMap::new()
     });
 
-    // Fast path: no external deps or outside extra includes → try in-process NAR cache
-    if external_deps.is_empty()
-        && extra_outside.is_empty()
-        && let Some(ref files) = allowed_files
-    {
-        match nar::serialize_nar(project_dir, Some(files)) {
-            Ok(nar_data) => {
-                let store_path = nar::compute_nar_store_path("project-src", &nar_data);
-                if Path::new(&store_path).exists() {
-                    log::info!("Source store path exists: {}", store_path);
-                    return Ok(store_path);
-                }
-                log::info!("Source store path miss, falling back to subprocess");
-            }
-            Err(e) => {
-                log::info!(
-                    "NAR serialization failed ({}), falling back to subprocess",
-                    e
-                );
-            }
+    let skeleton = match &allowed_files {
+        Some(files) if want_skeleton && external_deps.is_empty() && extra_outside.is_empty() => {
+            Some(add_graph_skeleton(project_dir, files)?)
         }
-    }
+        _ => None,
+    };
 
-    // Copy project files to temp dir
-    let temp = tempfile::tempdir().context("Failed to create temp dir for source copy")?;
-    let dest = temp.path().join("project-src");
+    let tree = tracing::info_span!("build_source_tree").in_scope(|| {
+        project_source_tree(
+            project_dir,
+            allowed_files.as_ref(),
+            &extra_outside,
+            &external_deps,
+        )
+    })?;
+    let nar = tracing::info_span!("serialize_project_nar").in_scope(|| tree.nar())?;
+    let store_path = tracing::info_span!("hash_project_nar")
+        .in_scope(|| nar::compute_nar_store_path("project-src", &nar));
+    Ok(ProjectSource::new(tree, store_path, nar, skeleton))
+}
 
-    match &allowed_files {
-        Some(files) => {
-            for file in files {
-                let src_path = project_dir.join(file);
-                let dest_path = dest.join(file);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if src_path.is_file() {
-                    std::fs::copy(&src_path, &dest_path)
-                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-                }
-            }
-            log::info!("Source copy: {} files via git2", files.len());
-        }
+/// The tree a copy of the project source would hold: the allowed files, the
+/// extra includes from outside the project under `.parent`, and each
+/// external path dependency under its sanitised name, with manifest paths
+/// rewritten to point at those names.
+fn project_source_tree(
+    project_dir: &Path,
+    allowed_files: Option<&HashSet<PathBuf>>,
+    extra_outside: &[(PathBuf, PathBuf)],
+    external_deps: &HashMap<PathBuf, String>,
+) -> Result<SourceTree> {
+    let excluded = ["target", ".git", ".direnv", "result"];
+    let mut tree = match allowed_files {
+        Some(files) => SourceTree::from_allowed_files(project_dir, files),
         None => {
-            log::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
-            copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
+            tracing::info!("Source tree: falling back to hardcoded excludes (not a git repo)");
+            SourceTree::from_dir_excluding(project_dir, &excluded)?
+        }
+    };
+    for (abs_path, store_rel) in extra_outside {
+        tree.insert_disk(store_rel.clone(), abs_path.clone());
+    }
+    if external_deps.is_empty() {
+        return Ok(tree);
+    }
+    // Collect all source roots so we can skip sub-paths already covered
+    // by a workspace root copy (e.g. don't copy sub-crate/ separately
+    // when its parent workspace/ is already being copied).
+    let roots: Vec<&PathBuf> = external_deps.keys().collect();
+    for (abs_path, sanitised) in external_deps {
+        let dominated = roots
+            .iter()
+            .any(|r| *r != abs_path && abs_path.starts_with(r));
+        if dominated {
+            continue;
+        }
+        let external = match collect_git_files(abs_path)? {
+            Some(files) => SourceTree::from_allowed_files(abs_path, &files),
+            None => SourceTree::from_dir_excluding(abs_path, &excluded)?,
+        };
+        tree.graft(Path::new(sanitised), external);
+    }
+    rewrite_tree_manifests(&mut tree, project_dir, external_deps)?;
+    Ok(tree)
+}
+
+/// Apply `rewrite_cargo_tomls` to the manifests of `tree`. It runs on a
+/// scratch directory that holds only the manifests, which is all it reads.
+fn rewrite_tree_manifests(
+    tree: &mut SourceTree,
+    project_dir: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> Result<()> {
+    let manifests: Vec<PathBuf> = tree
+        .files()
+        .filter(|f| f.file_name().is_some_and(|n| n == "Cargo.toml"))
+        .map(Path::to_path_buf)
+        .collect();
+    let scratch = tempfile::tempdir().context("Failed to create temp dir for manifests")?;
+    let dest = scratch.path().join("project-src");
+    std::fs::create_dir_all(&dest)?;
+    for rel in &manifests {
+        let target = dest.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap_or(&dest))?;
+        std::fs::write(&target, tree.read(rel)?)?;
+    }
+    rewrite_cargo_tomls(&dest, project_dir, mappings)?;
+    for rel in manifests {
+        let rewritten = std::fs::read(dest.join(&rel))?;
+        if rewritten != tree.read(&rel)? {
+            let executable = tree.is_executable(&rel)?;
+            tree.insert_bytes(rel, rewritten, executable);
         }
     }
+    Ok(())
+}
 
-    // Copy extra-includes that live outside the project directory
-    for (abs_path, store_rel) in &extra_outside {
-        let dest_path = dest.join(store_rel);
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(abs_path, &dest_path)
-            .with_context(|| format!("Failed to copy extra include {}", abs_path.display()))?;
+/// Add the project's skeleton to the store and return its path. The
+/// skeleton holds every file of the project, but only manifests keep their
+/// contents, see `nar::is_manifest`. Cargo plans the same unit
+/// graph from it as from the full source, and its path only moves when a
+/// manifest changes or a file appears or disappears.
+fn add_graph_skeleton(project_dir: &Path, files: &HashSet<PathBuf>) -> Result<String> {
+    let store_path = nar::skeleton_source_store_path(project_dir, files)?;
+    if plan_nix::store_paths::is_valid_store_path(&store_path)? {
+        return Ok(store_path);
     }
+    let temp = tempfile::tempdir().context("Failed to create temp dir for the skeleton")?;
+    let dest = temp.path().join(nar::SKELETON_NAME);
+    write_skeleton(project_dir, files, &dest)?;
+    let added = add_to_nix_store(&dest.to_string_lossy())?;
+    anyhow::ensure!(
+        added == store_path,
+        "The skeleton landed at {added}, expected {store_path}"
+    );
+    Ok(added)
+}
 
-    // Copy external path deps into the store tree and rewrite Cargo.toml paths
-    if !external_deps.is_empty() {
-        // Collect all source roots so we can skip sub-paths already covered
-        // by a workspace root copy (e.g. don't copy sub-crate/ separately
-        // when its parent workspace/ is already being copied).
-        let roots: Vec<&PathBuf> = external_deps.keys().collect();
-        for (abs_path, sanitised) in &external_deps {
-            let dominated = roots
-                .iter()
-                .any(|r| *r != abs_path && abs_path.starts_with(r));
-            if dominated {
-                continue;
+/// Write the skeleton of `files` under `project_dir` to `dest`, the tree
+/// whose NAR `nar::serialize_nar_skeleton` describes.
+fn write_skeleton(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for file in files {
+        // The NAR keeps every real directory on the way to an allowed path,
+        // even when the path itself is a symlink or missing.
+        let mut dir = PathBuf::new();
+        for component in file.parent().into_iter().flat_map(Path::components) {
+            dir.push(component);
+            let is_dir =
+                std::fs::symlink_metadata(project_dir.join(&dir)).is_ok_and(|m| m.is_dir());
+            if !is_dir {
+                break;
             }
-            let ext_dest = dest.join(sanitised);
-            copy_source_to_dest(abs_path, &ext_dest)
-                .with_context(|| format!("Failed to copy extra source: {}", abs_path.display()))?;
+            std::fs::create_dir_all(dest.join(&dir))?;
         }
-        rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
+        let src = project_dir.join(file);
+        let dest_path = dest.join(file);
+        let is_file = std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file());
+        if !is_file || !dest_path.parent().is_some_and(Path::is_dir) {
+            continue;
+        }
+        if nar::is_manifest(&src) {
+            std::fs::copy(&src, &dest_path)
+                .with_context(|| format!("Failed to copy {}", src.display()))?;
+        } else {
+            std::fs::write(&dest_path, b"")?;
+        }
     }
-
-    add_to_nix_store(&dest.to_string_lossy())
+    Ok(())
 }
 
 /// Collect git-tracked + untracked-but-not-ignored files.
@@ -1151,7 +1351,7 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
     let repo = match git2::Repository::discover(project_dir) {
         Ok(r) => r,
         Err(_) => {
-            log::info!("Not a git repo, using hardcoded excludes");
+            tracing::info!("Not a git repo, using hardcoded excludes");
             return Ok(None);
         }
     };
@@ -1190,7 +1390,7 @@ fn collect_git_files(project_dir: &Path) -> Result<Option<HashSet<PathBuf>>> {
         }
     }
 
-    log::info!("Source: {} files via git2", files.len());
+    tracing::info!("Source: {} files via git2", files.len());
     Ok(Some(files))
 }
 
@@ -1226,118 +1426,185 @@ fn read_extra_includes(manifest_path: &Path) -> Vec<String> {
         None => Vec::new(),
     }
 }
+// ---------------------------------------------------------------------------
+// Unit-graph keys and the `CARGO_SCHNEE_UNIT_GRAPH` hand-off
+// ---------------------------------------------------------------------------
 
-/// Recursively copy a directory, skipping entries whose names match the exclude list.
-/// Symlinks are skipped to avoid accidentally copying large nix store closures.
-fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("Failed to read dir {}", src.display()))?
-    {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if exclude.iter().any(|e| *e == name_str.as_ref()) {
-            continue;
-        }
-        let ft = entry.metadata()?.file_type();
-        if ft.is_symlink() {
-            continue;
-        }
-        let src_path = entry.path();
-        let dest_path = dest.join(&name);
-        if ft.is_dir() {
-            copy_dir_excluding(&src_path, &dest_path, exclude)?;
-        } else {
-            std::fs::copy(&src_path, &dest_path)
-                .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-        }
+/// Render the bool fields of `UserIntent` variants into a cache-key
+/// suffix.  Returns "" for variants that have no fields.
+///
+/// Cargo's resolver materialises a different unit set for each variant
+/// *and* for the bool fields inside `Check { test }` / `Doc { deps,
+/// json }`.  Encoding only the bare variant name silently feeds the
+/// wrong cached graph to a build that toggles those flags — same shape
+/// as the missing `--all-targets` discriminator.  This helper is
+/// composed onto `intent_str` (the short, drv-name-safe variant label)
+/// so the cache key carries the full discriminant while drv names stay
+/// readable.
+fn format_intent_fields(user_intent: &UserIntent) -> String {
+    match user_intent {
+        UserIntent::Check { test } => format!("[test={test}]"),
+        UserIntent::Doc { deps, json } => format!("[deps={deps},json={json}]"),
+        UserIntent::Build | UserIntent::Test | UserIntent::Bench => String::new(),
+        _ => String::new(),
     }
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Build cache — skip vendoring + derivation registration on unchanged builds
-// ---------------------------------------------------------------------------
+/// Short, drv-name-safe label for a `UserIntent` variant.  Used in drv
+/// names (aggregator) and as the intent component of the unit-graph
+/// cache key.
+fn intent_label(user_intent: &UserIntent) -> &'static str {
+    match user_intent {
+        UserIntent::Build => "build",
+        UserIntent::Check { .. } => "check",
+        UserIntent::Test => "test",
+        UserIntent::Bench => "bench",
+        UserIntent::Doc { .. } => "doc",
+        _ => "build",
+    }
+}
 
-/// A single unit-graph cache entry, keyed by
-/// `hash(Cargo.lock + Cargo.toml + profile + target + intent + packages + features)`.
+/// Shape of the serialised plan, bumped by hand whenever a change makes an
+/// entry written by an older cargo-schnee unusable: a new or removed
+/// `NixUnit` field, a different meaning for an existing one, or a change to
+/// what `construct_derivation` emits from the same unit.  It is deliberately
+/// not `CARGO_PKG_VERSION`, which is pinned at `0.1.0` and so can never
+/// distinguish two builds of the binary.
+const PLAN_SCHEMA_VERSION: u32 = 2;
+
+/// The Cargo profile a command selects: `--release`, then `--profile`, then
+/// `dev`.
+fn profile_name(release: bool, profile: &Option<String>) -> String {
+    if release {
+        "release".into()
+    } else {
+        profile.clone().unwrap_or_else(|| "dev".into())
+    }
+}
+
+/// Compose the unit-graph cache key.  Single point of truth shared by
+/// `run_build_pipeline` and `compute-graph`, so the graph files written
+/// by the latter validate against the exact key the former expects via
+/// the `CARGO_SCHNEE_UNIT_GRAPH` hand-off.
+///
+/// `targets_hash` (from `hash_discovered_targets`) covers the
+/// filesystem-driven part of cargo's target auto-discovery: the manifest
+/// hash alone misses added/removed `tests/*.rs` etc., which change the
+/// unit-graph shape without touching any manifest.  `intent_fields`
+/// covers the bool fields of `Check { test }` / `Doc { deps, json }` —
+/// different fields, different unit set (see `format_intent_fields`).
+#[allow(clippy::too_many_arguments)]
+fn compose_unit_graph_key(
+    lockfile_hash: &str,
+    manifest_hash: &str,
+    targets_hash: &str,
+    profile_name: &str,
+    target_triple: &str,
+    user_intent: &UserIntent,
+    packages: &[String],
+    exclude: &[String],
+    features: &[String],
+    no_default_features: bool,
+    all_targets: bool,
+    resolution: Option<&plan_nix::ResolutionScope>,
+) -> String {
+    // With a declared scope the graph covers the whole scope and `-p`
+    // only picks roots out of it afterwards, so the key names the scope,
+    // not the request.  Keying on the packages instead would give each
+    // sibling invocation its own cache entry and defeat the sharing the
+    // scope exists to produce.
+    let selection = match resolution {
+        Some(scope) => scope.cache_component(),
+        None => format!("{}:{}", packages.join(","), exclude.join(",")),
+    };
+    format!(
+        "schnee{}:{}:{}:{}:{}:{}:{}{}:{}:{}:{}:{}",
+        PLAN_SCHEMA_VERSION,
+        lockfile_hash,
+        manifest_hash,
+        targets_hash,
+        profile_name,
+        target_triple,
+        intent_label(user_intent),
+        format_intent_fields(user_intent),
+        selection,
+        features.join(","),
+        no_default_features,
+        all_targets,
+    )
+}
+
+/// A unit graph that `cargo-schnee compute-graph` wrote, usually inside
+/// the `lib.unitGraph` derivation, for a later invocation to read through
+/// `CARGO_SCHNEE_UNIT_GRAPH`. The key is
+/// `hash(Cargo.lock + Cargo.toml + discovered targets + profile + target
+/// + intent + packages + features)`, see `compose_unit_graph_key`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct UnitGraphCacheEntry {
     src_store: String,
     units: Vec<plan_nix::NixUnit>,
     target_cfg_envs: Vec<(String, String)>,
     host_cfg_envs: Vec<(String, String)>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct SchneeCache {
-    /// SHA-256 of Cargo.lock → vendor nix store path
+    /// Key the graph was computed for. A file without it deserialises
+    /// with an empty key, fails validation and triggers a fresh
+    /// bootstrap.
     #[serde(default)]
-    vendor_lockfile_hash: Option<String>,
-    #[serde(default)]
-    vendor_store_path: Option<String>,
-    /// Tool closure cache: store path → sorted list of closure paths.
-    /// Keyed on individual nix store paths (e.g. rustc, cc, pkg-config deps).
-    /// Invalidated per-entry: if a store path changes, its old entry is simply unused.
-    #[serde(default)]
-    tool_closures: HashMap<String, Vec<String>>,
-    /// Unit graph cache, keyed by a composite of Cargo.lock, workspace manifests,
-    /// profile, target, intent, packages, and features.  Multiple entries coexist
-    /// so that e.g. `--package X` does not evict the full-workspace entry.
-    #[serde(default)]
-    unit_graphs: HashMap<String, UnitGraphCacheEntry>,
+    cache_key: String,
 }
 
-struct CacheLock {
-    _file: std::fs::File,
+/// Read and validate a unit-graph entry from `path`. Returns the entry
+/// only if its embedded `cache_key` matches `expected_key` exactly. On
+/// any kind of mismatch (missing file, parse error, wrong key, no key)
+/// emits a warning and returns `None` so the caller falls back to a
+/// fresh bootstrap.
+fn parse_unit_graph_file(path: &Path, expected_key: &str) -> Option<UnitGraphCacheEntry> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("Could not read unit-graph file {}: {}", path.display(), e,);
+            return None;
+        }
+    };
+    let entry: UnitGraphCacheEntry = match serde_json::from_str(&data) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("Failed to parse unit-graph file {}: {}", path.display(), e,);
+            return None;
+        }
+    };
+    if entry.cache_key.is_empty() {
+        tracing::warn!(
+            "Unit-graph file {} has no cache_key field (likely an old cache)",
+            path.display(),
+        );
+        return None;
+    }
+    if entry.cache_key != expected_key {
+        tracing::warn!(
+            "Unit-graph file {} cache_key mismatch (expected {}, got {})",
+            path.display(),
+            expected_key,
+            entry.cache_key,
+        );
+        return None;
+    }
+    Some(entry)
 }
 
-impl CacheLock {
-    fn acquire(project_dir: &Path) -> Result<Self> {
-        use fs2::FileExt;
-        let dir = project_dir.join("target");
-        std::fs::create_dir_all(&dir)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(dir.join(".schnee-cache.lock"))
-            .context("Failed to open cache lock file")?;
-        file.lock_exclusive()
-            .context("Failed to acquire cache lock")?;
-        Ok(Self { _file: file })
-    }
-}
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
-    }
-}
-
-impl SchneeCache {
-    fn load(project_dir: &Path) -> Self {
-        let path = project_dir.join("target/.schnee-cache.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    fn save(&self, project_dir: &Path) -> Result<()> {
-        use tempfile::NamedTempFile;
-        let dir = project_dir.join("target");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(".schnee-cache.json");
-        let json = serde_json::to_string_pretty(self)?;
-        let mut tmp =
-            NamedTempFile::new_in(&dir).context("Failed to create temp file for cache")?;
-        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
-        tmp.persist(&path)
-            .context("Failed to atomically persist cache file")?;
-        Ok(())
-    }
+/// Read a unit-graph entry from `CARGO_SCHNEE_UNIT_GRAPH`, returning it
+/// only if the embedded `cache_key` matches `expected_key`.
+///
+/// The env var may point at a JSON file directly or at a directory
+/// containing `graph.json` (the layout `nix/unitGraph.nix` writes).
+fn try_load_unit_graph_from_env(expected_key: &str) -> Option<UnitGraphCacheEntry> {
+    let raw = std::env::var("CARGO_SCHNEE_UNIT_GRAPH").ok()?;
+    let path = std::path::PathBuf::from(&raw);
+    let path = if path.is_dir() {
+        path.join("graph.json")
+    } else {
+        path
+    };
+    parse_unit_graph_file(&path, expected_key)
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -1346,27 +1613,25 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&content)))
 }
 
-/// Hash all workspace Cargo.toml files (root + members) for cache keying.
-/// For non-workspace projects, falls back to hashing just the root Cargo.toml.
-fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+/// Resolve the Cargo.toml paths of all `[workspace] members` declared in
+/// the root manifest, sorted for deterministic iteration.  Non-workspace
+/// projects yield an empty list.  Invalid glob patterns are warned about
+/// and skipped.
+pub(crate) fn workspace_member_manifests(
+    manifest_path: &Path,
+    project_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let content = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let doc: toml::Value = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
 
-    // Check for [workspace] members
-    let members = doc
+    let mut member_manifests: Vec<PathBuf> = Vec::new();
+    if let Some(members) = doc
         .get("workspace")
         .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array());
-
-    let mut hasher = Sha256::new();
-    // Always include root manifest
-    hasher.update(std::fs::read(manifest_path)?);
-
-    if let Some(members) = members {
-        // Resolve member paths and hash each member's Cargo.toml.
-        let mut member_manifests: Vec<PathBuf> = Vec::new();
+        .and_then(|m| m.as_array())
+    {
         for member in members {
             if let Some(pattern) = member.as_str() {
                 let full_pattern = project_dir
@@ -1381,21 +1646,341 @@ fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<
                         }
                     }
                     Err(e) => {
-                        log::warn!("Invalid workspace member glob pattern '{}': {}", pattern, e);
+                        tracing::warn!(
+                            "Invalid workspace member glob pattern '{}': {}",
+                            pattern,
+                            e
+                        );
                     }
                 }
             }
         }
-        // Sort for deterministic hashing
-        member_manifests.sort();
-        for manifest in &member_manifests {
-            if let Ok(content) = std::fs::read(manifest) {
-                hasher.update(&content);
+    }
+    member_manifests.sort();
+    Ok(member_manifests)
+}
+
+/// Hash all workspace Cargo.toml files (root + members) for cache keying.
+/// For non-workspace projects, falls back to hashing just the root Cargo.toml.
+fn hash_workspace_manifests(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    // Always include root manifest
+    hasher.update(std::fs::read(manifest_path)?);
+    for manifest in workspace_member_manifests(manifest_path, project_dir)? {
+        if let Ok(content) = std::fs::read(&manifest) {
+            hasher.update(&content);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hash the set of target-defining files cargo auto-discovers from the
+/// filesystem for every workspace package: `src/lib.rs`, `src/main.rs`,
+/// `build.rs`, plus the scan directories `src/bin/` / `tests/` /
+/// `examples/` / `benches/` (each `*.rs` file and each `*/main.rs`
+/// subdirectory).  Cargo's planner derives the unit-graph *shape* from
+/// the presence of these paths, not from manifest contents, so they must
+/// participate in the unit-graph cache key: without them, adding e.g.
+/// `tests/foo.rs` gets a stale cached graph and the new test is silently
+/// never compiled.  Only the sorted path list is hashed — file contents
+/// don't affect graph shape, and content edits are already covered by the
+/// content-addressed src store.  Paths are hashed relative to
+/// `project_dir` so the key agrees between a local checkout and the store
+/// copy that `compute-graph` plans against.
+fn hash_discovered_targets(manifest_path: &Path, project_dir: &Path) -> Result<String> {
+    let mut package_dirs: Vec<PathBuf> =
+        vec![manifest_path.parent().unwrap_or(project_dir).to_path_buf()];
+    for manifest in workspace_member_manifests(manifest_path, project_dir)? {
+        if let Some(dir) = manifest.parent() {
+            package_dirs.push(dir.to_path_buf());
+        }
+    }
+
+    let mut discovered: Vec<String> = Vec::new();
+    let mut record = |path: &Path| {
+        let rel = path.strip_prefix(project_dir).unwrap_or(path);
+        discovered.push(rel.to_string_lossy().into_owned());
+    };
+    for dir in &package_dirs {
+        for fixed in ["src/lib.rs", "src/main.rs", "build.rs"] {
+            let path = dir.join(fixed);
+            if path.is_file() {
+                record(&path);
+            }
+        }
+        for scan in ["src/bin", "tests", "examples", "benches"] {
+            let Ok(entries) = std::fs::read_dir(dir.join(scan)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+                    record(&path);
+                } else if path.is_dir() && path.join("main.rs").is_file() {
+                    record(&path.join("main.rs"));
+                }
             }
         }
     }
 
+    discovered.sort();
+    discovered.dedup();
+    let mut hasher = Sha256::new();
+    for path in &discovered {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Point `link` at a GC root that keeps what the next warm build of the
+/// same profile, target and intent reuses. That is `sources`, every
+/// per-unit source and derivation, the aggregator derivation and every
+/// realised output, plus the `memoised` vendor and graph derivations and
+/// outputs. The link replaces the one the previous such build registered,
+/// which makes that build's paths collectable again. Returns whether it
+/// registered a new root.
+#[allow(clippy::too_many_arguments)]
+fn root_last_build(
+    link: &Path,
+    name: &str,
+    sources: &[String],
+    units: &[plan_nix::NixUnit],
+    aggregator_drv: &str,
+    aggregator_out: &str,
+    memoised: &[String],
+) -> Result<bool> {
+    use plan_nix::store_paths::{references_of_link, register_gc_root, store_dir, store_path_of};
+    // The aggregator derivation's path covers every unit derivation, so a
+    // root that already names it and the memoised inputs keeps this build.
+    // Skipping the re-registration spares resolving every unit's output.
+    let mut identity: Vec<String> = vec![aggregator_drv.to_string(), aggregator_out.to_string()];
+    identity.extend(memoised.iter().cloned());
+    if let Some(existing) = references_of_link(link)
+        && identity.iter().all(|p| existing.contains(p))
+    {
+        return Ok(false);
+    }
+    let store_dir = store_dir();
+    let unit_drvs: Vec<String> = units.iter().filter_map(|u| u.drv_path.clone()).collect();
+    let mut kept: Vec<String> = plan_nix::realise_unit_outputs(units)?;
+    kept.extend(unit_drvs);
+    kept.extend(identity);
+    kept.extend(
+        units
+            .iter()
+            .flat_map(|u| [u.manifest_dir.as_str(), u.source_file.as_str()])
+            .chain(sources.iter().map(String::as_str))
+            .filter_map(|p| store_path_of(p, &store_dir))
+            .map(str::to_string),
+    );
+    register_gc_root(link, name, &kept)?;
+    Ok(true)
+}
+
+/// What `realise_memoised_inputs` needs to put the unit graph into a
+/// derivation.
+struct GraphRequest<'a> {
+    name: String,
+    skeleton: &'a str,
+    project_dir: &'a Path,
+    args: Vec<String>,
+}
+
+/// The vendor farm and, when asked for, the unit graph, both realised from
+/// derivations whose paths follow from their inputs.
+struct MemoisedInputs {
+    vendor: String,
+    /// `graph.json` inside the realised unit-graph output.
+    graph: Option<PathBuf>,
+    /// Every planned derivation and realised output, for the GC root.
+    kept: Vec<String>,
+}
+
+/// The `compute-graph` flags that select the graph this build plans, or
+/// `None` for an intent `compute-graph` cannot express.
+#[allow(clippy::too_many_arguments)]
+fn compute_graph_args(
+    profile: &str,
+    target: Option<&str>,
+    user_intent: &UserIntent,
+    packages: &[String],
+    exclude: &[String],
+    features: &[String],
+    no_default_features: bool,
+    all_targets: bool,
+    resolution_scope: Option<&str>,
+) -> Option<Vec<String>> {
+    let intent = match user_intent {
+        UserIntent::Build => "build",
+        UserIntent::Check { test: false } => "check",
+        UserIntent::Test => "test",
+        UserIntent::Bench => "bench",
+        UserIntent::Doc {
+            deps: false,
+            json: false,
+        } => "doc",
+        _ => return None,
+    };
+    let mut args = vec!["--profile".to_string(), profile.to_string()];
+    let mut flag = |name: &str, values: &[String]| {
+        for v in values {
+            args.push(name.to_string());
+            args.push(v.clone());
+        }
+    };
+    flag(
+        "--target",
+        &target.map(String::from).into_iter().collect::<Vec<_>>(),
+    );
+    flag("--package", packages);
+    flag("--exclude", exclude);
+    flag("--features", features);
+    flag(
+        "--resolution-scope",
+        &resolution_scope
+            .map(String::from)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+    if no_default_features {
+        args.push("--no-default-features".into());
+    }
+    if all_targets {
+        args.push("--all-targets".into());
+    }
+    args.extend(["--intent".to_string(), intent.to_string()]);
+    Some(args)
+}
+
+/// The store path of the running `cargo-schnee` binary and the binary
+/// itself, when it lives in the store and a sandbox can therefore run it.
+fn schnee_in_store() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let exe = exe.to_string_lossy().to_string();
+    let store = plan_nix::store_paths::store_path_of(&exe, &plan_nix::store_paths::store_dir())?
+        .to_string();
+    Some((store, exe))
+}
+
+/// Realise the vendor farm for `lock_text`, and the unit graph when
+/// `graph` asks for it, through derivations that the store memoises by
+/// content. On a warm build both are already realised, and this costs one
+/// validity query and one `nix build` that builds nothing.
+///
+/// Returns `None` when the farm cannot describe this lockfile, such as for
+/// a git dependency, or when the build tools, the daemon or a
+/// store-resident `cargo-schnee` are missing. The caller then vendors with
+/// `cargo vendor` and bootstraps cargo in-process.
+fn realise_memoised_inputs(
+    lock_text: &str,
+    graph: Option<GraphRequest>,
+    system: &str,
+) -> Result<Option<MemoisedInputs>> {
+    use plan_nix::vendor_farm::{
+        BuildTools, crates_io_packages, plan_vendor_farm, register_planned,
+    };
+    let Some(crates) = crates_io_packages(lock_text)? else {
+        tracing::info!("Cargo.lock has non-crates.io packages, vendoring with cargo vendor");
+        return Ok(None);
+    };
+    let Some(tools) = BuildTools::from_path(system) else {
+        tracing::info!(
+            "bash, coreutils, tar or gzip missing from PATH, vendoring with cargo vendor"
+        );
+        return Ok(None);
+    };
+    let plan_span = tracing::info_span!("plan_vendor_and_graph").entered();
+    let farm = plan_vendor_farm(&crates, &tools)?;
+    let mut drvs = farm.drvs;
+    let graph_drv = match (graph, schnee_in_store()) {
+        (Some(request), Some((schnee_store, schnee_bin))) => {
+            let rustc = plan_nix::util::which_command("rustc")?
+                .to_string_lossy()
+                .to_string();
+            let rustc_store =
+                plan_nix::store_paths::store_path_of(&rustc, &plan_nix::store_paths::store_dir())
+                    .map(String::from);
+            match rustc_store {
+                Some(rustc_store) => {
+                    let inputs = plan_nix::graph_drv::GraphInputs {
+                        skeleton: request.skeleton,
+                        vendor_farm_drv: &farm.farm_drv,
+                        schnee_bin: &schnee_bin,
+                        schnee_store: &schnee_store,
+                        rustc_store: &rustc_store,
+                        args: request.args,
+                        profile_env: plan_nix::graph_drv::profile_env(),
+                        parent_configs: plan_nix::graph_drv::parent_configs(request.project_dir),
+                    };
+                    let planned =
+                        plan_nix::graph_drv::plan_graph_drv(&request.name, &inputs, &tools)?;
+                    let path = planned.path.clone();
+                    drvs.push(planned);
+                    Some(path)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    drop(plan_span);
+    let _register_span = tracing::info_span!("register_vendor_and_graph").entered();
+    let added = match register_planned(&drvs) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(
+                "Registering the vendor derivations failed ({e:#}), vendoring with cargo vendor"
+            );
+            return Ok(None);
+        }
+    };
+    tracing::info!(
+        "Registered {added} of {} vendor and graph derivations",
+        drvs.len()
+    );
+
+    let mut installables = vec![format!("{}^out", farm.farm_drv)];
+    installables.extend(graph_drv.iter().map(|d| format!("{d}^out")));
+    let _realise_span = tracing::info_span!("realise_vendor_and_graph").entered();
+    let output = Command::new("nix")
+        .arg("build")
+        .args(&installables)
+        .args(["--print-out-paths", "--no-link"])
+        .env(
+            "NIX_CONFIG",
+            nix_config(
+                std::env::var_os("NIX_CONFIG").as_deref(),
+                "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            ),
+        )
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to spawn nix build for the vendor farm")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Realising the vendor farm failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let outs = String::from_utf8(output.stdout)?;
+    let mut vendor = None;
+    let mut graph = None;
+    let mut kept: Vec<String> = drvs.iter().map(|d| d.path.clone()).collect();
+    for out in outs.lines().map(str::trim).filter(|o| !o.is_empty()) {
+        kept.push(out.to_string());
+        if out.ends_with("-vendor") {
+            vendor = Some(out.to_string());
+        } else {
+            graph = Some(PathBuf::from(out).join("graph.json"));
+        }
+    }
+    let vendor = vendor.context("nix build printed no vendor farm path")?;
+    Ok(Some(MemoisedInputs {
+        vendor,
+        graph,
+        kept,
+    }))
 }
 
 /// Run cargo vendor and add result to the nix store.
@@ -1416,6 +2001,13 @@ fn vendor_dependencies(manifest_path: &Path) -> Result<String> {
     // cargo vendor may not create the directory for zero-dep projects
     if !vendor_path.exists() {
         std::fs::create_dir_all(&vendor_path)?;
+    }
+    // The same `Cargo.lock` vendors to the same content, so the store path
+    // follows from the NAR hash and the add is skipped when it is valid.
+    let nar = nar::serialize_nar(&vendor_path, None)?;
+    let store_path = nar::compute_nar_store_path("vendor", &nar);
+    if plan_nix::store_paths::is_valid_store_path(&store_path).unwrap_or(false) {
+        return Ok(store_path);
     }
     add_to_nix_store(&vendor_path.to_string_lossy())
 }
@@ -1520,7 +2112,7 @@ fn write_profile(
 
     if !durations.is_empty() {
         // Sort by duration descending (longest first)
-        durations.sort_by(|a, b| b.1.cmp(&a.1));
+        durations.sort_by_key(|d| std::cmp::Reverse(d.1));
 
         let formatted: Vec<(String, std::time::Duration)> = durations
             .iter()
@@ -1532,6 +2124,7 @@ fn write_profile(
                     shell::DrvKind::TestCompile => " (test)",
                     shell::DrvKind::Check => " (check)",
                     shell::DrvKind::Doc => " (doc)",
+                    shell::DrvKind::Aggregator => " (aggregator)",
                     shell::DrvKind::Compile => "",
                 };
                 let label = if version.is_empty() {
@@ -1611,7 +2204,7 @@ fn run_binary(
     binary_path: &Path,
     args: &[String],
     target: &Option<String>,
-    manifest_dir: Option<&str>,
+    crate_dir: Option<CrateDir<'_>>,
 ) -> Result<std::process::ExitStatus> {
     let runner = resolve_runner(target);
     if runner.is_none() && is_cross_target(target) {
@@ -1639,12 +2232,8 @@ fn run_binary(
         cmd.args(args);
         cmd
     };
-    // Set CARGO_MANIFEST_DIR so that runtime lookups via std::env::var()
-    // resolve to the writable project directory instead of the nix store.
-    // Also set the working directory to match vanilla cargo behavior.
-    if let Some(dir) = manifest_dir {
-        cmd.env("CARGO_MANIFEST_DIR", dir);
-        cmd.current_dir(dir);
+    if let Some(dir) = crate_dir {
+        set_crate_dir(&mut cmd, dir)?;
     }
     let status = cmd
         .status()
@@ -1652,31 +2241,84 @@ fn run_binary(
     Ok(status)
 }
 
-/// Create a deterministic `/tmp` symlink for CARGO_MANIFEST_DIR.
-///
-/// At compile time the derivation creates the same symlink pointing to the
-/// Nix store path so proc macros can read files. Here at runtime we
-/// re-create it pointing to the writable project directory, so both
-/// `env!("CARGO_MANIFEST_DIR")` (baked at compile time) and
-/// `std::env::var("CARGO_MANIFEST_DIR")` resolve to a readable+writable
-/// location.
-fn schnee_manifest_symlink(project_manifest_dir: &str) -> String {
-    let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(project_manifest_dir.as_bytes());
-        nix_encoding::hex_lower(&hasher.finalize()[..8])
-    };
-    let tmp_path = format!("/tmp/_schnee_md_{}", hash);
-    // Atomically replace any stale symlink (may point to a store path from
-    // a previous build).
-    let _ = std::fs::remove_file(&tmp_path);
-    let _ = std::os::unix::fs::symlink(project_manifest_dir, &tmp_path);
-    tmp_path
+/// The crate directory a spawned binary runs in and sees as
+/// `CARGO_MANIFEST_DIR`.
+enum CrateDir<'a> {
+    /// A binary whose `CARGO_MANIFEST_DIR` is the checkout directory itself.
+    Checkout(&'a str),
+    /// A `TestCompile` binary. It was compiled with
+    /// `plan_nix::util::test_manifest_dir()`, so the checkout directory is
+    /// opened on `TEST_MANIFEST_DIR_FD` in the child, private to that run.
+    Test(&'a str),
+}
+
+/// Configure `cmd` to run in `dir`, as cargo does.
+fn set_crate_dir(cmd: &mut Command, dir: CrateDir<'_>) -> Result<()> {
+    match dir {
+        CrateDir::Checkout(dir) => {
+            cmd.env("CARGO_MANIFEST_DIR", dir);
+            cmd.current_dir(dir);
+        }
+        CrateDir::Test(dir) => {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let handle = std::fs::File::open(dir)
+                .with_context(|| format!("Failed to open the crate directory {dir}"))?;
+            cmd.env("CARGO_MANIFEST_DIR", plan_nix::util::test_manifest_dir());
+            cmd.current_dir(dir);
+            // SAFETY: the closure runs between fork and exec and calls only
+            // `dup2`, which is async-signal-safe. `handle` stays open in the
+            // parent until `cmd` is dropped, because the closure owns it.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let target = plan_nix::util::TEST_MANIFEST_DIR_FD;
+                    // `dup2` leaves the new descriptor without `FD_CLOEXEC`,
+                    // so the test binary inherits it.
+                    if libc::dup2(handle.as_raw_fd(), target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `NIX_CONFIG` for a spawned Nix command: the caller's `NIX_CONFIG`
+/// followed by `extra` on a line of its own. Replacing the caller's value
+/// would drop settings such as `log-profiling` or `max-jobs` that the
+/// caller set for the whole build.
+fn nix_config(caller: Option<&std::ffi::OsStr>, extra: &str) -> std::ffi::OsString {
+    let mut config = std::ffi::OsString::new();
+    if let Some(caller) = caller.filter(|c| !c.is_empty()) {
+        config.push(caller);
+        config.push("\n");
+    }
+    config.push(extra);
+    config
+}
+
+/// One root unit of a finished build, as the subcommands consume it.
+struct RootUnit {
+    drv_path: String,
+    target_name: String,
+    kind: plan_nix::UnitKind,
+    /// The crate's directory in the checkout, which the binary sees as its
+    /// `CARGO_MANIFEST_DIR` once it runs.
+    project_manifest_dir: String,
+    bin_path: Option<PathBuf>,
+}
+
+/// The pipeline profile a build splits libraries by, and where it records
+/// a new one.  See `SchneeArgs::pipeline_profile`.
+struct PipelineOptions {
+    profile: Option<plan_nix::pipeline::PipelineProfile>,
+    record_to: Option<PathBuf>,
 }
 
 struct BuildResult {
-    /// Root derivation paths with target names, unit kinds, manifest dirs, and binary paths
-    root_drvs: Vec<(String, String, plan_nix::UnitKind, String, Option<PathBuf>)>,
+    root_units: Vec<RootUnit>,
     /// target/<profile>/ directory
     target_debug: PathBuf,
 }
@@ -1696,8 +2338,31 @@ fn run_build_pipeline(
     verify_drv_paths: bool,
     verbose: u8,
     write_profile_to: &Option<PathBuf>,
+    pipeline_opts: &PipelineOptions,
     interrupted: &Arc<AtomicBool>,
     document_private_items: bool,
+    // Run clippy-driver instead of rustc on local (workspace) compile units.
+    // The cargo plan is unchanged; only per-unit derivations differ.
+    clippy: bool,
+    // Extra arguments forwarded to clippy-driver after the rustc command
+    // line on every local clippy unit, e.g. `["--deny", "warnings"]`.
+    // Empty for non-clippy commands and ignored for dependency units so
+    // their per-unit derivations stay byte-shared with regular runs.
+    clippy_lint_args: &[String],
+    // When `Some(path)`, write the root drv paths (one per line) to
+    // `path` after registration completes and return early without
+    // realising anything.  See `SchneeArgs::plan_only`.
+    plan_only: Option<&Path>,
+    // When `Some(path)` (and `plan_only` is set), additionally register
+    // an aggregator drv covering all roots and write its drv path here.
+    plan_aggregator_out: Option<&Path>,
+    // When true, plan all targets (lib + bins + tests + examples +
+    // benches) instead of cargo's default selection.  Mirrors `cargo
+    // ... --all-targets`; useful for `cargo clippy --all-targets`.
+    all_targets: bool,
+    // Key into `[workspace.metadata.schnee.resolution]`.  See
+    // `SchneeArgs::resolution_scope`.
+    resolution_scope: Option<&str>,
 ) -> Result<BuildResult> {
     let start_time = Instant::now();
     let manifest_path = resolve_manifest(manifest_path_opt)?;
@@ -1711,7 +2376,7 @@ fn run_build_pipeline(
     let ws_root_manifest_canon = ws_root_manifest.canonicalize().unwrap_or(ws_root_manifest);
     let packages = if packages.is_empty() && manifest_path != ws_root_manifest_canon {
         let pkg_name = read_package_name(&manifest_path)?;
-        log::info!(
+        tracing::info!(
             "Scoping build to package '{}' (manifest at {})",
             pkg_name,
             manifest_path.display(),
@@ -1722,99 +2387,140 @@ fn run_build_pipeline(
     };
     let packages = &packages[..];
 
-    let profile = if release {
-        plan_nix::ProfileConfig::release()
-    } else if let Some(p) = profile_opt {
-        match p.as_str() {
-            "dev" => plan_nix::ProfileConfig::dev(),
-            "release" => plan_nix::ProfileConfig::release(),
-            _ => plan_nix::ProfileConfig {
-                name: p.clone(),
-                opt_level: "0",
-                debug_info: true,
-            },
-        }
-    } else {
-        plan_nix::ProfileConfig::dev()
-    };
+    // Read from the workspace root manifest even when the caller pointed
+    // at a member: a member declaring its own scope would reintroduce the
+    // per-invocation divergence the scope removes.
+    let resolution = resolution_scope
+        .map(|key| plan_nix::read_resolution_scope(&ws_root_manifest_canon, key))
+        .transpose()?;
+    let resolution = resolution.as_ref();
+
+    let profile = profile_name(release, profile_opt);
 
     let target_config = match target {
         Some(t) => plan_nix::TargetConfig::with_target(t),
         None => plan_nix::TargetConfig::native(),
     };
 
-    // Load build cache (locked to prevent concurrent cache corruption)
-    let _cache_lock = CacheLock::acquire(project_dir)?;
-    let mut cache = SchneeCache::load(project_dir);
-
-    // Vendor dependencies — skip if Cargo.lock hasn't changed
     let vendor_start = Instant::now();
     let lockfile_path = find_lockfile(project_dir)?;
     let lockfile_hash = hash_file(&lockfile_path)?;
+
+    // Clippy mode reuses the regular check unit graph because the cargo
+    // plan is identical, only the rustc binary is swapped per unit at
+    // construction time.
+    let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
+    // Filesystem-driven target discovery (tests/, benches/, examples/,
+    // src/bin/, src/lib.rs, src/main.rs, build.rs) changes the unit-graph
+    // shape without touching any manifest, so it gets its own key
+    // component — otherwise adding `tests/foo.rs` serves a stale cached
+    // graph and the new test silently never runs.
+    let targets_hash = hash_discovered_targets(&manifest_path, project_dir)?;
+    let intent_str = intent_label(&user_intent);
+    let unit_graph_key = compose_unit_graph_key(
+        &lockfile_hash,
+        &manifest_hash,
+        &targets_hash,
+        &profile,
+        &target_config.target_triple,
+        &user_intent,
+        packages,
+        exclude,
+        features,
+        no_default_features,
+        all_targets,
+        resolution,
+    );
+    // `nix/buildPackage.nix` computes the graph in the `lib.unitGraph`
+    // derivation and hands it over. Otherwise this build registers its
+    // own unit-graph derivation next to the vendor farm, and the store
+    // memoises both by the content of their inputs.
+    let mut graph = try_load_unit_graph_from_env(&unit_graph_key);
+    if let Some(entry) = &graph {
+        tracing::info!(
+            "Loaded unit graph from CARGO_SCHNEE_UNIT_GRAPH ({} units)",
+            entry.units.len(),
+        );
+    }
+    let source_span = tracing::info_span!("add_project_source").entered();
+    let want_skeleton = vendor_dir.is_none() && graph.is_none();
+    let project = project_source(project_dir, want_skeleton)?;
+    let src_store = project.store_path.clone();
+    let skeleton = project.skeleton.clone();
+    drop(source_span);
+    let mut memoised_paths: Vec<String> = Vec::new();
     let vendor_store = if let Some(dir) = vendor_dir {
         let dir = dir
             .canonicalize()
             .with_context(|| format!("Cannot canonicalize vendor dir: {}", dir.display()))?;
         shell::status("Vendoring", &format!("using provided {}", dir.display()));
         dir.to_string_lossy().into_owned()
-    } else if cache.vendor_lockfile_hash.as_deref() == Some(&lockfile_hash) {
-        if let Some(ref cached_path) = cache.vendor_store_path {
-            if Path::new(cached_path).exists() {
-                shell::status("Vendoring", "dependencies (cached)");
-                cached_path.clone()
-            } else {
-                vendor_dependencies(&manifest_path)?
-            }
-        } else {
-            vendor_dependencies(&manifest_path)?
-        }
     } else {
         shell::status("Vendoring", "dependencies...");
-        vendor_dependencies(&manifest_path)?
+        let lock_text = std::fs::read_to_string(&lockfile_path)
+            .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
+        let request = match (&graph, skeleton.as_deref()) {
+            (None, Some(skeleton)) => compute_graph_args(
+                &profile,
+                target.as_deref(),
+                &user_intent,
+                packages,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+                resolution_scope,
+            )
+            .map(|args| GraphRequest {
+                name: format!(
+                    "{}-{}-unit-graph",
+                    read_package_name(&manifest_path).unwrap_or_else(|_| "workspace".into()),
+                    intent_str
+                ),
+                skeleton,
+                project_dir,
+                args,
+            }),
+            _ => None,
+        };
+        // A fetch can fail where `cargo vendor` still succeeds from the local
+        // registry cache, so a failed farm falls back rather than aborting.
+        let memo = realise_memoised_inputs(&lock_text, request, &target_config.nix_system)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Falling back to cargo vendor: {:#}", e);
+                None
+            });
+        match memo {
+            Some(memo) => {
+                if let Some(file) = &memo.graph {
+                    graph = parse_unit_graph_file(file, &unit_graph_key);
+                    if let Some(entry) = &graph {
+                        tracing::info!(
+                            "Loaded unit graph from {} ({} units)",
+                            file.display(),
+                            entry.units.len()
+                        );
+                    }
+                }
+                memoised_paths = memo.kept;
+                memo.vendor
+            }
+            None => vendor_dependencies(&manifest_path)?,
+        }
     };
-    cache.vendor_lockfile_hash = Some(lockfile_hash.clone());
-    cache.vendor_store_path = Some(vendor_store.clone());
-
-    // Add project source to the Nix store
-    let src_store = add_project_source_to_store(project_dir)?;
     let vendor_duration = vendor_start.elapsed();
 
-    // Plan: extract unit graph and register per-unit CA derivations directly.
     let plan_start = Instant::now();
     shell::status("Planning", "build...");
-
-    // Check unit graph cache
-    let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
-    let intent_str = match user_intent {
-        UserIntent::Build => "build",
-        UserIntent::Check { .. } => "check",
-        UserIntent::Test => "test",
-        UserIntent::Bench => "bench",
-        UserIntent::Doc { .. } => "doc",
-        _ => "build",
+    let handed_over = graph;
+    let (cached_units, cached_cfg_envs, cached_host_cfg_envs) = match handed_over {
+        Some(e) => (
+            Some((e.src_store, e.units)),
+            Some(e.target_cfg_envs),
+            Some(e.host_cfg_envs),
+        ),
+        None => (None, None, None),
     };
-    let packages_str = packages.join(",");
-    let exclude_str = exclude.join(",");
-    let features_str = features.join(",");
-    let unit_graph_key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        lockfile_hash,
-        manifest_hash,
-        profile.name,
-        target_config.target_triple,
-        intent_str,
-        packages_str,
-        exclude_str,
-        features_str,
-        no_default_features,
-    );
-    let cached_entry = cache.unit_graphs.get(&unit_graph_key);
-    let cached_units = cached_entry.map(|e| {
-        log::info!("Unit graph cache hit ({} units)", e.units.len());
-        (e.src_store.clone(), e.units.clone())
-    });
-    let cached_cfg_envs = cached_entry.map(|e| e.target_cfg_envs.clone());
-    let cached_host_cfg_envs = cached_entry.map(|e| e.host_cfg_envs.clone());
 
     // Resolve passthrough env vars for build-script derivations.
     // CARGO_SCHNEE_PASSTHRU_ENVS is a space-separated list of env var names
@@ -1828,7 +2534,7 @@ fn run_build_pipeline(
         .filter_map(|name| match std::env::var(&name) {
             Ok(val) => Some((name, val)),
             Err(_) => {
-                log::warn!(
+                tracing::warn!(
                     "passthruEnv: {} is declared but not set in the environment — \
                      it will not be forwarded to build scripts",
                     name,
@@ -1838,11 +2544,33 @@ fn run_build_pipeline(
         })
         .collect();
 
-    let (root_drvs, plan_units, cfg_envs, host_cfg_envs) = plan_nix::run_plan_nix(
-        Path::new(&src_store),
+    // `--remap-path-prefix` rules to apply to every compile unit.
+    // CARGO_SCHNEE_PATH_PREFIX_REMAPS is JSON-encoded — a list of two-element
+    // arrays `[[src_relative, replacement], ...]` — so the consumer's Nix
+    // attrset can express remaps relative to the project-src layout without
+    // knowing the per-build store hash.
+    let path_prefix_remaps: Vec<(String, String)> =
+        match std::env::var("CARGO_SCHNEE_PATH_PREFIX_REMAPS") {
+            Ok(s) if !s.is_empty() => serde_json::from_str(&s)
+                .with_context(|| format!("parse CARGO_SCHNEE_PATH_PREFIX_REMAPS as JSON: {}", s))?,
+            _ => Vec::new(),
+        };
+
+    // Caller-supplied unit setup rules. CARGO_SCHNEE_UNIT_SETUP is
+    // JSON-encoded — a list of rule objects (see `nix/buildPackage.nix`'s
+    // `unitSetup`) whose scripts are sourced inside matching units'
+    // sandboxes immediately before the driver invocation runs.
+    let unit_setup: Vec<plan_nix::UnitSetupRule> = match std::env::var("CARGO_SCHNEE_UNIT_SETUP") {
+        Ok(s) if !s.is_empty() => serde_json::from_str(&s)
+            .with_context(|| format!("parse CARGO_SCHNEE_UNIT_SETUP as JSON: {}", s))?,
+        _ => Vec::new(),
+    };
+
+    let (root_drvs, plan_units, _, _) = plan_nix::run_plan_nix(
+        &project,
         Path::new(&vendor_store),
         verify_drv_paths,
-        &mut cache.tool_closures,
+        &mut HashMap::new(),
         cached_units,
         cached_cfg_envs,
         cached_host_cfg_envs,
@@ -1856,41 +2584,111 @@ fn run_build_pipeline(
         &passthru_envs,
         Some(project_dir),
         document_private_items,
+        clippy,
+        clippy_lint_args,
+        &path_prefix_remaps,
+        &unit_setup,
+        all_targets,
+        resolution,
+        pipeline_opts.profile.as_ref(),
     )?;
-
-    // Update unit graph cache
-    cache.unit_graphs.insert(
-        unit_graph_key,
-        UnitGraphCacheEntry {
-            src_store: src_store.clone(),
-            units: plan_units
-                .iter()
-                .map(|u| {
-                    let mut c = u.clone();
-                    c.clear_drv_path();
-                    c
-                })
-                .collect(),
-            target_cfg_envs: cfg_envs,
-            host_cfg_envs,
-        },
-    );
 
     let plan_duration = plan_start.elapsed();
 
-    // Build all root derivations
-    let project_pkg_name = read_bin_target_name(&manifest_path).ok();
-    let mut cmd = Command::new("nix-store");
-    cmd.arg("--realise");
-    for (drv_path, _, _) in &root_drvs {
-        cmd.arg(drv_path);
+    // Always construct the aggregator drv after registration: it depends
+    // on every root drv and produces a `$out/root-<idx>` symlink farm
+    // pointing at each root's realised output.  Both the CLI realise path
+    // and the Nix-side `lib.buildPackage` go through this single
+    // derivation; CLI realises directly via `nix-store --realise`, lib.*
+    // chains via `builtins.outputOf`.  Avoids the per-root realisation
+    // conflict that hit `lib.buildPackage` previously and unifies the two
+    // pipelines onto one drv graph.
+    let pname_for_agg = if let Ok(name) = read_package_name(&manifest_path) {
+        name
+    } else if !packages.is_empty() {
+        packages[0].clone()
+    } else {
+        "workspace".to_string()
+    };
+    let aggregator_drv = plan_nix::construct_aggregator_drv(
+        &pname_for_agg,
+        intent_str,
+        &root_drvs,
+        &target_config.nix_system,
+    )
+    .context("Constructing aggregator drv")?;
+
+    // --plan-only: write root drv paths and return without realising.
+    // Realisation moves to the outer Nix scheduler via a dynamic-derivation
+    // reference on the aggregator, eliminating the recursive-nix slot
+    // inversion deadlock that bites under concurrent `lib.buildPackage`
+    // invocations.
+    if let Some(out_path) = plan_only {
+        let mut content = String::new();
+        for (drv_path, _, _) in &root_drvs {
+            content.push_str(drv_path);
+            content.push('\n');
+        }
+        std::fs::write(out_path, content)
+            .with_context(|| format!("Writing plan output to {}", out_path.display()))?;
+
+        if let Some(agg_out) = plan_aggregator_out {
+            std::fs::write(agg_out, format!("{}\n", aggregator_drv))
+                .with_context(|| format!("Writing aggregator drv path to {}", agg_out.display()))?;
+        }
+
+        return Ok(BuildResult {
+            root_units: Vec::new(),
+            target_debug: PathBuf::new(),
+        });
     }
+
+    // CLI realise path: ask the daemon to build the aggregator drv.  Its
+    // transitive deps are every per-unit drv the planner registered, so
+    // the daemon emits the same `building '/nix/store/...' lines we
+    // already parse for the inline "Compiling foo v1.2" status output —
+    // unchanged DX, plus one trailing build line for the aggregator
+    // itself (a near-instant symlink farm).
+    //
+    // Use `nix build <drv>^out --print-out-paths` rather than
+    // `nix-store --realise <drv>`. Since the build-trace rework
+    // (Nix master post-2.34), `nix-store --realise` no longer follows
+    // the resolve-and-build chain for placeholder dynamic-derivation
+    // outputs and exits with "cannot operate on output 'out' of the
+    // unbuilt derivation". `nix build` is the only invocation that
+    // realises the chain end-to-end on both pre- and post-rework Nix,
+    // and `--print-out-paths` writes the realised store path to stdout
+    // so we can keep the same stdout-parsing shape downstream.
+    let project_pkg_name = read_bin_target_name(&manifest_path).ok();
+    let mut cmd = Command::new("nix");
+    cmd.arg("build");
+    cmd.arg(format!("{}^out", aggregator_drv));
+    cmd.arg("--print-out-paths");
+    cmd.arg("--no-link");
+    let build_start = Instant::now();
+    let mut recorder = pipeline_opts.record_to.as_ref().map(|_| {
+        // The JSON log carries every build's log lines by activity id, and
+        // with `log-profiling` the CPU time each builder used.  A Nix
+        // without the setting warns and leaves the CPU time out.
+        cmd.args(["--log-format", "internal-json"]);
+        cmd.args(["--option", "log-profiling", "true"]);
+        plan_nix::pipeline::PipelineRecorder::new(
+            build_start,
+            pipeline_opts.profile.clone().unwrap_or_default(),
+        )
+    });
     let mut child = cmd
-        .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+        .env(
+            "NIX_CONFIG",
+            nix_config(
+                std::env::var_os("NIX_CONFIG").as_deref(),
+                "extra-experimental-features = nix-command ca-derivations dynamic-derivations",
+            ),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn nix-store --realise")?;
+        .context("Failed to spawn nix build")?;
 
     let stdout = child.stdout.take().context("stdout not piped")?;
     let stdout_thread = std::thread::spawn(move || {
@@ -1903,18 +2701,23 @@ fn run_build_pipeline(
     let stderr = child.stderr.take().context("stderr not piped")?;
     let reader = std::io::BufReader::new(stderr);
     let mut seen_pkgs: HashSet<String> = HashSet::new();
-    let build_start = Instant::now();
     let mut building_events: Vec<(Instant, String)> = Vec::new();
     let mut total_drv_count: Option<usize> = None;
 
     let gctx = GlobalContext::default()?;
     let mut progress = Progress::with_style("Building", ProgressStyle::Ratio, &gctx);
     let mut diag_shell = cargo::core::shell::Shell::new();
-    let src_store_prefix = format!("{}/", src_store);
-    let project_dir_prefix = format!("{}/", project_dir.display());
+    let path_remaps = plan_nix::diagnostic_path_remaps(&plan_units, &src_store, project_dir);
     let mut nix_error_lines: Vec<String> = Vec::new();
 
-    for line in reader.lines().map_while(Result::ok) {
+    let lines = reader
+        .lines()
+        .map_while(Result::ok)
+        .flat_map(|line| match recorder.as_mut() {
+            Some(recorder) => recorder.read(&line),
+            None => vec![line],
+        });
+    for line in lines {
         if interrupted.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
@@ -2016,12 +2819,7 @@ fn run_build_pipeline(
             progress.clear();
             // Nix prefixes "Last N log lines" with "> "; strip before checking
             let content = trimmed.strip_prefix("> ").unwrap_or(trimmed);
-            let was_diagnostic = diagnostics::emit_line(
-                &mut diag_shell,
-                content,
-                &src_store_prefix,
-                &project_dir_prefix,
-            );
+            let was_diagnostic = diagnostics::emit_line(&mut diag_shell, content, &path_remaps);
             if !was_diagnostic {
                 nix_error_lines.push(trimmed.to_string());
             }
@@ -2074,21 +2872,66 @@ fn run_build_pipeline(
         }
         std::process::exit(1);
     }
-    let out_paths: Vec<String> = stdout_content
+    if let (Some(recorder), Some(path)) = (recorder, &pipeline_opts.record_to) {
+        let profile = recorder.finish();
+        profile.save(path)?;
+        tracing::info!(
+            "Wrote the build times of {} libraries and {} other units to {}",
+            profile.libraries.len(),
+            profile.others.len(),
+            path.display()
+        );
+    }
+    // Aggregator output: a single $out path with `root-<idx>`
+    // symlinks pointing at each root's realised output.  Project the
+    // per-root paths into the same shape the rest of the pipeline
+    // expects (one realised path per root, in registration order).
+    let aggregator_out_path = stdout_content
         .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("nix build emitted no output paths"))?
+        .to_string();
+    let out_paths: Vec<String> = (0..root_drvs.len())
+        .map(|idx| format!("{}/root-{}", aggregator_out_path, idx))
         .collect();
     let build_end = Instant::now();
     let build_duration = build_end.duration_since(build_start);
 
+    let root_start = Instant::now();
+    let mut kept_sources: Vec<String> = project
+        .in_store()
+        .then(|| src_store.clone())
+        .into_iter()
+        .collect();
+    if vendor_dir.is_none() {
+        kept_sources.push(vendor_store.clone());
+    }
+    let gc_root = project_dir.join("target/.schnee-roots").join(format!(
+        "{}-{}-{}",
+        profile, target_config.target_triple, intent_str
+    ));
+    match root_last_build(
+        &gc_root,
+        &format!("{}-{}-gc-root", pname_for_agg, intent_str),
+        &kept_sources,
+        &plan_units,
+        &aggregator_drv,
+        &aggregator_out_path,
+        &memoised_paths,
+    ) {
+        Ok(registered) => tracing::info!(
+            "{} GC root {} in {} ms",
+            if registered { "Registered" } else { "Kept" },
+            gc_root.display(),
+            root_start.elapsed().as_millis()
+        ),
+        Err(e) => tracing::warn!("Failed to register GC root {}: {:#}", gc_root.display(), e),
+    }
+
     // Copy outputs to target/<profile>/
     let copy_start = Instant::now();
-    let profile_dir = if profile.name == "dev" {
-        "debug"
-    } else {
-        &profile.name
-    };
+    let profile_dir = if profile == "dev" { "debug" } else { &profile };
     let target_debug = if target_config.is_cross() {
         project_dir
             .join("target")
@@ -2126,7 +2969,7 @@ fn run_build_pipeline(
             if dest.exists()
                 && let Err(e) = std::fs::remove_file(&dest)
             {
-                log::debug!("Failed to remove old file {}: {}", dest.display(), e);
+                tracing::debug!("Failed to remove old file {}: {}", dest.display(), e);
             }
             std::fs::copy(entry.path(), &dest).with_context(|| {
                 format!(
@@ -2171,7 +3014,7 @@ fn run_build_pipeline(
                 if clean_dest.exists()
                     && let Err(e) = std::fs::remove_file(&clean_dest)
                 {
-                    log::debug!(
+                    tracing::debug!(
                         "Failed to remove old binary {}: {}",
                         clean_dest.display(),
                         e
@@ -2186,42 +3029,27 @@ fn run_build_pipeline(
     }
     let copy_duration = copy_start.elapsed();
 
-    // Replay cached diagnostics
-    {
-        let built_set: HashSet<&str> = building_events
-            .iter()
-            .map(|(_, drv)| drv.as_str())
-            .collect();
-        let cached_local_drvs: Vec<&str> = plan_nix::local_compile_drv_paths(&plan_units)
-            .into_iter()
-            .filter(|drv| !built_set.contains(drv))
-            .collect();
-        if !cached_local_drvs.is_empty() {
-            let resolve_output = Command::new("nix-store")
-                .arg("--realise")
-                .args(&cached_local_drvs)
-                .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
-                .output();
-            if let Ok(output) = resolve_output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for out_path in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    let diag_path = Path::new(out_path).join("diagnostics");
-                    diagnostics::replay_diagnostics_from_file(
-                        &mut diag_shell,
-                        &diag_path,
-                        &src_store_prefix,
-                        &project_dir_prefix,
-                    );
-                }
+    // `nix build` shows no log of a successful build, so the diagnostics of
+    // every local unit are replayed here, whether it was built in this run or
+    // not. Each appears exactly once.
+    match plan_nix::realise_local_outputs(&plan_units) {
+        Ok(out_paths) => {
+            for out_path in out_paths {
+                diagnostics::replay_diagnostics_from_file(
+                    &mut diag_shell,
+                    &Path::new(&out_path).join("diagnostics"),
+                    &path_remaps,
+                );
             }
         }
+        Err(e) => tracing::warn!("Not replaying compiler diagnostics: {e:#}"),
     }
 
     let elapsed = start_time.elapsed();
-    let profile_desc = match profile.name.as_str() {
+    let profile_desc = match profile.as_str() {
         "dev" => "`dev` profile [unoptimized + debuginfo]".to_string(),
         "release" => "`release` profile [optimized]".to_string(),
-        _ => format!("`{}` profile", profile.name),
+        _ => format!("`{}` profile", profile),
     };
     shell::status(
         "Finished",
@@ -2231,11 +3059,6 @@ fn run_build_pipeline(
             elapsed.as_secs_f64()
         ),
     );
-
-    // Save cache
-    if let Err(e) = cache.save(project_dir) {
-        log::warn!("Failed to save build cache: {}", e);
-    }
 
     if let Some(profile_path) = write_profile_to {
         write_profile(
@@ -2257,34 +3080,32 @@ fn run_build_pipeline(
         );
     }
 
-    // Build root_drvs with manifest dirs and binary paths
-    let root_drvs_with_kind: Vec<(String, String, plan_nix::UnitKind, String, Option<PathBuf>)> =
-        root_drvs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (drv_path, target_name, kind))| {
-                let unit = plan_units
-                    .iter()
-                    .find(|u| u.drv_path.as_deref() == Some(&drv_path));
-                // Map store-path manifest_dir back to the project directory for
-                // runtime CARGO_MANIFEST_DIR (covers std::env::var() lookups).
-                let manifest_dir = unit
-                    .map(|u| {
-                        let store_prefix = src_store_prefix.trim_end_matches('/');
-                        if let Some(suffix) = u.manifest_dir.strip_prefix(store_prefix) {
-                            format!("{}{}", project_dir.display(), suffix)
-                        } else {
-                            u.manifest_dir.clone()
-                        }
-                    })
-                    .unwrap_or_default();
-                let bin_path = root_bin_paths.get(idx).cloned().flatten();
-                (drv_path, target_name, kind, manifest_dir, bin_path)
-            })
-            .collect();
+    // Pair each root with its manifest dirs and binary path.  The planner
+    // already recorded `original_manifest_dir` as the checkout path before
+    // per-crate slicing rewrote `manifest_dir` onto a crate store, so read it
+    // rather than stripping a prefix off `manifest_dir`, which no longer
+    // matches the project source store for a sliced crate.
+    let root_units: Vec<RootUnit> = root_drvs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (drv_path, target_name, kind))| {
+            let unit = plan_units
+                .iter()
+                .find(|u| u.drv_path.as_deref() == Some(&drv_path));
+            RootUnit {
+                project_manifest_dir: unit
+                    .map(|u| u.original_manifest_dir.clone())
+                    .unwrap_or_default(),
+                bin_path: root_bin_paths.get(idx).cloned().flatten(),
+                drv_path,
+                target_name,
+                kind,
+            }
+        })
+        .collect();
 
     Ok(BuildResult {
-        root_drvs: root_drvs_with_kind,
+        root_units,
         target_debug,
     })
 }
@@ -2307,20 +3128,83 @@ fn cleanup_stale_temps() {
     }
 }
 
+/// Always installs a `fmt` layer to stderr matching the previous
+/// `env_logger` output (no target prefix, no timestamps). When
+/// `CARGO_SCHNEE_TRACE=<path>` is set, a `tracing-chrome` layer is
+/// additionally installed that writes a `chrome://tracing` JSON file
+/// to that path. The returned `FlushGuard` joins the writer thread on
+/// drop, so the trace file is flushed cleanly when `main` returns.
+///
+/// Filter precedence: `SCHNEE_LOG` env var, then `RUST_LOG`, then the
+/// `--verbose` count (0=warn, 1=info, 2=debug, ≥3=trace, scoped to the
+/// `cargo_schnee` module).
+///
+/// File-creation failures for `CARGO_SCHNEE_TRACE` are warned about
+/// rather than panicking — pre-flighting the create avoids
+/// `tracing_chrome::ChromeLayerBuilder::build()`'s internal `expect`,
+/// which would crash cargo-schnee at startup over a missing parent
+/// directory or perms-denied path.
+fn init_tracing(verbose: u8) -> Option<tracing_chrome::FlushGuard> {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let default_level = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let env_filter = EnvFilter::try_from_env("SCHNEE_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new(format!("cargo_schnee={default_level}")));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time();
+
+    // Pre-flight the trace file. `ChromeLayerBuilder::build()` panics
+    // via `expect` if `File::create` fails; we'd rather warn and
+    // continue without the chrome layer than crash the binary because a
+    // diagnostic env var pointed somewhere unwritable.
+    let chrome = std::env::var("CARGO_SCHNEE_TRACE")
+        .ok()
+        .and_then(|path| match std::fs::File::create(&path) {
+            Ok(file) => Some(
+                tracing_chrome::ChromeLayerBuilder::new()
+                    .writer(std::io::BufWriter::new(file))
+                    .include_args(true)
+                    .build(),
+            ),
+            Err(e) => {
+                eprintln!(
+                    "warning: CARGO_SCHNEE_TRACE={:?}: cannot open trace file ({}); chrome trace disabled",
+                    path, e,
+                );
+                None
+            }
+        });
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    let guard = if let Some((chrome_layer, flush_guard)) = chrome {
+        registry.with(chrome_layer).init();
+        Some(flush_guard)
+    } else {
+        registry.init();
+        None
+    };
+    let _ = tracing_log::LogTracer::init();
+    guard
+}
+
 fn main() -> Result<()> {
     let Cargo::Schnee(args) = Cargo::parse();
 
-    let log_level = match args.verbose {
-        0 => LevelFilter::Warn,
-        1 => LevelFilter::Info,
-        2 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
-    };
-    env_logger::Builder::new()
-        .filter_module("cargo_schnee", log_level)
-        .format_target(false)
-        .format_timestamp(None)
-        .init();
+    let _trace_guard = init_tracing(args.verbose);
 
     let interrupted = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
@@ -2331,7 +3215,21 @@ fn main() -> Result<()> {
 
     let verbose = args.verbose;
     let write_profile_to = args.write_profile_to;
+    let pipeline_opts = PipelineOptions {
+        profile: args
+            .pipeline_profile
+            .as_deref()
+            .map(plan_nix::pipeline::PipelineProfile::load)
+            .transpose()?,
+        record_to: args.write_pipeline_profile,
+    };
     let verify_drv_paths = args.verify_drv_paths;
+    let plan_only = args.plan_only.clone();
+    let plan_only_ref = plan_only.as_deref();
+    let plan_aggregator_out = args.plan_aggregator_out.clone();
+    let plan_aggregator_out_ref = plan_aggregator_out.as_deref();
+    let resolution_scope_arg = args.resolution_scope.clone();
+    let resolution_scope = resolution_scope_arg.as_deref();
 
     match args.command {
         SchneeCommand::Check {
@@ -2359,8 +3257,15 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
         }
         SchneeCommand::Build {
@@ -2388,8 +3293,15 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
         }
         SchneeCommand::Run {
@@ -2419,28 +3331,39 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find the binary to run
             let bin_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::Compile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::Compile))
                 .collect();
 
-            let (_, target_name, _, manifest_dir, _) = if let Some(bin_name) = bin {
+            let root = if let Some(bin_name) = bin {
                 bin_roots
                     .iter()
-                    .find(|(_, name, _, _, _)| name == bin_name)
+                    .find(|u| &u.target_name == bin_name)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "no bin target named `{}`\navailable targets: {}",
                             bin_name,
                             bin_roots
                                 .iter()
-                                .map(|(_, n, _, _, _)| n.as_str())
+                                .map(|u| u.target_name.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -2452,16 +3375,21 @@ fn main() -> Result<()> {
                     "multiple binary targets found, use --bin to specify one: {}",
                     bin_roots
                         .iter()
-                        .map(|(_, n, _, _, _)| n.as_str())
+                        .map(|u| u.target_name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             };
 
-            let bin_name = binary_name(target_name, target);
+            let bin_name = binary_name(&root.target_name, target);
             let binary_path = result.target_debug.join(&bin_name);
             shell::status("Running", &format!("`{}`", binary_path.display()));
-            let status = run_binary(&binary_path, args, target, Some(manifest_dir))?;
+            let status = run_binary(
+                &binary_path,
+                args,
+                target,
+                Some(CrateDir::Checkout(&root.project_manifest_dir)),
+            )?;
             std::process::exit(status.code().unwrap_or(1));
         }
         SchneeCommand::Test {
@@ -2490,15 +3418,26 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find test binaries (TestCompile roots)
             let test_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if test_roots.is_empty() {
@@ -2507,13 +3446,18 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, _target_name, _, manifest_dir, bin_path) in &test_roots {
-                let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path
+            for root in &test_roots {
+                let binary_path = root
+                    .bin_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("test root has no binary output"))?;
                 shell::status("Running", &format!("tests in `{}`", binary_path.display()));
-                let status = run_binary(binary_path, args, target, Some(&symlink_path))?;
+                let status = run_binary(
+                    binary_path,
+                    args,
+                    target,
+                    Some(CrateDir::Test(&root.project_manifest_dir)),
+                )?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2548,15 +3492,26 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 false,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Find bench binaries (TestCompile roots — bench uses same compile mode)
             let bench_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::TestCompile))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::TestCompile))
                 .collect();
 
             if bench_roots.is_empty() {
@@ -2565,9 +3520,9 @@ fn main() -> Result<()> {
             }
 
             let mut any_failed = false;
-            for (_, _target_name, _, manifest_dir, bin_path) in &bench_roots {
-                let symlink_path = schnee_manifest_symlink(manifest_dir);
-                let binary_path = bin_path
+            for root in &bench_roots {
+                let binary_path = root
+                    .bin_path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("bench root has no binary output"))?;
                 shell::status(
@@ -2576,7 +3531,12 @@ fn main() -> Result<()> {
                 );
                 let mut bench_args = vec!["--bench".to_string()];
                 bench_args.extend(args.iter().cloned());
-                let status = run_binary(binary_path, &bench_args, target, Some(&symlink_path))?;
+                let status = run_binary(
+                    binary_path,
+                    &bench_args,
+                    target,
+                    Some(CrateDir::Test(&root.project_manifest_dir)),
+                )?;
                 if !status.success() {
                     any_failed = true;
                 }
@@ -2601,21 +3561,7 @@ fn main() -> Result<()> {
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine project directory"))?;
 
-            let profile_cfg = if release {
-                plan_nix::ProfileConfig::release()
-            } else if let Some(p) = profile {
-                match p.as_str() {
-                    "dev" => plan_nix::ProfileConfig::dev(),
-                    "release" => plan_nix::ProfileConfig::release(),
-                    _ => plan_nix::ProfileConfig {
-                        name: p.clone(),
-                        opt_level: "0",
-                        debug_info: true,
-                    },
-                }
-            } else {
-                plan_nix::ProfileConfig::dev()
-            };
+            let profile_cfg = profile_name(release, profile);
 
             let target_config = match target {
                 Some(t) => plan_nix::TargetConfig::with_target(t),
@@ -2632,10 +3578,10 @@ fn main() -> Result<()> {
                 None => vendor_dependencies(&manifest_path)?,
             };
 
-            let src_store = add_project_source_to_store(project_dir)?;
+            let project = project_source(project_dir, false)?;
             let mut closure_cache = HashMap::new();
             let (_, plan_units, _, _) = plan_nix::run_plan_nix(
-                Path::new(&src_store),
+                &project,
                 Path::new(&vendor_store),
                 verify_drv_paths,
                 &mut closure_cache,
@@ -2652,14 +3598,73 @@ fn main() -> Result<()> {
                 &[],
                 Some(project_dir),
                 false,
+                false,
+                &[],
+                &[],
+                &[],
+                false,
+                None,
+                pipeline_opts.profile.as_ref(),
             )?;
 
             println!("{}", plan::format_mermaid_graph(&plan_units));
         }
-        SchneeCommand::Clippy => {
-            anyhow::bail!(
-                "cargo schnee clippy is not yet implemented (needs clippy-driver as rustc wrapper)"
-            );
+        SchneeCommand::Clippy {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref exclude,
+            // schnee never runs clippy on dependency units — local units
+            // swap rustc for clippy-driver while deps stay rustc-checked
+            // so their per-unit derivations remain byte-shared with the
+            // regular check / build pipeline.  `--no-deps` is therefore
+            // implicitly always-on; we accept the flag for cargo-clippy
+            // CLI compatibility but it is a no-op.
+            no_deps: _no_deps,
+            all_targets,
+            ref features,
+            no_default_features,
+            ref args,
+        } => {
+            // clap's `last = true` keeps a literal `--` token in
+            // the captured `args` when the cargo wrapper passes
+            // something like `clippy ... -- --deny warnings`.  The
+            // `--` itself isn't a clippy-driver flag — feeding it
+            // through ends "everything is a flag" mode and rustc
+            // treats subsequent `--deny` as a positional source
+            // file.  Strip it before plumbing.
+            let lint_args: Vec<String> = args
+                .iter()
+                .filter(|a| a.as_str() != "--")
+                .cloned()
+                .collect();
+            run_build_pipeline(
+                manifest_path,
+                vendor_dir,
+                release,
+                profile,
+                target,
+                package,
+                exclude,
+                features,
+                no_default_features,
+                UserIntent::Check { test: false },
+                verify_drv_paths,
+                verbose,
+                &write_profile_to,
+                &pipeline_opts,
+                &interrupted,
+                false,
+                true,
+                &lint_args,
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                all_targets,
+                resolution_scope,
+            )?;
         }
         SchneeCommand::Doc {
             ref manifest_path,
@@ -2691,22 +3696,33 @@ fn main() -> Result<()> {
                 verify_drv_paths,
                 verbose,
                 &write_profile_to,
+                &pipeline_opts,
                 &interrupted,
                 document_private_items,
+                false,
+                &[],
+                plan_only_ref,
+                plan_aggregator_out_ref,
+                false,
+                resolution_scope,
             )?;
+
+            if plan_only.is_some() {
+                return Ok(());
+            }
 
             // Merge doc outputs into target/doc/
             let target_doc = result.target_debug.parent().unwrap().join("doc");
             std::fs::create_dir_all(&target_doc)?;
 
             let doc_roots: Vec<_> = result
-                .root_drvs
+                .root_units
                 .iter()
-                .filter(|(_, _, kind, _, _)| matches!(kind, plan_nix::UnitKind::Doc))
+                .filter(|u| matches!(u.kind, plan_nix::UnitKind::Doc))
                 .collect();
 
-            for (_, target_name, _, _, _) in &doc_roots {
-                shell::status("Documenting", target_name);
+            for root in &doc_roots {
+                shell::status("Documenting", &root.target_name);
             }
 
             // Each doc derivation output has $out/doc/<crate_name>/ and
@@ -2714,13 +3730,19 @@ fn main() -> Result<()> {
             let out_paths: Vec<String> = {
                 let mut cmd = Command::new("nix-store");
                 cmd.arg("--realise");
-                for (drv_path, _, kind, _, _) in &result.root_drvs {
-                    if matches!(kind, plan_nix::UnitKind::Doc) {
-                        cmd.arg(drv_path);
+                for root in &result.root_units {
+                    if matches!(root.kind, plan_nix::UnitKind::Doc) {
+                        cmd.arg(&root.drv_path);
                     }
                 }
                 let output = cmd
-                    .env("NIX_CONFIG", "extra-experimental-features = ca-derivations")
+                    .env(
+                        "NIX_CONFIG",
+                        nix_config(
+                            std::env::var_os("NIX_CONFIG").as_deref(),
+                            "extra-experimental-features = ca-derivations",
+                        ),
+                    )
                     .output()
                     .context("Failed to resolve doc derivation outputs")?;
                 String::from_utf8_lossy(&output.stdout)
@@ -2751,17 +3773,17 @@ fn main() -> Result<()> {
             ref vendor_dir,
         } => {
             let mut closure_cache = HashMap::new();
-            let default_profile = plan_nix::ProfileConfig::dev();
             let default_target = plan_nix::TargetConfig::native();
+            let project = ProjectSource::in_store_at(src)?;
             let (root_drvs, _, _, _) = plan_nix::run_plan_nix(
-                src,
+                &project,
                 vendor_dir,
                 verify_drv_paths,
                 &mut closure_cache,
                 None,
                 None,
                 None,
-                &default_profile,
+                "dev",
                 &default_target,
                 UserIntent::Build,
                 &[],
@@ -2771,11 +3793,133 @@ fn main() -> Result<()> {
                 &[],
                 None,
                 false,
+                false,
+                &[],
+                &[],
+                &[],
+                false,
+                None,
+                None,
             )?;
             // Output the root .drv paths
             for (drv_path, _, _) in &root_drvs {
                 println!("{}", drv_path);
             }
+        }
+        SchneeCommand::ComputeGraph {
+            ref manifest_path,
+            ref vendor_dir,
+            release,
+            ref profile,
+            ref target,
+            ref package,
+            ref exclude,
+            ref features,
+            no_default_features,
+            ref intent,
+            all_targets,
+            ref output,
+        } => {
+            let manifest_path = resolve_manifest(manifest_path)?;
+            let project_dir_buf = resolve_workspace_root(&manifest_path)?;
+            let project_dir = project_dir_buf.as_path();
+
+            // Profile / target resolution mirrors `run_build_pipeline`.
+            let profile_cfg = profile_name(release, profile);
+            let target_config = match target {
+                Some(t) => plan_nix::TargetConfig::with_target(t),
+                None => plan_nix::TargetConfig::native(),
+            };
+
+            // Cache-key composition mirrors `run_build_pipeline` so the
+            // env-var hand-off in the build path matches this exactly.
+            let lockfile_path = find_lockfile(project_dir)?;
+            let lockfile_hash = hash_file(&lockfile_path)?;
+            let manifest_hash = hash_workspace_manifests(&manifest_path, project_dir)?;
+            let user_intent = match intent.as_str() {
+                "build" => UserIntent::Build,
+                "check" => UserIntent::Check { test: false },
+                "test" => UserIntent::Test,
+                "bench" => UserIntent::Bench,
+                "doc" => UserIntent::Doc {
+                    deps: false,
+                    json: false,
+                },
+                other => anyhow::bail!(
+                    "unknown --intent {:?}: expected build/check/test/bench/doc",
+                    other,
+                ),
+            };
+            let targets_hash = hash_discovered_targets(&manifest_path, project_dir)?;
+            // The `--all-targets` selection is part of the key because it
+            // is a strictly larger unit set: a graph computed without it
+            // is rejected by a `--all-targets` build rather than reused.
+            // A graph shared with a clippy gate therefore has to be
+            // computed with it.
+            let resolution = resolution_scope
+                .map(|key| plan_nix::read_resolution_scope(&project_dir.join("Cargo.toml"), key))
+                .transpose()?;
+            let resolution = resolution.as_ref();
+            let unit_graph_key = compose_unit_graph_key(
+                &lockfile_hash,
+                &manifest_hash,
+                &targets_hash,
+                &profile_cfg,
+                &target_config.target_triple,
+                &user_intent,
+                package,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+                resolution,
+            );
+
+            // With a scope declared the emitted graph deliberately covers
+            // the whole scope, `-p` and all: consumers narrow it to their
+            // own roots on load, which is what lets them share it.
+            let (units, cfg_envs, host_cfg_envs) = plan_nix::fresh_unit_graph(
+                project_dir,
+                vendor_dir,
+                &profile_cfg,
+                &target_config,
+                user_intent,
+                package,
+                exclude,
+                features,
+                no_default_features,
+                all_targets,
+                resolution,
+            )?;
+
+            // Match the convention used by the in-tree cache: drv_path is
+            // recomputed by every consumer, so don't bake it in.
+            let units: Vec<plan_nix::NixUnit> = units
+                .into_iter()
+                .map(|mut u| {
+                    u.clear_drv_path();
+                    u
+                })
+                .collect();
+
+            let unit_count = units.len();
+            let entry = UnitGraphCacheEntry {
+                src_store: project_dir.to_string_lossy().to_string(),
+                units,
+                target_cfg_envs: cfg_envs,
+                host_cfg_envs,
+                cache_key: unit_graph_key,
+            };
+
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create parent of {}", output.display()))?;
+            }
+            let json = serde_json::to_string_pretty(&entry)
+                .context("Failed to serialise unit graph entry")?;
+            std::fs::write(output, json)
+                .with_context(|| format!("Failed to write {}", output.display()))?;
+            tracing::info!("Wrote {} units to {}", unit_count, output.display());
         }
     }
 
@@ -2785,6 +3929,219 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nix_config_keeps_the_callers_settings() {
+        let extra = "extra-experimental-features = ca-derivations";
+        assert_eq!(
+            nix_config(
+                Some(std::ffi::OsStr::new("log-profiling = true\nmax-jobs = 4")),
+                extra
+            ),
+            "log-profiling = true\nmax-jobs = 4\nextra-experimental-features = ca-derivations"
+        );
+        assert_eq!(nix_config(None, extra), extra);
+        assert_eq!(nix_config(Some(std::ffi::OsStr::new("")), extra), extra);
+    }
+
+    /// The copy the project source used to be: every allowed file that is a
+    /// regular file after following symlinks, and the parents of every
+    /// allowed entry.
+    fn reference_copy(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) {
+        for file in files {
+            let src = project_dir.join(file);
+            let target = dest.join(file);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            if src.is_file() {
+                std::fs::copy(&src, &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_source_tree_serialises_like_the_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/submodule")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(root.join("ignored.log"), "noise\n").unwrap();
+        std::os::unix::fs::symlink("run.sh", root.join("run-link")).unwrap();
+        std::os::unix::fs::symlink("crates", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("crates/a/dangling")).unwrap();
+        let files: HashSet<PathBuf> = [
+            "Cargo.toml",
+            "crates/a/src/lib.rs",
+            "run.sh",
+            "run-link",
+            "dir-link",
+            "crates/a/dangling",
+            "gone/file.rs",
+            "vendor/submodule",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let tree = project_source_tree(&root, Some(&files), &[], &HashMap::new()).unwrap();
+        let copy = tmp.path().join("copy");
+        reference_copy(&root, &files, &copy);
+        assert!(
+            tree.nar().unwrap() == nar::serialize_nar(&copy, None).unwrap(),
+            "the tree serialises differently from the copy"
+        );
+    }
+
+    #[test]
+    fn the_source_tree_holds_external_deps_with_rewritten_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let ext = tmp.path().join("ext");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(ext.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\n[package]\nname = \"app\"\n\n[dependencies]\next = { path = \"../ext\" }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(ext.join("Cargo.toml"), "[package]\nname = \"ext\"\n").unwrap();
+        std::fs::write(ext.join("src/lib.rs"), "pub fn e() {}\n").unwrap();
+        git2::Repository::init(&ext).unwrap();
+        let files: HashSet<PathBuf> = ["Cargo.toml", "src/main.rs"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let deps = HashMap::from([(ext.canonicalize().unwrap(), "ext".to_string())]);
+
+        let tree = project_source_tree(&root, Some(&files), &[], &deps).unwrap();
+
+        let manifest = String::from_utf8(tree.read(Path::new("Cargo.toml")).unwrap()).unwrap();
+        assert!(manifest.contains("path = \"ext\""), "{manifest}");
+        assert!(
+            manifest.contains("\"ext\""),
+            "the workspace excludes ext: {manifest}"
+        );
+        assert_eq!(
+            tree.read(Path::new("ext/src/lib.rs")).unwrap(),
+            b"pub fn e() {}\n"
+        );
+        let copy = tmp.path().join("copy");
+        tree.materialise(&copy).unwrap();
+        assert!(tree.nar().unwrap() == nar::serialize_nar(&copy, None).unwrap());
+    }
+
+    /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the
+    /// manifest path.
+    fn scaffold_package(root: &Path) -> PathBuf {
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        manifest
+    }
+
+    #[test]
+    fn discovered_targets_change_on_test_file_add_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+
+        // Adding a tests/*.rs file changes the unit-graph shape, so it
+        // must change the hash (this is the false-green `cargo test` bug).
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/must_fail.rs"), "#[test]\nfn t() {}\n").unwrap();
+        let with_test = hash_discovered_targets(&manifest, root).unwrap();
+        assert_ne!(base, with_test);
+
+        // Removing it restores the original hash.
+        std::fs::remove_file(root.join("tests/must_fail.rs")).unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_ignore_content_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/a.rs"), "#[test]\nfn t() {}\n").unwrap();
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+        // Contents don't affect graph shape — rebuild-on-edit is handled
+        // by the content-addressed src store, not the unit-graph key.
+        std::fs::write(root.join("tests/a.rs"), "#[test]\nfn t2() { panic!() }\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { println!(\"hi\") }\n").unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_subdir_main_and_helper_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = scaffold_package(root);
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+
+        // A tests/ subdirectory without main.rs is not a target.
+        std::fs::create_dir_all(root.join("tests/common")).unwrap();
+        std::fs::write(root.join("tests/common/util.rs"), "pub fn u() {}\n").unwrap();
+        assert_eq!(hash_discovered_targets(&manifest, root).unwrap(), base);
+
+        // tests/<dir>/main.rs is one.
+        std::fs::create_dir_all(root.join("tests/suite")).unwrap();
+        std::fs::write(root.join("tests/suite/main.rs"), "fn main() {}\n").unwrap();
+        assert_ne!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_cover_workspace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\nmembers = [\"crates/*\"]\n").unwrap();
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "").unwrap();
+
+        let base = hash_discovered_targets(&manifest, root).unwrap();
+        std::fs::create_dir_all(root.join("crates/a/tests")).unwrap();
+        std::fs::write(root.join("crates/a/tests/x.rs"), "#[test]\nfn t() {}\n").unwrap();
+        assert_ne!(hash_discovered_targets(&manifest, root).unwrap(), base);
+    }
+
+    #[test]
+    fn discovered_targets_hash_is_location_independent() {
+        // The hash must agree between a local checkout and the store copy
+        // `compute-graph` plans against — paths are hashed relative to
+        // project_dir.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let ma = scaffold_package(a.path());
+        let mb = scaffold_package(b.path());
+        std::fs::create_dir_all(a.path().join("tests")).unwrap();
+        std::fs::write(a.path().join("tests/t.rs"), "").unwrap();
+        std::fs::create_dir_all(b.path().join("tests")).unwrap();
+        std::fs::write(b.path().join("tests/t.rs"), "").unwrap();
+        assert_eq!(
+            hash_discovered_targets(&ma, a.path()).unwrap(),
+            hash_discovered_targets(&mb, b.path()).unwrap(),
+        );
+    }
 
     #[test]
     fn read_bin_target_name_from_package() {
@@ -3078,5 +4435,141 @@ version = "1.2.3"
         copy_dir_recursive(src.path(), dst.path()).unwrap();
         // No error, destination remains valid
         assert!(dst.path().exists());
+    }
+
+    fn write_graph(tmp: &tempfile::TempDir, key: &str) -> PathBuf {
+        let entry = UnitGraphCacheEntry {
+            src_store: "/nix/store/aaa-src".into(),
+            units: Vec::new(),
+            target_cfg_envs: Vec::new(),
+            host_cfg_envs: Vec::new(),
+            cache_key: key.to_string(),
+        };
+        let path = tmp.path().join("graph.json");
+        std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn unit_graph_file_loads_when_key_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "expected-key");
+        let loaded = parse_unit_graph_file(&path, "expected-key");
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().cache_key, "expected-key");
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_key_mismatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "a");
+        assert!(parse_unit_graph_file(&path, "b").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_key_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_graph(&tmp, "");
+        assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.json");
+        assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+
+    #[test]
+    fn unit_graph_file_rejected_when_parse_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("malformed.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(parse_unit_graph_file(&path, "any").is_none());
+    }
+}
+
+#[cfg(test)]
+mod skeleton_tests {
+    use super::*;
+
+    /// The tree `write_skeleton` produces must hash to the path that
+    /// `nar::skeleton_source_store_path` predicts, or `add_graph_skeleton`
+    /// adds a path that no derivation names.
+    #[test]
+    fn written_skeleton_matches_its_nar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let write = |rel: &str, body: &str| {
+            let p = project.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n");
+        write("Cargo.lock", "version = 4\n");
+        write(".cargo/config.toml", "[build]\n");
+        write("app/Cargo.toml", "[package]\nname = \"app\"\n");
+        write("app/src/main.rs", "fn main() {}\n");
+        write("app/README.md", "readme\n");
+        write("ignored/file.txt", "not allowed\n");
+        std::fs::create_dir_all(project.join("links")).unwrap();
+        std::os::unix::fs::symlink("../app", project.join("links/app")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = project.join("app/run.sh");
+            std::fs::write(&script, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let files: HashSet<PathBuf> = [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config.toml",
+            "app/Cargo.toml",
+            "app/src/main.rs",
+            "app/README.md",
+            "app/run.sh",
+            "links/app",
+            "deleted/gone.rs",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let dest = tmp.path().join(nar::SKELETON_NAME);
+        write_skeleton(&project, &files, &dest).unwrap();
+        let written = nar::serialize_nar(&dest, None).unwrap();
+        let expected = nar::serialize_nar_skeleton(&project, Some(&files)).unwrap();
+        assert!(
+            written == expected,
+            "the written skeleton hashes differently"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(".cargo/config.toml")).unwrap(),
+            "[build]\n"
+        );
+        assert_eq!(std::fs::read(dest.join("app/src/main.rs")).unwrap(), b"");
+    }
+
+    /// The full source NAR follows an allowed symlink to a regular file, but
+    /// the skeleton must not, because `write_skeleton` skips every symlink.
+    #[test]
+    fn written_skeleton_matches_its_nar_with_a_symlinked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "notes\n").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", project.join("AGENTS.md")).unwrap();
+        let files: HashSet<PathBuf> = ["Cargo.toml", "CLAUDE.md", "AGENTS.md"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let dest = tmp.path().join(nar::SKELETON_NAME);
+        write_skeleton(&project, &files, &dest).unwrap();
+        assert!(
+            nar::serialize_nar(&dest, None).unwrap()
+                == nar::serialize_nar_skeleton(&project, Some(&files)).unwrap(),
+            "the written skeleton hashes differently"
+        );
     }
 }

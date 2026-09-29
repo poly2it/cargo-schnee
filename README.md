@@ -108,13 +108,29 @@ sequenceDiagram
 
 ### Source preparation
 
-Dependencies are vendored via `cargo vendor` into a temporary
-directory, then added to the Nix store with `nix-store --add`. The resulting
-store path is reused across builds by caching the `Cargo.lock` hash to
-vendor store path mapping in `target/.schnee-cache.json`. When running inside
-a Nix derivation, such as via `buildRustPackage`, network access is unavailable,
-so the `--vendor-dir` flag accepts a pre-vendored directory already in the Nix
-store from the outer build's fetch phase.
+Dependencies are vendored through derivations whose paths follow from
+`Cargo.lock`. Each crates.io package becomes a `builtin:fetchurl` fixed-output
+derivation keyed on its lockfile checksum and an unpack derivation, and a
+derivation named `vendor` symlinks the unpacked crates into the directory
+source cargo reads. cargo-schnee computes every `.drv` path itself, registers
+the missing ones and realises the farm, so a warm build finds it realised and
+the store memoises it by content. A lockfile with a git or alternative-registry
+package falls back to `cargo vendor` into a temporary directory and
+`nix-store --add`. When running inside a Nix derivation, such as via
+`buildRustPackage`, network access is unavailable, so the `--vendor-dir` flag
+accepts a pre-vendored directory already in the Nix store from the outer
+build's fetch phase.
+
+The unit graph comes from a derivation as well. It runs
+`cargo-schnee compute-graph` over the vendor farm and a skeleton of the
+project, in which only `Cargo.toml`, `Cargo.lock` and `.cargo/config*` keep
+their contents, so a source edit that adds or removes no file reuses it. This
+needs `cargo-schnee` itself in the store. A binary run from `target/`
+bootstraps cargo in-process on every build instead.
+
+A successful build points `target/.schnee-roots/<profile>-<target>-<intent>`
+at a GC root that keeps the sources, every unit derivation and every realised
+output alive, so a garbage collection does not undo a warm build.
 
 The project source is added to the Nix store with
 `.gitignore`-aware filtering via `libgit2`. To avoid spawning `nix-store
@@ -378,6 +394,83 @@ implements cargo's
 [links](https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key)
 mechanism.
 
+#### Job server
+
+Under Cargo, every `rustc` shares one GNU make job server, so the codegen
+threads of all concurrent compilations together stay at the core count. A Nix
+builder has no job server, and each `rustc` then starts as many codegen
+threads as it has codegen units. Derivations that run codegen therefore set
+`__jobserver = "1"`. A Nix with the `jobserver` experimental feature gives such
+a builder a job server that every opted-in build on the machine shares, and
+`rustc` finds it in `CARGO_MAKEFLAGS`.
+
+`Compile`, `TestCompile` and `BuildScriptCompile` derivations set the
+attribute. `Check` and `Doc` derivations run no codegen and do not. A
+`BuildScriptRun` derivation sets it when the build script depends on
+`jobserver`, `cmake` or `autotools`, directly or transitively. `cc` with its
+`parallel` feature reads the job server through `jobserver`, and `cmake` and
+`autotools` pass `CARGO_MAKEFLAGS` on to `make` as `MAKEFLAGS`. The job server
+uses the `fifo:` form, which needs GNU make 4.4 or later.
+
+The attribute does not depend on the daemon, so a unit has the same derivation
+path on every machine. A Nix without the feature exports it as the environment
+variable `__jobserver` and otherwise ignores it.
+
+#### Pipelined compilation
+
+Cargo starts a library's dependents once rustc has written the library's
+`.rmeta`, while its codegen still runs. A derivation's output exists only when
+the build ends, so cargo-schnee gets the same overlap by splitting a library
+into two derivations. The metadata half runs the library's rustc invocation
+with `-Z no-codegen` and keeps only the `.rmeta`. The link half runs it
+unchanged. Dependent libraries compile against the metadata half, and linking
+units against the link halves.
+
+A split repeats the frontend and adds a derivation, and it shortens the build
+only where a library's codegen holds up the longest chain of units. So
+cargo-schnee models the build on the current unit graph, with every unit
+starting as soon as its inputs are done, and follows the modelled critical
+path. It splits each library on the path whose dependent on the path is a
+library and whose frontend took at most 60 % of its build, whatever its size,
+and repeats this until the path holds no such library. It then undoes every
+split whose removal lengthens the modelled build by less than 0.1 s. A
+library off the path is therefore never split.
+
+The model costs a unit at the CPU time Nix reports for its builder, because
+that changes less with the host's load than wall time, but never above the
+wall time, because parallel codegen spends several CPU seconds per second.
+Without a CPU time the wall time stands in. It reads those times from a
+pipeline profile, which a previous build records from Nix's
+`--log-format internal-json` output with `log-profiling` enabled:
+
+```sh
+cargo schnee build --release --write-pipeline-profile pipeline.json
+cargo schnee build --release --pipeline-profile pipeline.json
+```
+
+A split build runs more units at once than the build that recorded the
+profile, and the contention can move the critical path onto a library the
+profile left whole. So a profile is meant to be re-recorded from the builds it
+plans, by giving both flags the same file:
+
+```sh
+cargo schnee build --release --pipeline-profile pipeline.json \
+  --write-pipeline-profile pipeline.json
+```
+
+The recording then starts from the profile the build was planned with and
+replaces the times of every unit that the build ran. Units that came from the
+cache keep their earlier times, and metadata halves are not recorded, because
+the link half records the library's frontend.
+
+Without `--pipeline-profile` nothing is split and every derivation is as
+before. With it, every rustc unit exports `RUSTC_BOOTSTRAP=1`, which
+`-Z no-codegen` needs and which changes the crate hash. Both halves of a
+library and every whole unit then share one crate hash, so a changed split
+decision does not rebuild dependents. The profile is an ordinary file the user
+keeps, and it holds times keyed by derivation name, so a stale profile changes
+only which libraries are split.
+
 ### Derivation registration
 
 Once the derivation JSON for each `NixUnit` has been constructed, it must be
@@ -399,17 +492,23 @@ from the hash, the sorted references, and the store prefix. That fingerprint
 is hashed again, XOR-folded from 32 bytes to 20, and encoded in nix-base32
 to produce the final `/nix/store/<hash>-<name>.drv` path.
 
-If the `.drv` path already exists in the store, registration is skipped.
-Otherwise, the derivation is registered via the Nix daemon Unix socket at
-`/nix/var/nix/daemon-socket/socket` using the `wopAddTextToStore` operation,
-opcode 8. The daemon protocol uses u64 little-endian integers and
-length-prefixed strings padded to 8-byte boundaries. If the daemon connection
-fails, cargo-schnee falls back to spawning `nix derivation add` as a
-subprocess.
-
-Units are registered level-by-level in topological order. All units at the
-same depth can be registered in a single batch since their dependencies are
-already resolved.
+Because paths are computed client-side, construction never waits on the
+daemon: derivations are constructed level-by-level in topological order
+(in parallel within each level), each level's computed paths feeding the
+next level's `inputDrvs`. A single batched `wopQueryValidPaths` round
+trip then partitions the whole DAG into cache hits and misses — on a
+warm store, registration is that one round trip. Misses are registered
+via the Nix daemon Unix socket (resolved from `NIX_REMOTE`, then
+`NIX_DAEMON_SOCKET_PATH`, then the system socket) using the
+`wopAddTextToStore` operation, opcode 8, level-by-level so a drv's
+references are always valid before its dependents are added. The daemon
+protocol uses u64 little-endian integers and length-prefixed strings
+padded to 8-byte boundaries; the socket is buffered so a message costs
+one syscall, not one per protocol word. Tool closures (`rustc`, `cc`,
+system libraries) are resolved over the same connection via
+`wopQueryPathInfo` BFS instead of spawning `nix-store -qR` per root. If
+the daemon connection fails, cargo-schnee falls back to the nix CLI for
+both registration and closure queries.
 
 When cargo-schnee itself runs inside a Nix derivation, as is the case with
 `buildRustPackage` integration, the outer build must have
@@ -626,6 +725,66 @@ Files matching these patterns are added to the source tree even if they appear
 in `.gitignore`. Files outside the project directory are supported and are
 stored with a `.parent` prefix in the Nix store tree.
 
+### Inputs of a build script
+
+Each unit of a local package sees only its package's own directory, so an edit
+in one package leaves every other package's derivations alone. A package at the
+workspace root sees the root without the member directories. A build script that
+reads files outside its package directory, for example a shared `../spec/`
+tree, must name them in its package's `Cargo.toml`, relative to the package:
+
+```toml
+[package.metadata.schnee]
+extra-includes = ["../spec/**"]
+```
+
+Only that package's build-script run sees those files, at their usual place
+relative to its directory. When a build script names a missing path in
+`cargo:rerun-if-changed`, cargo-schnee prints the path and points at this key.
+
+### Sharing a resolution across packages
+
+Cargo unifies features across whatever a single command line names, so
+`-p a` and `-p b` resolve two different graphs even for the crates they
+share. Packaging each binary of a workspace separately therefore
+recompiles the common dependencies once per binary, with different
+feature sets and different unit derivations.
+
+Declare a resolution scope to pin the resolution input independently of
+the request. The table lives in the workspace manifest only — a member
+declaring its own scope would reintroduce the divergence — and is keyed
+by target triple with a `default` fallback:
+
+```toml
+[workspace.metadata.schnee.resolution]
+default = "workspace"
+x86_64-pc-windows-msvc = { packages = ["app", "installer", "updater"] }
+```
+
+A value is either the string `"workspace"`, meaning every member, or a
+table with `packages` and an optional `exclude`. Name the scope from
+`lib.buildPackage` and from `lib.unitGraph`:
+
+```nix
+self.lib.buildPackage {
+  inherit pkgs src cargoDeps;
+  package = "installer";
+  target = "x86_64-pc-windows-msvc";
+  resolutionScope = "x86_64-pc-windows-msvc";
+}
+```
+
+Cargo then resolves over the scope, and `package` becomes a
+post-resolution root filter: the plan is pruned to what the requested
+roots reach, and every sibling naming the same scope gets byte-identical
+derivations for the units they share. Asking for a package outside the
+scope is a hard error naming the manifest key.
+
+`lib.unitGraph` takes the same `resolutionScope`, so one pre-computed
+graph serves every package in the scope. Pass `allTargets = true` when
+the graph also has to serve a `--all-targets` clippy gate — that unit
+set is larger, and the cache key records the difference.
+
 ### Packaging with `lib.buildPackage`
 
 For straightforward packaging, `lib.buildPackage` handles all the toolchain
@@ -667,9 +826,9 @@ path.
 
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
-`wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`, `postInstall`,
-`postFixup`, and `meta`. Unrecognised attributes are passed through to
-`buildRustPackage`.
+`unitSetup`, `wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`,
+`postInstall`, `postFixup`, and `meta`. Unrecognised attributes are passed
+through to `buildRustPackage`.
 
 #### `env`
 
@@ -725,6 +884,109 @@ devShells.default = pkgs.mkShell {
   BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
 };
 ```
+
+#### `unitSetup`
+
+`unitSetup` is an ordered list of rules that source caller-supplied shell
+scripts inside selected per-unit sandboxes, immediately before the compiler,
+rustdoc, clippy-driver, or build-script invocation runs. Use it when a
+compilation depends on external state at execution time — the driving case is
+sqlx's `query!` macro family, which expands against a live `DATABASE_URL` and
+writes query metadata into `SQLX_OFFLINE_DIR` as a side effect of compilation.
+
+```nix
+cargo-schnee.lib.buildPackage {
+  inherit pkgs src;
+  cargoLock = ./Cargo.lock;
+  unitSetup = [
+    {
+      # Cargo package name, or "*" to match every package. Matches
+      # vendored dependencies as well as workspace members.
+      package = "my-backend";
+      # Unit kinds the rule applies to. Default: the four macro-expansion
+      # kinds — compile, check, test-compile, doc. The build-script kinds
+      # build-script-compile and build-script-run may be named explicitly.
+      kinds = [ "check" ];
+      # Optional filter on cargo target names, e.g. restrict to the lib
+      # target of a package that also has bins. Default: all targets.
+      targets = [ "my-backend" ];
+      # Store path of a shell script.
+      script = ./setup.sh;
+    }
+  ];
+}
+```
+
+Every rule matching a unit contributes its script, sourced in list order.
+The script contract:
+
+- The script is *sourced*, not executed: its exports persist into the
+  subsequent compiler or build-script invocation, and an `EXIT` trap it sets
+  fires when the surrounding script exits — after the work completes — giving
+  daemonised helpers (e.g. an embedded PostgreSQL on a Unix socket) a defined
+  shutdown point.
+- It runs after all cargo environment exports, so `CARGO_MANIFEST_DIR`,
+  `CARGO_PKG_NAME`, and friends are readable, and `$out` already exists.
+- `SCHNEE_AUX_DIR` is exported, naming a directory the script may create and
+  populate with auxiliary output. The install step merges each *root* unit's
+  aux directory into `$out/schnee-aux/<target-name>/` in the package output.
+  Only root units surface this way: aux output written in a non-root unit
+  (e.g. a dependency's compile unit) stays inside that unit's own store
+  output and is not installed. Doc roots have no target name; the install
+  step warns when it discards their aux output for that reason.
+- A nonzero exit fails the unit with that exit code; stderr passes through.
+- The script runs mid-chain in the unit's build shell: it must not `cd` or
+  change shell options (`set -e`, `set -u`, …), which would perturb the
+  driver invocation that follows it.
+- The sandbox has no network and no default `PATH`; scripts must reference
+  tools by absolute store path. The script and its reference closure are
+  mounted automatically.
+
+With `unitSetup` absent or empty, every generated derivation is byte-identical
+to a run without the feature; with rules present, only matching units change
+and all other units keep sharing caches with ordinary builds. A rule matching
+a vendored package forks that package's unit caches — the intended meaning,
+not an error. `lib.testPackage` and `lib.clippyPackage` forward `unitSetup`
+like any shared argument; clippy units are check units with a swapped driver,
+so `kinds = [ "check" ]` covers them.
+
+Matching limitations: `package` compares by name only, so when the dependency
+graph carries a crate at several versions a rule matches all of them; and
+`targets` compares names with `-` collapsed to `_`, so it cannot distinguish a
+lib target from a same-named bin target. The planner warns about any rule that
+matched no unit in the plan — usually a typo'd package or target name, though
+a rule list shared between build, test, and clippy packages can legitimately
+match nothing in one of them.
+
+##### Scoping
+
+A rule's `script` is mounted in the planner sandbox together with its whole
+reference closure, so every rule a call carries is a build input of that
+call. A script naming an expensive derivation — a generated query cache, a
+fixture corpus — would therefore block every package sharing the rule list on
+building it, including packages whose plan never contains the crate the rule
+names.
+
+Rules are scoped to the call before they reach the planner. When `package`
+names a workspace member, the plan covers that member and the crates
+reachable from it over path dependencies, so a rule naming a member outside
+that set is dropped and its closure is not built. Declaring the whole rule
+list once, in arguments shared across a workspace, is therefore the intended
+usage: each call takes the rules that concern it.
+
+The filter never drops a rule the plan could match. Rules with `package =
+"*"`, rules naming something that is not a workspace member — a vendored
+dependency, a path dependency in a sibling workspace — and every rule on a
+call with no `package` argument are all kept, because their reachability is
+not decidable from the workspace manifests. A call whose path dependencies
+leave this workspace keeps every rule for the same reason. Rules are
+validated before scoping, so a malformed rule still fails the call that
+declares it even when it is dropped.
+
+`lib.testPackage` additionally accepts `testRunnerSetup`, a single script
+store path sourced in the test runner before the first test binary executes,
+under the same contract (`SCHNEE_AUX_DIR` is `$out/schnee-aux` in the runner's
+output; the `EXIT` trap runs after the last binary exits).
 
 For Windows targets, `buildPackage` automatically sets `dontFixup = true`
 because patchelf and strip do not work on PE binaries. When `doCheck` is
@@ -870,6 +1132,44 @@ cargo schnee build --verify-drv-paths \
     --manifest-path examples/simple/Cargo.toml
 ```
 
+### Pre-computed unit graphs
+
+The planner's cargo bootstrap (resolve + unit extraction) is the
+largest phase of a warm replan. `lib.unitGraph` moves it into its own
+derivation containing the workspace's unit graph. The graph takes `src`
+as an input, so any source edit rebuilds it; the reuse it buys is
+across consumers of one source, not across edits to it.
+
+`lib.buildPackage` wires this automatically whenever the
+resolver-relevant selection is fully expressed in structured args
+(`package`, `features`, `noDefaultFeatures`, `buildType`, `target`,
+`intent`); any `cargoExtraArgs` entry disables it, since those flags
+could affect resolution invisibly. Pass `autoUnitGraph = false` to opt
+out, or wire a graph manually through the buildPackage `env`:
+
+```nix
+let
+  graph = self.lib.unitGraph {
+    inherit pkgs rustToolchain;
+    src = ./.;
+    cargoDeps = cargoVendoredDeps;
+  };
+in
+self.lib.buildPackage {
+  inherit pkgs rustToolchain;
+  src = ./.;
+  cargoDeps = cargoVendoredDeps;
+  env = { CARGO_SCHNEE_UNIT_GRAPH = "${graph}"; };
+}
+```
+
+The graph is keyed on cargo's resolution inputs (Cargo.lock + every
+workspace Cargo.toml + the vendor dir + cargo-schnee version + profile
++ target + features), so it's shared across worktrees, branches, and
+machines with the same lockfile. cargo-schnee validates the embedded
+key on load and falls through to a fresh bootstrap on any mismatch, so
+a stale or wrong-input graph is silently ignored rather than served.
+
 ### Environment variables
 
 | Variable | Description |
@@ -878,3 +1178,6 @@ cargo schnee build --verify-drv-paths \
 | `CARGO_SCHNEE_PASSTHRU_ENVS` | Space-separated list of environment variable names to forward into build-script derivations. |
 | `CARGO_TARGET_<TRIPLE>_LINKER` | Cross-linker for the given target triple. Used in derivation builder scripts. |
 | `CARGO_TARGET_<TRIPLE>_RUNNER` | Runner for cross-compiled binaries, such as `wine`. Required by `run`, `test`, and `bench` on cross targets. |
+| `CARGO_SCHNEE_UNIT_GRAPH` | Path (file or directory containing `graph.json`) to a pre-computed unit-graph entry from `cargo-schnee compute-graph` or `lib.unitGraph`. cargo-schnee validates the embedded key against the current invocation's resolution inputs and falls back to a fresh bootstrap on mismatch. |
+| `CARGO_SCHNEE_TRACE` | Path to write a `chrome://tracing` JSON file capturing the planner's internal phases (`extract_units`, `query_closures`, `compute_topo_levels`, `register_derivations`). Disabled when unset. |
+| `SCHNEE_LOG` | Tracing-subscriber filter, same syntax as `RUST_LOG`. Defaults to `cargo_schnee=warn` (verbosity bumps with `-v`/`-vv`/`-vvv`). |
