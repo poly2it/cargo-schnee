@@ -857,6 +857,43 @@ fn fixture_extra_includes_parent() {
     );
 }
 
+/// A build script sees only its package directory, so reading a sibling
+/// directory without declaring it fails, and the failure names the path.
+#[test]
+#[ignore]
+fn fixture_build_script_sibling_undeclared() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/build-script-sibling-undeclared");
+    clean_target(&fixture_dir);
+    let output = Command::new(cargo_schnee_bin())
+        .args(["schnee", "build", "--manifest-path"])
+        .arg(fixture_dir.join("Cargo.toml"))
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the build must fail:\n{stderr}");
+    assert!(
+        stderr.contains("the build script of reader names ../spec/api.txt"),
+        "the failure must name the missing path:\n{stderr}"
+    );
+}
+
+/// The same build script succeeds once its package declares the sibling
+/// directory in `[package.metadata.schnee] extra-includes`.
+#[test]
+#[ignore]
+fn fixture_build_script_sibling_declared() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/build-script-sibling-declared");
+    clean_target(&fixture_dir);
+    run_schnee_build(&fixture_dir.join("Cargo.toml"));
+    let output = Command::new(fixture_dir.join("target/debug/reader"))
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("first line of the spec"));
+}
+
 /// External path dep pointing at a sub-crate inside another workspace.
 /// The sub-crate inherits `edition.workspace = true` from its parent workspace
 /// root. cargo-schnee must copy the entire external workspace (not just the
