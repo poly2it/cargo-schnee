@@ -46,7 +46,7 @@ let
     "clippyScope" "clippyExtraArgs" "lintArgs"
   ];
 
-  # Deduplicate args.  Skeptiva-style consumers prepend
+  # Deduplicate args.  Some consumers prepend
   # commonArgs.cargoExtraArgs onto clippyExtraArgs in their wrapper,
   # which together with our own cargoExtraArgs forwarding leaves
   # `--no-default-features` (and similar bool flags) appearing

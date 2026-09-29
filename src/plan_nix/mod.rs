@@ -318,7 +318,7 @@ pub struct NixUnit {
     pub(crate) compile_test: bool,
     /// Set when this local unit was per-crate sliced off the project-src tree
     /// (see `assign_per_crate_src_stores`): the crate's directory relative to
-    /// the project-src root, e.g. `skeptiva-ai-common`. Slicing rewrites the
+    /// the project-src root, e.g. `app-common`. Slicing rewrites the
     /// unit's source onto a flat `<hash>-<member>` store, which severs the
     /// crate's position in the workspace; `--remap-path-prefix` rules that are
     /// expressed relative to the project-src root must re-append this so

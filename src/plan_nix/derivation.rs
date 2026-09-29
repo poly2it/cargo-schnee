@@ -1304,16 +1304,12 @@ mod tests {
         // store. The root remap must target `crates/<member>`, not bare
         // `crates`, or the member directory is dropped and every crate's
         // `src/lib.rs` collapses to `crates/src/lib.rs`.
-        let args = remap_args(
-            &root_remap(),
-            "/nix/store/h-skeptiva-ai-common",
-            Some("skeptiva-ai-common"),
-        );
+        let args = remap_args(&root_remap(), "/nix/store/h-app-common", Some("app-common"));
         assert_eq!(
             args,
             vec![
                 "--remap-path-prefix".to_string(),
-                shell_quote("/nix/store/h-skeptiva-ai-common=crates/skeptiva-ai-common"),
+                shell_quote("/nix/store/h-app-common=crates/app-common"),
             ]
         );
     }
@@ -1324,12 +1320,12 @@ mod tests {
         // parent dirs (a non-flat `crates/<member>` workspace layout).
         let args = remap_args(
             &root_remap(),
-            "/nix/store/h-msedge-shim",
-            Some("crates/skeptiva-ai-msedge-shim"),
+            "/nix/store/h-browser-shim",
+            Some("crates/app-browser-shim"),
         );
         assert_eq!(
             args[1],
-            shell_quote("/nix/store/h-msedge-shim=crates/crates/skeptiva-ai-msedge-shim"),
+            shell_quote("/nix/store/h-browser-shim=crates/crates/app-browser-shim"),
         );
     }
 
@@ -2221,7 +2217,7 @@ mod tests {
     }
 
     /// Runs a generated compile script with a real rustc against a job server
-    /// FIFO in the form N3 passes, and watches the FIFO with inotify.  rustc
+    /// FIFO in the form a Nix job server passes, and watches the FIFO with inotify.  rustc
     /// reads a token for its second codegen unit, so a read proves rustc
     /// joined the pool, and the byte count afterwards proves it gave every
     /// token back.

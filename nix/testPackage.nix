@@ -36,7 +36,7 @@ let
   effectiveScope = if testScope != null then testScope else defaultScope;
   cargoArgs = effectiveScope ++ cargoTestExtraArgs;
 
-  # Dedup forwarded args; consumers like skeptiva's testCrate prepend
+  # Dedup forwarded args; some consumers' test wrappers prepend
   # commonArgs.cargoExtraArgs onto cargoTestExtraArgs in their wrapper,
   # so without dedup `--no-default-features` (and friends) end up
   # listed twice and cargo-schnee's clap rejects duplicates.  Order-
@@ -83,8 +83,8 @@ in
     # `env!("CARGO_MANIFEST_DIR").join("testdata/...")` find their
     # fixtures.  Best-effort: `$src/<package>` if that exists, else
     # `$src`.  Tests requiring workspace-root-prefixed paths need the
-    # consumer to lay out src to match (skeptiva does — `crates/` is
-    # its src).
+    # consumer to lay out src to match, for example by using the
+    # workspace directory as src.
     target="$src"
     if [ -n "${pkgArg}" ] && [ -d "$src${pkgArg}" ]; then
       target="$src${pkgArg}"

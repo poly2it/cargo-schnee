@@ -286,14 +286,14 @@ levels:
   still compile because their run units keep the whole tree). Run with
   `cargo test --test integration -- --ignored`.
 - *Build-correct (nix mode)* — building a real monorepo check through the patched
-  cargo-schnee (`nix build .#checks.x86_64-linux.build-skeptiva-ci-robot
-  --override-input cargo-schnee path:tmp/cargo-schnee`) succeeds end-to-end,
+  cargo-schnee (`nix build .#checks.x86_64-linux.build-app
+  --override-input cargo-schnee path:../cargo-schnee`) succeeds end-to-end,
   exercising the recursive-nix per-crate store-adds inside the planner
-  derivation (built `…-skeptiva-ci-robot.drv`, `…-aggregator.drv`, exit 0).
+  derivation (built `…-app.drv`, `…-aggregator.drv`, exit 0).
 
 The **decoupling** claim rests on the deterministic tests above (a crate's unit
 references a per-crate store that is byte-identical across sibling edits), not on
-a rebuild experiment: a "rebuild ci-robot after editing an unrelated crate →
+a rebuild experiment: a "rebuild app after editing an unrelated crate →
 0 recompiles" run is *confounded*, because the check's outer drvPath is stable
 (flake-input-keyed, not source-keyed), so the second build is a cache hit
 whether or not the inner units decoupled. A clean end-to-end decoupling signal
@@ -317,7 +317,7 @@ farm whose entries are per-crate content-addressed store paths, so the slicer
 sandbox → `couldn't read .../src/lib.rs`). Proven by the deterministic
 `assign_decouples_local_and_vendored_crates` test (a symlink-farm model where
 bumping one vendored crate leaves a sibling's target byte-identical) and by
-nix-mode builds of ci-robot and app-backend (the latter with a large
+nix-mode builds of app and app-backend (the latter with a large
 vendored closure including ring, rustls, wasmtime), exit 0.
 
 **Change 3 — superseded.** Every local build-script run is now sliced to its
@@ -360,10 +360,10 @@ reproduces the coupling today and must pass after wiring:
 # In the monorepo, with the patched cargo-schnee pinned:
 DRV() { nix eval --raw ".#checks.x86_64-linux.$1.drvPath"; }
 
-before_a=$(DRV build-skeptiva-formatter)   # unrelated leaf crate
+before_a=$(DRV build-app-formatter)   # unrelated leaf crate
 # edit an unrelated crate's source body, e.g. app-backend:
 echo "// touch" >> crates/app-backend/src/main.rs
-after_a=$(DRV build-skeptiva-formatter)
+after_a=$(DRV build-app-formatter)
 git checkout -- crates/app-backend/src/main.rs
 
 test "$before_a" = "$after_a"  # FAILS today (coupling); MUST hold after wiring
