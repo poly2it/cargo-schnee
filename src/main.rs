@@ -10,6 +10,7 @@ mod nix_encoding;
 mod plan;
 mod plan_nix;
 mod shell;
+mod source_tree;
 
 use anyhow::{Context, Result};
 use cargo::core::Workspace;
@@ -18,6 +19,7 @@ use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
+use source_tree::{ProjectSource, SourceTree};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -876,36 +878,6 @@ fn find_enclosing_workspace_root(path: &Path, stop_at: &Path) -> Option<PathBuf>
     None
 }
 
-/// Copy git-tracked files from an external source directory into `dest`.
-fn copy_source_to_dest(source_dir: &Path, dest: &Path) -> Result<()> {
-    let files = collect_git_files(source_dir)?;
-    match files {
-        Some(files) => {
-            for file in &files {
-                let src_path = source_dir.join(file);
-                let dest_path = dest.join(file);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if src_path.is_file() {
-                    std::fs::copy(&src_path, &dest_path)
-                        .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-                }
-            }
-            tracing::info!(
-                "Extra source copy: {} files from {}",
-                files.len(),
-                source_dir.display()
-            );
-        }
-        None => {
-            copy_dir_excluding(source_dir, dest, &["target", ".git", ".direnv", "result"])?;
-            tracing::info!("Extra source copy (no git): {}", source_dir.display());
-        }
-    }
-    Ok(())
-}
-
 /// Rewrite path dependencies in all Cargo.toml files under `dest` so that
 /// external deps point to their new in-tree locations.
 fn rewrite_cargo_tomls(
@@ -1107,23 +1079,18 @@ fn rewrite_paths_in_table(
     changed
 }
 
-/// Add the project source to the Nix store, respecting .gitignore.
+/// Describe the project source, respecting .gitignore, without adding it to
+/// the store. The result knows the store path the source has, and adds it
+/// only when a caller needs the whole tree, see `ProjectSource`.
 ///
-/// Uses libgit2 to discover tracked + untracked-but-not-ignored files,
-/// then computes the NAR store path in-process. If the path already exists
-/// in the store (warm build), skips the subprocess entirely. Otherwise,
-/// copies files to a temp dir and runs `nix-store --add`.
+/// Uses libgit2 to discover tracked + untracked-but-not-ignored files. When
+/// path dependencies outside `project_dir` are detected, they join the tree
+/// and Cargo.toml paths are rewritten.
 ///
-/// When path dependencies outside `project_dir` are detected, they are
-/// copied into the store tree and Cargo.toml paths are rewritten.
-///
-/// With `want_skeleton`, also returns the store path of the project's
-/// skeleton, see `add_graph_skeleton`, unless the source reaches outside
-/// `project_dir` or is not a git work tree.
-fn add_project_source_to_store(
-    project_dir: &Path,
-    want_skeleton: bool,
-) -> Result<(String, Option<String>)> {
+/// With `want_skeleton`, also adds the project's skeleton, see
+/// `add_graph_skeleton`, unless the source reaches outside `project_dir` or
+/// is not a git work tree.
+fn project_source(project_dir: &Path, want_skeleton: bool) -> Result<ProjectSource> {
     let _span = tracing::info_span!("add_project_source").entered();
     // Collect allowed files via git2
     let mut allowed_files =
@@ -1142,7 +1109,8 @@ fn add_project_source_to_store(
             f.file_name().is_some_and(|n| n == "Cargo.toml") && f.parent() != Some(Path::new(""))
         }) {
             let base = project_dir.join(manifest.parent().unwrap_or(Path::new("")));
-            for p in plan_nix::util::package_extra_includes(&project_dir.join(manifest)) {
+            let text = std::fs::read_to_string(project_dir.join(manifest)).unwrap_or_default();
+            for p in plan_nix::util::package_extra_includes(&text) {
                 extra_patterns.push((base.clone(), p));
             }
         }
@@ -1230,92 +1198,94 @@ fn add_project_source_to_store(
         _ => None,
     };
 
-    // Fast path: no external deps or outside extra includes → try in-process NAR cache
-    if external_deps.is_empty()
-        && extra_outside.is_empty()
-        && let Some(ref files) = allowed_files
-    {
-        match tracing::info_span!("serialize_project_nar")
-            .in_scope(|| nar::serialize_nar(project_dir, Some(files)))
-        {
-            Ok(nar_data) => {
-                let store_path = tracing::info_span!("hash_project_nar")
-                    .in_scope(|| nar::compute_nar_store_path("project-src", &nar_data));
-                // A collected path can outlive its store registration on
-                // disk, so only the store can say whether it is reusable.
-                if plan_nix::store_paths::is_valid_store_path(&store_path).unwrap_or(false) {
-                    tracing::info!("Source store path is valid: {}", store_path);
-                    return Ok((store_path, skeleton));
-                }
-                if nar_matches_copy(project_dir, files) {
-                    match tracing::info_span!("store_add_project")
-                        .in_scope(|| plan_nix::add_source_nar("project-src", &nar_data))
-                    {
-                        Ok(p) => return Ok((p, skeleton)),
-                        Err(e) => tracing::info!("Daemon add of project source failed: {}", e),
-                    }
-                }
-                tracing::info!("Source store path miss, falling back to a copy");
-            }
-            Err(e) => {
-                tracing::info!(
-                    "NAR serialization failed ({}), falling back to subprocess",
-                    e
-                );
-            }
-        }
-    }
+    let tree = tracing::info_span!("build_source_tree").in_scope(|| {
+        project_source_tree(
+            project_dir,
+            allowed_files.as_ref(),
+            &extra_outside,
+            &external_deps,
+        )
+    })?;
+    let nar = tracing::info_span!("serialize_project_nar").in_scope(|| tree.nar())?;
+    let store_path = tracing::info_span!("hash_project_nar")
+        .in_scope(|| nar::compute_nar_store_path("project-src", &nar));
+    Ok(ProjectSource::new(tree, store_path, nar, skeleton))
+}
 
-    let copy_span = tracing::info_span!("copy_project_source").entered();
-    // Copy project files to temp dir
-    let temp = tempfile::tempdir().context("Failed to create temp dir for source copy")?;
-    let dest = temp.path().join("project-src");
-
-    match &allowed_files {
-        Some(files) => {
-            copy_allowed_files(project_dir, &dest, files)?;
-            tracing::info!("Source copy: {} files via git2", files.len());
-        }
+/// The tree a copy of the project source would hold: the allowed files, the
+/// extra includes from outside the project under `.parent`, and each
+/// external path dependency under its sanitised name, with manifest paths
+/// rewritten to point at those names.
+fn project_source_tree(
+    project_dir: &Path,
+    allowed_files: Option<&HashSet<PathBuf>>,
+    extra_outside: &[(PathBuf, PathBuf)],
+    external_deps: &HashMap<PathBuf, String>,
+) -> Result<SourceTree> {
+    let excluded = ["target", ".git", ".direnv", "result"];
+    let mut tree = match allowed_files {
+        Some(files) => SourceTree::from_allowed_files(project_dir, files),
         None => {
-            tracing::info!("Source copy: falling back to hardcoded excludes (not a git repo)");
-            copy_dir_excluding(project_dir, &dest, &["target", ".git", ".direnv", "result"])?;
+            tracing::info!("Source tree: falling back to hardcoded excludes (not a git repo)");
+            SourceTree::from_dir_excluding(project_dir, &excluded)?
+        }
+    };
+    for (abs_path, store_rel) in extra_outside {
+        tree.insert_disk(store_rel.clone(), abs_path.clone());
+    }
+    if external_deps.is_empty() {
+        return Ok(tree);
+    }
+    // Collect all source roots so we can skip sub-paths already covered
+    // by a workspace root copy (e.g. don't copy sub-crate/ separately
+    // when its parent workspace/ is already being copied).
+    let roots: Vec<&PathBuf> = external_deps.keys().collect();
+    for (abs_path, sanitised) in external_deps {
+        let dominated = roots
+            .iter()
+            .any(|r| *r != abs_path && abs_path.starts_with(r));
+        if dominated {
+            continue;
+        }
+        let external = match collect_git_files(abs_path)? {
+            Some(files) => SourceTree::from_allowed_files(abs_path, &files),
+            None => SourceTree::from_dir_excluding(abs_path, &excluded)?,
+        };
+        tree.graft(Path::new(sanitised), external);
+    }
+    rewrite_tree_manifests(&mut tree, project_dir, external_deps)?;
+    Ok(tree)
+}
+
+/// Apply `rewrite_cargo_tomls` to the manifests of `tree`. It runs on a
+/// scratch directory that holds only the manifests, which is all it reads.
+fn rewrite_tree_manifests(
+    tree: &mut SourceTree,
+    project_dir: &Path,
+    mappings: &HashMap<PathBuf, String>,
+) -> Result<()> {
+    let manifests: Vec<PathBuf> = tree
+        .files()
+        .filter(|f| f.file_name().is_some_and(|n| n == "Cargo.toml"))
+        .map(Path::to_path_buf)
+        .collect();
+    let scratch = tempfile::tempdir().context("Failed to create temp dir for manifests")?;
+    let dest = scratch.path().join("project-src");
+    std::fs::create_dir_all(&dest)?;
+    for rel in &manifests {
+        let target = dest.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap_or(&dest))?;
+        std::fs::write(&target, tree.read(rel)?)?;
+    }
+    rewrite_cargo_tomls(&dest, project_dir, mappings)?;
+    for rel in manifests {
+        let rewritten = std::fs::read(dest.join(&rel))?;
+        if rewritten != tree.read(&rel)? {
+            let executable = tree.is_executable(&rel)?;
+            tree.insert_bytes(rel, rewritten, executable);
         }
     }
-
-    // Copy extra-includes that live outside the project directory
-    for (abs_path, store_rel) in &extra_outside {
-        let dest_path = dest.join(store_rel);
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(abs_path, &dest_path)
-            .with_context(|| format!("Failed to copy extra include {}", abs_path.display()))?;
-    }
-
-    // Copy external path deps into the store tree and rewrite Cargo.toml paths
-    if !external_deps.is_empty() {
-        // Collect all source roots so we can skip sub-paths already covered
-        // by a workspace root copy (e.g. don't copy sub-crate/ separately
-        // when its parent workspace/ is already being copied).
-        let roots: Vec<&PathBuf> = external_deps.keys().collect();
-        for (abs_path, sanitised) in &external_deps {
-            let dominated = roots
-                .iter()
-                .any(|r| *r != abs_path && abs_path.starts_with(r));
-            if dominated {
-                continue;
-            }
-            let ext_dest = dest.join(sanitised);
-            copy_source_to_dest(abs_path, &ext_dest)
-                .with_context(|| format!("Failed to copy extra source: {}", abs_path.display()))?;
-        }
-        rewrite_cargo_tomls(&dest, project_dir, &external_deps)?;
-    }
-
-    drop(copy_span);
-    let added = tracing::info_span!("store_add_project")
-        .in_scope(|| plan_nix::add_source_to_store(&dest.to_string_lossy()))?;
-    Ok((added, skeleton))
+    Ok(())
 }
 
 /// Add the project's skeleton to the store and return its path. The
@@ -1370,40 +1340,6 @@ fn write_skeleton(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) -> 
         }
     }
     Ok(())
-}
-
-/// Copy `files`, relative to `project_dir`, into `dest`. A file that is not
-/// a regular file after following symlinks is skipped, but its parent
-/// directories are still created.
-pub(crate) fn copy_allowed_files(
-    project_dir: &Path,
-    dest: &Path,
-    files: &HashSet<PathBuf>,
-) -> Result<()> {
-    for file in files {
-        let src_path = project_dir.join(file);
-        let dest_path = dest.join(file);
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if src_path.is_file() {
-            std::fs::copy(&src_path, &dest_path)
-                .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Whether the NAR that `nar::serialize_nar` writes for `files` matches the
-/// tree `copy_allowed_files` builds. Both turn a symlink to a regular file
-/// into that file and leave out any other symlink. They differ only for an
-/// entry that is missing or a directory, such as a submodule, because the
-/// copy then creates directories the NAR lacks.
-fn nar_matches_copy(project_dir: &Path, files: &HashSet<PathBuf>) -> bool {
-    files.iter().all(|f| {
-        std::fs::symlink_metadata(project_dir.join(f))
-            .is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
-    })
 }
 
 /// Collect git-tracked + untracked-but-not-ignored files.
@@ -1487,36 +1423,6 @@ fn read_extra_includes(manifest_path: &Path) -> Vec<String> {
         None => Vec::new(),
     }
 }
-
-/// Recursively copy a directory, skipping entries whose names match the exclude list.
-/// Symlinks are skipped to avoid accidentally copying large nix store closures.
-fn copy_dir_excluding(src: &Path, dest: &Path, exclude: &[&str]) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("Failed to read dir {}", src.display()))?
-    {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if exclude.iter().any(|e| *e == name_str.as_ref()) {
-            continue;
-        }
-        let ft = entry.metadata()?.file_type();
-        if ft.is_symlink() {
-            continue;
-        }
-        let src_path = entry.path();
-        let dest_path = dest.join(&name);
-        if ft.is_dir() {
-            copy_dir_excluding(&src_path, &dest_path, exclude)?;
-        } else {
-            std::fs::copy(&src_path, &dest_path)
-                .with_context(|| format!("Failed to copy {}", src_path.display()))?;
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Unit-graph keys and the `CARGO_SCHNEE_UNIT_GRAPH` hand-off
 // ---------------------------------------------------------------------------
@@ -2535,7 +2441,9 @@ fn run_build_pipeline(
     }
     let source_span = tracing::info_span!("add_project_source").entered();
     let want_skeleton = vendor_dir.is_none() && graph.is_none();
-    let (src_store, skeleton) = add_project_source_to_store(project_dir, want_skeleton)?;
+    let project = project_source(project_dir, want_skeleton)?;
+    let src_store = project.store_path.clone();
+    let skeleton = project.skeleton.clone();
     drop(source_span);
     let mut memoised_paths: Vec<String> = Vec::new();
     let vendor_store = if let Some(dir) = vendor_dir {
@@ -2656,7 +2564,7 @@ fn run_build_pipeline(
     };
 
     let (root_drvs, plan_units, _, _) = plan_nix::run_plan_nix(
-        Path::new(&src_store),
+        &project,
         Path::new(&vendor_store),
         verify_drv_paths,
         &mut HashMap::new(),
@@ -2982,7 +2890,11 @@ fn run_build_pipeline(
     let build_duration = build_end.duration_since(build_start);
 
     let root_start = Instant::now();
-    let mut kept_sources = vec![src_store.clone()];
+    let mut kept_sources: Vec<String> = project
+        .in_store()
+        .then(|| src_store.clone())
+        .into_iter()
+        .collect();
     if vendor_dir.is_none() {
         kept_sources.push(vendor_store.clone());
     }
@@ -3657,10 +3569,10 @@ fn main() -> Result<()> {
                 None => vendor_dependencies(&manifest_path)?,
             };
 
-            let (src_store, _) = add_project_source_to_store(project_dir, false)?;
+            let project = project_source(project_dir, false)?;
             let mut closure_cache = HashMap::new();
             let (_, plan_units, _, _) = plan_nix::run_plan_nix(
-                Path::new(&src_store),
+                &project,
                 Path::new(&vendor_store),
                 verify_drv_paths,
                 &mut closure_cache,
@@ -3853,8 +3765,9 @@ fn main() -> Result<()> {
         } => {
             let mut closure_cache = HashMap::new();
             let default_target = plan_nix::TargetConfig::native();
+            let project = ProjectSource::in_store_at(src)?;
             let (root_drvs, _, _, _) = plan_nix::run_plan_nix(
-                src,
+                &project,
                 vendor_dir,
                 verify_drv_paths,
                 &mut closure_cache,
@@ -4022,65 +3935,96 @@ mod tests {
         assert_eq!(nix_config(Some(std::ffi::OsStr::new("")), extra), extra);
     }
 
-    /// A project with nested and executable allowed files beside a file the
-    /// allowed set leaves out.
-    fn plain_project() -> (tempfile::TempDir, HashSet<PathBuf>) {
+    /// The copy the project source used to be: every allowed file that is a
+    /// regular file after following symlinks, and the parents of every
+    /// allowed entry.
+    fn reference_copy(project_dir: &Path, files: &HashSet<PathBuf>, dest: &Path) {
+        for file in files {
+            let src = project_dir.join(file);
+            let target = dest.join(file);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            if src.is_file() {
+                std::fs::copy(&src, &target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_source_tree_serialises_like_the_copy() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root = tmp.path().join("project");
         std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/submodule")).unwrap();
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.join("crates/a/src/lib.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(root.join("run.sh"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         std::fs::write(root.join("ignored.log"), "noise\n").unwrap();
-        let files = ["Cargo.toml", "crates/a/src/lib.rs", "run.sh"]
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        (tmp, files)
-    }
+        std::os::unix::fs::symlink("run.sh", root.join("run-link")).unwrap();
+        std::os::unix::fs::symlink("crates", root.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("crates/a/dangling")).unwrap();
+        let files: HashSet<PathBuf> = [
+            "Cargo.toml",
+            "crates/a/src/lib.rs",
+            "run.sh",
+            "run-link",
+            "dir-link",
+            "crates/a/dangling",
+            "gone/file.rs",
+            "vendor/submodule",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
 
-    fn assert_nar_matches_copy(root: &Path, files: &HashSet<PathBuf>) {
-        assert!(nar_matches_copy(root, files));
-        let copy = tempfile::tempdir().unwrap();
-        copy_allowed_files(root, copy.path(), files).unwrap();
-        assert_eq!(
-            nar::serialize_nar(root, Some(files)).unwrap(),
-            nar::serialize_nar(copy.path(), None).unwrap(),
+        let tree = project_source_tree(&root, Some(&files), &[], &HashMap::new()).unwrap();
+        let copy = tmp.path().join("copy");
+        reference_copy(&root, &files, &copy);
+        assert!(
+            tree.nar().unwrap() == nar::serialize_nar(&copy, None).unwrap(),
+            "the tree serialises differently from the copy"
         );
     }
 
     #[test]
-    fn plain_allowed_files_serialise_like_their_copy() {
-        let (tmp, files) = plain_project();
-        assert_nar_matches_copy(tmp.path(), &files);
-    }
+    fn the_source_tree_holds_external_deps_with_rewritten_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let ext = tmp.path().join("ext");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(ext.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\n[package]\nname = \"app\"\n\n[dependencies]\next = { path = \"../ext\" }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(ext.join("Cargo.toml"), "[package]\nname = \"ext\"\n").unwrap();
+        std::fs::write(ext.join("src/lib.rs"), "pub fn e() {}\n").unwrap();
+        git2::Repository::init(&ext).unwrap();
+        let files: HashSet<PathBuf> = ["Cargo.toml", "src/main.rs"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let deps = HashMap::from([(ext.canonicalize().unwrap(), "ext".to_string())]);
 
-    #[test]
-    fn allowed_symlinks_serialise_like_their_copy() {
-        let (tmp, mut files) = plain_project();
-        let root = tmp.path();
-        std::os::unix::fs::symlink("run.sh", root.join("run-link")).unwrap();
-        std::os::unix::fs::symlink("crates", root.join("dir-link")).unwrap();
-        std::os::unix::fs::symlink("nowhere", root.join("crates/a/dangling")).unwrap();
-        for f in ["run-link", "dir-link", "crates/a/dangling"] {
-            files.insert(PathBuf::from(f));
-        }
-        assert_nar_matches_copy(root, &files);
-    }
+        let tree = project_source_tree(&root, Some(&files), &[], &deps).unwrap();
 
-    #[test]
-    fn a_missing_or_directory_entry_needs_the_copy() {
-        let (tmp, files) = plain_project();
-        let mut missing = files.clone();
-        missing.insert(PathBuf::from("gone/file.rs"));
-        assert!(!nar_matches_copy(tmp.path(), &missing));
-        std::fs::create_dir_all(tmp.path().join("vendor/submodule")).unwrap();
-        let mut submodule = files;
-        submodule.insert(PathBuf::from("vendor/submodule"));
-        assert!(!nar_matches_copy(tmp.path(), &submodule));
+        let manifest = String::from_utf8(tree.read(Path::new("Cargo.toml")).unwrap()).unwrap();
+        assert!(manifest.contains("path = \"ext\""), "{manifest}");
+        assert!(
+            manifest.contains("\"ext\""),
+            "the workspace excludes ext: {manifest}"
+        );
+        assert_eq!(
+            tree.read(Path::new("ext/src/lib.rs")).unwrap(),
+            b"pub fn e() {}\n"
+        );
+        let copy = tmp.path().join("copy");
+        tree.materialise(&copy).unwrap();
+        assert!(tree.nar().unwrap() == nar::serialize_nar(&copy, None).unwrap());
     }
 
     /// Scaffold a minimal package: Cargo.toml + src/main.rs.  Returns the

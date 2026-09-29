@@ -220,30 +220,36 @@ pub(crate) fn sanitize_drv_name(name: &str) -> String {
     }
 }
 
-/// The `[package.metadata.schnee] extra-includes` globs of the manifest at
-/// `manifest`, written relative to the package directory. Empty when the
-/// manifest is unreadable or declares none.
-pub(crate) fn package_extra_includes(manifest: &Path) -> Vec<String> {
-    metadata_extra_includes(manifest, "package")
+/// The `[package.metadata.schnee] extra-includes` globs of the manifest
+/// text `manifest`, written relative to the package directory. Empty when
+/// the manifest does not parse or declares none.
+pub(crate) fn package_extra_includes(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["package", "metadata", "schnee", "extra-includes"],
+    )
 }
 
 /// The `[workspace.metadata.schnee] extra-includes` globs of the manifest
-/// at `manifest`, written relative to the workspace root.
-pub(crate) fn workspace_extra_includes(manifest: &Path) -> Vec<String> {
-    metadata_extra_includes(manifest, "workspace")
+/// text `manifest`, written relative to the workspace root.
+pub(crate) fn workspace_extra_includes(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["workspace", "metadata", "schnee", "extra-includes"],
+    )
 }
 
-fn metadata_extra_includes(manifest: &Path, table: &str) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(manifest) else {
+/// The `[workspace] members` globs of the manifest text `manifest`.
+pub(crate) fn workspace_member_patterns(manifest: &str) -> Vec<String> {
+    string_array(manifest, &["workspace", "members"])
+}
+
+fn string_array(manifest: &str, keys: &[&str]) -> Vec<String> {
+    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
         return Vec::new();
     };
-    let Ok(doc) = toml::from_str::<toml::Value>(&content) else {
-        return Vec::new();
-    };
-    doc.get(table)
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("schnee"))
-        .and_then(|s| s.get("extra-includes"))
+    keys.iter()
+        .try_fold(&doc, |v, k| v.get(k))
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()

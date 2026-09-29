@@ -32,6 +32,7 @@ use util::{
     which_rustc, which_rustdoc,
 };
 
+use crate::source_tree::{ProjectSource, SourceTree};
 use anyhow::{Context, Result};
 use cargo::core::Workspace;
 use cargo::core::compiler::UnitInterner;
@@ -753,14 +754,10 @@ pub fn narrow_to_requested_roots(
 }
 
 /// Read custom sys-env mappings from `[workspace.metadata.schnee.sys-env]` or
-/// `[package.metadata.schnee.sys-env]` in the given Cargo.toml.
+/// `[package.metadata.schnee.sys-env]` in the given Cargo.toml contents.
 /// Returns a list of (links_name, env_var_name) pairs.
-fn read_custom_sys_env(manifest_path: &Path) -> Vec<(String, String)> {
-    let content = match std::fs::read_to_string(manifest_path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let doc: toml::Value = match toml::from_str(&content) {
+fn read_custom_sys_env(content: &str) -> Vec<(String, String)> {
+    let doc: toml::Value = match toml::from_str(content) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -947,12 +944,6 @@ pub(crate) fn add_source_nar(name: &str, nar: &[u8]) -> Result<String> {
     ensure_source_nar(&mut NixDaemonConn::connect()?, name, nar)
 }
 
-/// Add the source tree at `path` to the store as `nix-store --add` does,
-/// over a fresh daemon connection. See [`add_source_dir`].
-pub(crate) fn add_source_to_store(path: &str) -> Result<String> {
-    add_source_dir(&mut NixDaemonConn::connect().ok(), path)
-}
-
 /// Make the store hold `nar` as the source path `name`. A path the store
 /// already holds costs one validity query, and a new one goes to the
 /// daemon without a `nix-store` process that walks and hashes the tree
@@ -973,40 +964,16 @@ fn ensure_source_nar(conn: &mut NixDaemonConn, name: &str, nar: &[u8]) -> Result
     Ok(added)
 }
 
-/// Add the source tree at `path` to the store under the name of its last
-/// component, with the store path `nix-store --add` gives it, through
-/// [`ensure_source_nar`]. The tree must hold no symlinks, because the
-/// serialiser skips them. Without a daemon, or when the daemon fails, it
-/// falls back to `nix-store --add`, and a failed connection is replaced so
-/// later requests on `conn` start clean.
-fn add_source_dir(conn: &mut Option<NixDaemonConn>, path: &str) -> Result<String> {
-    let Some(c) = conn.as_mut() else {
-        return crate::add_to_nix_store(path);
-    };
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("source tree {path} has no usable name"))?;
-    let nar = crate::nar::serialize_nar(Path::new(path), None)?;
-    ensure_source_nar(c, name, &nar).or_else(|e| {
-        info!("Daemon add of {} failed: {}, falling back to CLI", path, e);
-        *conn = NixDaemonConn::connect().ok();
-        crate::add_to_nix_store(path)
-    })
-}
-
-/// Add `files`, relative to `dir`, to the store as the source path `name`
-/// through [`ensure_source_nar`]. `dir` must be a store tree, which holds
-/// only regular files and directories, so a copy of `files` serialises to
-/// the same NAR. Without a daemon, or when the daemon fails, it adds such a
-/// copy with `nix-store --add`.
-fn add_source_files(
+/// Add `tree` to the store as the source path `name` through
+/// [`ensure_source_nar`]. Without a daemon, or when the daemon fails, it
+/// adds a copy of the tree with `nix-store --add`, and a failed connection
+/// is replaced so later requests on `conn` start clean.
+fn add_source_tree(
     conn: &mut Option<NixDaemonConn>,
-    dir: &str,
     name: &str,
-    files: &HashSet<PathBuf>,
+    tree: &SourceTree,
 ) -> Result<String> {
-    let nar = crate::nar::serialize_nar(Path::new(dir), Some(files))?;
+    let nar = tree.nar()?;
     let added = match conn.as_mut() {
         Some(c) => ensure_source_nar(c, name, &nar),
         None => Err(anyhow::anyhow!("no daemon connection")),
@@ -1016,7 +983,7 @@ fn add_source_files(
         *conn = NixDaemonConn::connect().ok();
         let tmp = tempfile::tempdir().context("Failed to create temp dir for a source slice")?;
         let dest = tmp.path().join(name);
-        crate::copy_allowed_files(Path::new(dir), &dest, files)?;
+        tree.materialise(&dest)?;
         crate::add_to_nix_store(&dest.to_string_lossy())
     })
 }
@@ -1232,21 +1199,12 @@ pub fn fresh_unit_graph(
     Ok((units, bcx_cfg_envs, bcx_host_cfg_envs))
 }
 
-/// A source tree for [`assign_per_crate_src_stores`] to add to the store.
-pub(super) struct SliceSource<'a> {
-    /// Directory the tree is rooted at.
-    pub(super) dir: &'a str,
-    /// Store name of the tree.
-    pub(super) name: &'a str,
-    /// Files of the tree relative to `dir`, or `None` for all of `dir`.
-    pub(super) files: Option<&'a HashSet<PathBuf>>,
-}
-
 /// Assign each unit its source store path. Every unit of a vendored crate
 /// gets the crate's own store path behind the vendor symlink farm. Every
-/// unit of a local crate gets a slice of the project source that `add`
-/// puts in the store, so an edit in one package moves only that package's
-/// units. `add` is injected so the slicing is testable without a daemon.
+/// unit of a local crate gets a slice of `tree`, the project source rooted
+/// at `src_str`, which `add` puts in the store under the given name, so an
+/// edit in one package moves only that package's units. `add` is injected
+/// so the slicing is testable without a daemon.
 ///
 /// A member below the root gets its directory. A package at the project
 /// root gets the root minus the directories of the workspace members and
@@ -1260,21 +1218,19 @@ pub(super) struct SliceSource<'a> {
 fn assign_per_crate_src_stores(
     units: &mut [NixUnit],
     src_str: &str,
+    tree: &SourceTree,
     vendor_str: &str,
-    mut add: impl FnMut(&SliceSource) -> Result<String>,
+    mut add: impl FnMut(&str, &SourceTree) -> Result<String>,
 ) -> Result<Vec<String>> {
     let mut unit_src_store: Vec<String> = vec![src_str.to_string(); units.len()];
     let mut per_crate: HashMap<String, String> = HashMap::new();
-    let other_packages = local_package_dirs(units, src_str);
+    let root_manifest = manifest_text(tree, "");
+    let other_packages = local_package_dirs(units, src_str, tree, &root_manifest);
     // Files of the workspace-level extra includes that no package directory
     // holds, such as a shared spec outside the project. Every build-script
     // run sees them, as it did when it saw the whole tree.
-    let workspace_patterns = if src_str.is_empty() {
-        Vec::new()
-    } else {
-        util::workspace_extra_includes(&Path::new(src_str).join("Cargo.toml"))
-    };
-    let shared_inputs: HashSet<PathBuf> = extra_include_files(src_str, "", &workspace_patterns)?
+    let workspace_patterns = util::workspace_extra_includes(&root_manifest);
+    let shared_inputs: HashSet<PathBuf> = extra_include_files(tree, "", &workspace_patterns)?
         .into_iter()
         .filter(|f| !other_packages.iter().any(|d| f.starts_with(d)))
         .collect();
@@ -1320,11 +1276,14 @@ fn assign_per_crate_src_stores(
             unit_src_store[i] = store;
             continue;
         }
+        if !tree.contains(Path::new(&crate_rel)) {
+            continue;
+        }
 
         let extras = if is_bsr {
-            let manifest = Path::new(&units[i].manifest_dir).join("Cargo.toml");
+            let manifest = manifest_text(tree, &crate_rel);
             let mut files =
-                extra_include_files(root, &crate_rel, &util::package_extra_includes(&manifest))?;
+                extra_include_files(tree, &crate_rel, &util::package_extra_includes(&manifest))?;
             if !crate_rel.is_empty() {
                 files.extend(shared_inputs.iter().cloned());
             }
@@ -1342,11 +1301,7 @@ fn assign_per_crate_src_stores(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("source");
-                    let p = add(&SliceSource {
-                        dir: &full,
-                        name,
-                        files: None,
-                    })?;
+                    let p = add(name, &tree.subtree(Path::new(&crate_rel)))?;
                     per_crate.insert(key, p.clone());
                     p
                 }
@@ -1363,18 +1318,14 @@ fn assign_per_crate_src_stores(
         let store = match per_crate.get(&key) {
             Some(p) => p.clone(),
             None => {
-                let files = workspace_slice_files(root, &crate_rel, &other_packages, &extras)?;
+                let files = workspace_slice_files(tree, &crate_rel, &other_packages, &extras);
                 let name = units[i]
                     .cargo_envs
                     .iter()
                     .find(|(k, _)| k == "CARGO_PKG_NAME")
                     .map(|(_, v)| v.as_str())
                     .unwrap_or("source");
-                let p = add(&SliceSource {
-                    dir: root,
-                    name,
-                    files: Some(&files),
-                })?;
+                let p = add(name, &tree.select(&files))?;
                 per_crate.insert(key, p.clone());
                 p
             }
@@ -1383,6 +1334,14 @@ fn assign_per_crate_src_stores(
         unit_src_store[i] = store;
     }
     Ok(unit_src_store)
+}
+
+/// The text of the manifest of the package at `crate_rel` in `tree`, or an
+/// empty string when the tree holds none.
+fn manifest_text(tree: &SourceTree, crate_rel: &str) -> String {
+    tree.read(&Path::new(crate_rel).join("Cargo.toml"))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
 }
 
 /// Move `unit`'s source paths from below `from` onto `to`.
@@ -1395,19 +1354,25 @@ fn rebase_unit(unit: &mut NixUnit, from: &str, to: &str) {
     }
 }
 
-/// Directories, relative to `src`, of every package in the workspace other
-/// than one at the root: the workspace members the root manifest declares,
-/// and every local package the plan names.
-fn local_package_dirs(units: &[NixUnit], src: &str) -> HashSet<PathBuf> {
-    let root = Path::new(src);
-    let members = crate::workspace_member_manifests(&root.join("Cargo.toml"), root)
-        .unwrap_or_default()
+/// Directories, relative to the project root, of every package in the
+/// workspace other than one at the root: the workspace members that
+/// `root_manifest` declares, and every local package the plan names.
+fn local_package_dirs(
+    units: &[NixUnit],
+    src: &str,
+    tree: &SourceTree,
+    root_manifest: &str,
+) -> HashSet<PathBuf> {
+    let members = util::workspace_member_patterns(root_manifest)
         .into_iter()
-        .filter_map(|m| {
-            m.parent()
-                .and_then(|d| d.strip_prefix(root).ok())
-                .map(Path::to_path_buf)
+        .filter_map(|p| glob::Pattern::new(&format!("{p}/Cargo.toml")).ok())
+        .flat_map(|pattern| {
+            tree.files()
+                .filter(|f| pattern.matches_path_with(f, literal_separator()))
+                .filter_map(|f| f.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>()
         });
+    let root = Path::new(src);
     let planned = units.iter().filter(|u| u.is_local).filter_map(|u| {
         Path::new(&u.manifest_dir)
             .strip_prefix(root)
@@ -1420,72 +1385,52 @@ fn local_package_dirs(units: &[NixUnit], src: &str) -> HashSet<PathBuf> {
         .collect()
 }
 
-/// Files, relative to `src`, of the workspace-shaped slice of the package at
-/// `crate_rel`: every file below the package directory, without the
-/// directories in `other_packages` when the package is the root, plus the
-/// files matching `extras`, globs relative to the package directory.
+fn literal_separator() -> glob::MatchOptions {
+    glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    }
+}
+
+/// Files, relative to the project root, of the workspace-shaped slice of the
+/// package at `crate_rel`: every file of `tree` below the package directory,
+/// without the directories in `other_packages` when the package is the
+/// root, plus `extra_files`.
 fn workspace_slice_files(
-    src: &str,
+    tree: &SourceTree,
     crate_rel: &str,
     other_packages: &HashSet<PathBuf>,
     extra_files: &HashSet<PathBuf>,
-) -> Result<HashSet<PathBuf>> {
-    let excluded: HashSet<PathBuf> = if crate_rel.is_empty() {
-        other_packages.clone()
-    } else {
-        HashSet::new()
-    };
-    let mut files = extra_files.clone();
-    collect_tree_files(Path::new(src), Path::new(crate_rel), &excluded, &mut files)?;
-    Ok(files)
+) -> HashSet<PathBuf> {
+    let dir = Path::new(crate_rel);
+    let root = crate_rel.is_empty();
+    tree.files()
+        .filter(|f| f.starts_with(dir))
+        .filter(|f| !root || !other_packages.iter().any(|d| f.starts_with(d)))
+        .map(Path::to_path_buf)
+        .chain(extra_files.iter().cloned())
+        .collect()
 }
 
-/// Files, relative to `src`, that match `patterns`, globs relative to the
-/// package at `crate_rel`.
+/// Files of `tree` that match `patterns`, globs relative to the package at
+/// `crate_rel`.
 fn extra_include_files(
-    src: &str,
+    tree: &SourceTree,
     crate_rel: &str,
     patterns: &[String],
 ) -> Result<HashSet<PathBuf>> {
-    let root = Path::new(src);
     let mut files = HashSet::new();
     for pattern in patterns {
-        let full = root.join(util::project_relative_pattern(crate_rel, pattern));
-        let paths = glob::glob(&full.to_string_lossy())
+        let relative = util::project_relative_pattern(crate_rel, pattern);
+        let matcher = glob::Pattern::new(&relative)
             .with_context(|| format!("invalid extra-includes pattern '{pattern}'"))?;
-        for path in paths.flatten() {
-            if path.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                files.insert(rel.to_path_buf());
-            }
-        }
+        files.extend(
+            tree.files()
+                .filter(|f| matcher.matches_path_with(f, literal_separator()))
+                .map(Path::to_path_buf),
+        );
     }
     Ok(files)
-}
-
-/// Add every regular file below `root/rel` to `out`, relative to `root`,
-/// skipping the directories in `excluded`.
-fn collect_tree_files(
-    root: &Path,
-    rel: &Path,
-    excluded: &HashSet<PathBuf>,
-    out: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    let dir = root.join(rel);
-    for entry in
-        std::fs::read_dir(&dir).with_context(|| format!("Failed to read dir {}", dir.display()))?
-    {
-        let entry = entry?;
-        let child = rel.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_dir() && !excluded.contains(&child) {
-            collect_tree_files(root, &child, excluded, out)?;
-        } else if kind.is_file() {
-            out.insert(child);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1529,12 +1474,17 @@ mod slice_tests {
 
     /// The real content-addressed add, minus the store insertion: NAR-hash
     /// the slice. Used so the test exercises actual addressing.
-    fn ca_add(s: &SliceSource) -> Result<String> {
-        let nar = crate::nar::serialize_nar(Path::new(s.dir), s.files)?;
+    fn ca_add(name: &str, slice: &SourceTree) -> Result<String> {
         Ok(crate::nar::compute_nar_store_path(
-            &format!("{}-src", s.name),
-            &nar,
+            &format!("{name}-src"),
+            &slice.nar()?,
         ))
+    }
+
+    /// Slice `units` of the project at `src`, read from disk.
+    fn slice(units: &mut [NixUnit], src: &str, vendor: &str) -> Vec<String> {
+        let tree = SourceTree::from_dir_excluding(Path::new(src), &[]).unwrap();
+        assign_per_crate_src_stores(units, src, &tree, vendor, ca_add).unwrap()
     }
 
     fn write(p: &Path, s: &str) {
@@ -1633,7 +1583,7 @@ mod slice_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (src, vendor, store) = workspace(tmp.path());
         let mut us = units(&src, &vendor);
-        let s = assign_per_crate_src_stores(&mut us, &src, &vendor, ca_add).unwrap();
+        let s = slice(&mut us, &src, &vendor);
 
         assert!(s.iter().all(|p| *p != src), "no unit keeps the whole tree");
         assert_eq!(us[0].manifest_dir, s[0]);
@@ -1659,16 +1609,14 @@ mod slice_tests {
     fn a_member_edit_leaves_other_packages_slices_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let (src, vendor, store) = workspace(tmp.path());
-        let before =
-            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+        let before = slice(&mut units(&src, &vendor), &src, &vendor);
 
         write(
             &Path::new(&src).join("crate-a/src/lib.rs"),
             "pub fn a() { let _ = 1; }\n",
         );
         vendor_symlink(&vendor, &store, "once_cell", "pub fn o() { let _ = 1; }\n");
-        let after =
-            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+        let after = slice(&mut units(&src, &vendor), &src, &vendor);
 
         assert_ne!(after[0], before[0], "crate-a's own slice moves");
         assert_ne!(after[2], before[2], "crate-a's build-script run moves");
@@ -1683,12 +1631,10 @@ mod slice_tests {
     fn extra_includes_reach_only_the_build_script_run() {
         let tmp = tempfile::tempdir().unwrap();
         let (src, vendor, _) = workspace(tmp.path());
-        let before =
-            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+        let before = slice(&mut units(&src, &vendor), &src, &vendor);
 
         write(&Path::new(&src).join("spec/api.json"), "{\"v\": 2}\n");
-        let after =
-            assign_per_crate_src_stores(&mut units(&src, &vendor), &src, &vendor, ca_add).unwrap();
+        let after = slice(&mut units(&src, &vendor), &src, &vendor);
 
         assert_ne!(
             after[5], before[5],
@@ -1717,7 +1663,7 @@ mod slice_tests {
         write(&s.join("crate-b/gen/out.rs"), "\n");
         let run = || {
             let mut us = units(&src, &vendor);
-            let stores = assign_per_crate_src_stores(&mut us, &src, &vendor, ca_add).unwrap();
+            let stores = slice(&mut us, &src, &vendor);
             (stores, us)
         };
         let (before, us) = run();
@@ -1747,8 +1693,9 @@ mod slice_tests {
     fn the_root_slice_leaves_out_member_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let (src, _, _) = workspace(tmp.path());
-        let others = local_package_dirs(&[], &src);
-        let files = workspace_slice_files(&src, "", &others, &HashSet::new()).unwrap();
+        let tree = SourceTree::from_dir_excluding(Path::new(&src), &[]).unwrap();
+        let others = local_package_dirs(&[], &src, &tree, &manifest_text(&tree, ""));
+        let files = workspace_slice_files(&tree, "", &others, &HashSet::new());
         let mut files: Vec<_> = files.into_iter().collect();
         files.sort();
         assert_eq!(
@@ -1985,7 +1932,7 @@ pub type PlanOutput = (
 // once those merge. `run_build_pipeline` carries the same allow.
 #[allow(clippy::too_many_arguments)]
 pub fn run_plan_nix(
-    src: &Path,
+    project: &ProjectSource,
     vendor_dir: &Path,
     verify_drv_paths: bool,
     closure_cache: &mut HashMap<String, Vec<String>>,
@@ -2037,14 +1984,15 @@ pub fn run_plan_nix(
 ) -> Result<PlanOutput> {
     let _root_span = tracing::info_span!("plan_nix").entered();
 
-    let manifest_path = src.join("Cargo.toml");
-    if !manifest_path.exists() {
-        anyhow::bail!("No Cargo.toml found at {}", manifest_path.display());
-    }
+    let src = Path::new(&project.store_path);
+    let root_manifest = project
+        .tree
+        .read(Path::new("Cargo.toml"))
+        .with_context(|| format!("No Cargo.toml found at {}", src.display()))?;
 
     // Read custom sys-env overrides from [workspace.metadata.schnee.sys-env]
     // or [package.metadata.schnee.sys-env] in the root Cargo.toml.
-    let custom_sys_env = read_custom_sys_env(&manifest_path);
+    let custom_sys_env = read_custom_sys_env(&String::from_utf8_lossy(&root_manifest));
 
     let src_str = src.to_string_lossy().to_string();
 
@@ -2083,8 +2031,17 @@ pub fn run_plan_nix(
             );
             (units, cfg, host_cfg)
         } else {
-            fresh_unit_graph(
-                src,
+            // Cargo reads only manifests to plan, so the skeleton serves as
+            // well as the whole tree and keeps the tree out of the store.
+            let graph_src = match &project.skeleton {
+                Some(skeleton) if !project.in_store() => skeleton.clone(),
+                _ => {
+                    project.ensure_in_store()?;
+                    src_str.clone()
+                }
+            };
+            let (mut units, cfg, host_cfg) = fresh_unit_graph(
+                Path::new(&graph_src),
                 vendor_dir,
                 profile_name,
                 target,
@@ -2095,7 +2052,11 @@ pub fn run_plan_nix(
                 no_default_features,
                 all_targets,
                 resolution,
-            )?
+            )?;
+            for unit in &mut units {
+                rebase_unit(unit, &graph_src, &src_str);
+            }
+            (units, cfg, host_cfg)
         };
     // Both branches above yield the whole-scope graph when a scope is
     // declared — the cached one because `is_root` is serialised as it was
@@ -2594,14 +2555,24 @@ pub fn run_plan_nix(
     // recursive-nix.
     let vendor_str = vendor_dir.to_string_lossy().to_string();
     let slice_span = tracing::info_span!("slice_sources").entered();
-    let unit_src_store = assign_per_crate_src_stores(&mut nix_units, &src_str, &vendor_str, |s| {
-        let _s = tracing::info_span!("add_slice", name = s.name).entered();
-        match s.files {
-            None => add_source_dir(&mut daemon, s.dir),
-            Some(files) => add_source_files(&mut daemon, s.dir, s.name, files),
-        }
-    })?;
+    let unit_src_store = assign_per_crate_src_stores(
+        &mut nix_units,
+        &src_str,
+        &project.tree,
+        &vendor_str,
+        |name, slice| {
+            let _s = tracing::info_span!("add_slice", name = name).entered();
+            let path = add_source_tree(&mut daemon, name, slice)?;
+            info!("Source slice {} -> {}", name, path);
+            Ok(path)
+        },
+    )?;
     drop(slice_span);
+    // A unit that no slice covers still names the whole tree, which only
+    // then has to reach the store.
+    if unit_src_store.contains(&src_str) {
+        project.ensure_in_store()?;
+    }
 
     // Phase 1: construct every unit's derivation JSON, ATerm bytes, and
     // `.drv` store path, level by level. Paths are computed client-side,
@@ -3341,25 +3312,27 @@ mod add_source_tests {
     use super::daemon::fake::{self, Request};
     use super::*;
 
-    fn tree() -> (tempfile::TempDir, String) {
+    fn tree() -> (tempfile::TempDir, SourceTree) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("my-crate");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"my-crate\"\n").unwrap();
         std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-        let path = dir.to_string_lossy().into_owned();
-        (tmp, path)
+        let tree = SourceTree::from_dir_excluding(&dir, &[]).unwrap();
+        (tmp, tree)
     }
 
     #[test]
-    fn add_source_dir_skips_a_tree_the_store_holds() {
-        let (_tmp, path) = tree();
-        let nar = crate::nar::serialize_nar(Path::new(&path), None).unwrap();
-        let expected = crate::nar::compute_nar_store_path("my-crate", &nar);
+    fn add_source_tree_skips_a_tree_the_store_holds() {
+        let (_tmp, tree) = tree();
+        let expected = crate::nar::compute_nar_store_path("my-crate", &tree.nar().unwrap());
         let (conn, handle) = fake::connect(HashSet::from([expected.clone()]));
         let mut conn = Some(conn);
 
-        assert_eq!(add_source_dir(&mut conn, &path).unwrap(), expected);
+        assert_eq!(
+            add_source_tree(&mut conn, "my-crate", &tree).unwrap(),
+            expected
+        );
 
         drop(conn);
         assert_eq!(
@@ -3369,14 +3342,17 @@ mod add_source_tests {
     }
 
     #[test]
-    fn add_source_dir_sends_a_new_tree_as_a_source_nar() {
-        let (_tmp, path) = tree();
-        let nar = crate::nar::serialize_nar(Path::new(&path), None).unwrap();
+    fn add_source_tree_sends_a_new_tree_as_a_source_nar() {
+        let (_tmp, tree) = tree();
+        let nar = tree.nar().unwrap();
         let expected = crate::nar::compute_nar_store_path("my-crate", &nar);
         let (conn, handle) = fake::connect(HashSet::new());
         let mut conn = Some(conn);
 
-        assert_eq!(add_source_dir(&mut conn, &path).unwrap(), expected);
+        assert_eq!(
+            add_source_tree(&mut conn, "my-crate", &tree).unwrap(),
+            expected
+        );
 
         drop(conn);
         assert_eq!(

@@ -178,11 +178,12 @@ fn nar_serialize_path(
 }
 
 /// Write a NAR string: u64 length + bytes + zero-padding to 8-byte boundary.
-fn nar_string(buf: &mut Vec<u8>, s: &str) {
+pub(crate) fn nar_string(buf: &mut Vec<u8>, s: &str) {
     nar_bytes(buf, s.as_bytes());
 }
 
-fn nar_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+/// Write NAR bytes: u64 length + bytes + zero-padding to 8-byte boundary.
+pub(crate) fn nar_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
     buf.extend_from_slice(data);
     let padding = (8 - (data.len() % 8)) % 8;
