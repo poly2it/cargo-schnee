@@ -961,6 +961,7 @@ fn ensure_source_nar(conn: &mut NixDaemonConn, name: &str, nar: &[u8]) -> Result
         added == expected,
         "daemon added {name} as {added}, expected {expected}"
     );
+    info!("Added source {} ({} bytes of NAR)", added, nar.len());
     Ok(added)
 }
 

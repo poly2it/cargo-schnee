@@ -1474,6 +1474,50 @@ fn fresh_fixture_copy(name: &str) -> PathBuf {
     dest
 }
 
+/// The store paths a plan added as sources, from its `Added source` lines.
+fn added_sources(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.split("Added source ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(String::from)
+        .collect()
+}
+
+/// An edit to one crate adds only that crate's slice to the store. The
+/// whole project source stays out of it.
+#[test]
+#[ignore]
+fn fixture_edit_adds_only_its_crate_slice() {
+    let project = fresh_fixture_copy("workspace-bins");
+    let plan = |label: &str| {
+        let output = Command::new(cargo_schnee_bin())
+            .args(["schnee", "build", "--manifest-path"])
+            .arg(project.join("Cargo.toml"))
+            .arg("--plan-only")
+            .arg(project.join(format!("{label}.roots")))
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("Failed to execute cargo-schnee");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "plan failed:\n{stderr}");
+        added_sources(&stderr)
+    };
+    plan("first");
+
+    // A unique edit, so the store cannot hold the edited slice from an
+    // earlier run.
+    let main = project.join("bin-a/src/main.rs");
+    let body = std::fs::read_to_string(&main).unwrap();
+    let stamp = project.file_name().unwrap().to_string_lossy().into_owned();
+    std::fs::write(&main, format!("{body}// {stamp}\n")).unwrap();
+    let added = plan("edited");
+
+    assert_eq!(added.len(), 1, "one source added: {added:?}");
+    assert!(added[0].ends_with("-bin-a"), "{added:?}");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
 /// Every local crate's warnings appear exactly once, on the build that
 /// compiles it and on a later build that finds it built. `warn-lib` has no
 /// input derivations and `warn-bin` depends on it, so both the unresolved and
