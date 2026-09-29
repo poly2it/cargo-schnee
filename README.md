@@ -416,6 +416,34 @@ The attribute does not depend on the daemon, so a unit has the same derivation
 path on every machine. A Nix without the feature exports it as the environment
 variable `__jobserver` and otherwise ignores it.
 
+#### Pipelined compilation
+
+Cargo starts a library's dependents once rustc has written the library's
+`.rmeta`, while its codegen still runs. A derivation's output exists only when
+the build ends, so cargo-schnee gets the same overlap by splitting a library
+into two derivations. The metadata half runs the library's rustc invocation
+with `-Z no-codegen` and keeps only the `.rmeta`. The link half runs it
+unchanged. Dependent libraries compile against the metadata half, and linking
+units against the link halves.
+
+A split repeats the frontend and adds a derivation, so cargo-schnee splits
+only libraries that another library depends on, whose codegen took at least
+1 s and whose frontend took at most 60 % of the compile. It reads those times
+from a pipeline profile, which a previous build records:
+
+```sh
+cargo schnee build --release --write-pipeline-profile pipeline.json
+cargo schnee build --release --pipeline-profile pipeline.json
+```
+
+Without `--pipeline-profile` nothing is split and every derivation is as
+before. With it, every rustc unit exports `RUSTC_BOOTSTRAP=1`, which
+`-Z no-codegen` needs and which changes the crate hash. Both halves of a
+library and every whole unit then share one crate hash, so a changed split
+decision does not rebuild dependents. The profile is an ordinary file the user
+keeps, and it holds times keyed by derivation name, so a stale profile changes
+only which libraries are split.
+
 ### Derivation registration
 
 Once the derivation JSON for each `NixUnit` has been constructed, it must be
