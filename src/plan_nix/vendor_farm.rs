@@ -211,7 +211,6 @@ fn unpack_drv_json(
             tools.tar_store,
         ],
         "env": {
-            "allowSubstitutes": "",
             "archive": archive,
             "checksum": krate.checksum,
             "out": self_placeholder("out"),
@@ -253,7 +252,6 @@ fn farm_drv_json(entries: &[(String, String)], tools: &BuildTools) -> Result<ser
         "inputDrvs": input_drvs,
         "inputSrcs": [tools.bash_store, tools.coreutils_store],
         "env": {
-            "allowSubstitutes": "",
             "crateNames": names.join("\n"),
             "crateOuts": targets.join(" "),
             "out": self_placeholder("out"),

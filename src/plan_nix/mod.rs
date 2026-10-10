@@ -2920,16 +2920,9 @@ fn aggregator_drv_json(
         "rootNames".into(),
         serde_json::Value::String(target_names.join("\n")),
     );
-    // No substituter can hold a trace for a derivation whose inputs are
-    // this machine's unit derivations, so without these Nix asks every
-    // configured cache for one on every build and waits for a 404.
     env.insert(
         "preferLocalBuild".into(),
         serde_json::Value::String("1".into()),
-    );
-    env.insert(
-        "allowSubstitutes".into(),
-        serde_json::Value::String("".into()),
     );
 
     Ok(serde_json::json!({
@@ -2949,7 +2942,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aggregator_drv_is_built_locally_without_substitution() {
+    fn aggregator_drv_is_built_locally_and_substitutable() {
         let roots = vec![(
             "/nix/store/00000000000000000000000000000000-app.drv".to_string(),
             "app".to_string(),
@@ -2965,7 +2958,7 @@ mod tests {
             "/nix/store/22222222222222222222222222222222-coreutils",
         )
         .unwrap();
-        assert_eq!(json["env"]["allowSubstitutes"], "");
+        assert!(json["env"].get("allowSubstitutes").is_none());
         assert_eq!(json["env"]["preferLocalBuild"], "1");
     }
 
