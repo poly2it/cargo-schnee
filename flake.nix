@@ -141,6 +141,7 @@
       lib.clippyPackage = import ./nix/clippyPackage.nix { inherit self; };
       lib.unitGraph = import ./nix/unitGraph.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
+      lib.vendorCargoLock = import ./nix/vendorCargoLock.nix;
 
       lib.cargoOverrides = { pkgs }:
         let cargoSchnee = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
