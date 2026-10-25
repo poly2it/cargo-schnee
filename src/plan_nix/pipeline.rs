@@ -397,6 +397,8 @@ pub fn split_units(units: &mut Vec<NixUnit>, profile: &PipelineProfile) -> usize
 /// ran, and a unit that came from the cache keeps its earlier times.
 pub struct PipelineRecorder {
     clock: Instant,
+    /// Derivation names of the plan's units whose times a profile keeps.
+    units: HashSet<String>,
     builds: HashMap<u64, Build>,
     profile: PipelineProfile,
     /// Names recorded in this run, each with whether it wrote an `.rlib`.
@@ -413,10 +415,18 @@ struct Build {
 }
 
 impl PipelineRecorder {
-    /// Starts from `planned_with`, the profile the build was planned with.
-    pub fn new(clock: Instant, planned_with: PipelineProfile) -> Self {
+    /// Starts from `planned_with`, the profile the build was planned with,
+    /// and records the builds of `units`. A metadata half repeats its
+    /// library's frontend, whose time the link half records, so it is left
+    /// out.
+    pub fn new(clock: Instant, planned_with: PipelineProfile, units: &[NixUnit]) -> Self {
         Self {
             clock,
+            units: units
+                .iter()
+                .filter(|u| u.pipeline != PipelineRole::Metadata)
+                .map(|u| u.drv_name.clone())
+                .collect(),
             builds: HashMap::new(),
             profile: planned_with,
             recorded: HashSet::new(),
@@ -438,10 +448,7 @@ impl PipelineRecorder {
                 text,
                 at,
             } => {
-                // A metadata half repeats its library's frontend, whose time
-                // the link half records.
-                if let Some(name) =
-                    drv_name_of(&drv_path).filter(|name| !name.ends_with(META_NAME_SUFFIX))
+                if let Some(name) = drv_name_of(&drv_path).filter(|name| self.units.contains(*name))
                 {
                     let build = Build {
                         name: name.to_string(),
@@ -729,7 +736,11 @@ mod tests {
             |id: u64, us: u64| event(serde_json::json!({"action": "stop", "id": id, "ts": us}));
 
         let planned_with = profile(&[("a", timing(1.0, 9.0)), ("z", timing(1.0, 2.0))]);
-        let mut recorder = PipelineRecorder::new(Instant::now(), planned_with);
+        let mut meta = unit("a", "lib", &[]);
+        meta.drv_name = "a-0.1.0-a-meta".into();
+        meta.pipeline = PipelineRole::Metadata;
+        let units = [unit("a", "lib", &[]), meta];
+        let mut recorder = PipelineRecorder::new(Instant::now(), planned_with, &units);
         recorder.read(&started(1, "a-0.1.0-a-meta", 0));
         recorder.read(&started(2, "a-0.1.0-a", 0));
         recorder.read(&artifact(1, "liba.rmeta", "metadata", 2_000_000));
@@ -742,6 +753,32 @@ mod tests {
         assert_eq!(profile.libraries["a-0.1.0-a"], timing(2.5, 5.0));
         assert_eq!(profile.libraries["z-0.1.0-z"], timing(1.0, 2.0));
         assert!(profile.others.is_empty());
+    }
+
+    /// The aggregator and the vendor and graph derivations are no units, so
+    /// no plan could ever read their times.
+    #[test]
+    fn recorder_keeps_only_the_units_of_the_plan() {
+        let event = |json: serde_json::Value| format!("@nix {json}");
+        let started = |id: u64, name: &str| {
+            event(serde_json::json!({
+                "action": "start", "fields": [format!("/nix/store/h-{name}.drv"), "", 1, 1],
+                "id": id, "level": 3, "text": "building", "ts": 0, "type": 105,
+            }))
+        };
+        let stopped =
+            |id: u64| event(serde_json::json!({"action": "stop", "id": id, "ts": 1_000_000}));
+
+        let app = unit("app", "bin", &[]);
+        let mut recorder =
+            PipelineRecorder::new(Instant::now(), PipelineProfile::default(), &[app]);
+        recorder.read(&started(1, "app-0.1.0-app"));
+        recorder.read(&started(2, "app-build-aggregator"));
+        recorder.read(&stopped(1));
+        recorder.read(&stopped(2));
+
+        let profile = recorder.finish();
+        assert_eq!(profile.others.keys().collect::<Vec<_>>(), ["app-0.1.0-app"]);
     }
 
     #[test]
@@ -767,7 +804,11 @@ mod tests {
         };
         let stopped = |id: u64, us: u64| format!(r#"@nix {{"action":"stop","id":{id},"ts":{us}}}"#);
 
-        let mut recorder = PipelineRecorder::new(Instant::now(), PipelineProfile::default());
+        let mut recorder = PipelineRecorder::new(
+            Instant::now(),
+            PipelineProfile::default(),
+            &[unit("a", "lib", &[])],
+        );
         assert_eq!(
             recorder.read(&started(1, "a-0.1.0-a", 10_000_000)),
             vec!["building '/nix/store/h-a-0.1.0-a.drv'".to_string()]

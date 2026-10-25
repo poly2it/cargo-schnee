@@ -2683,6 +2683,7 @@ fn run_build_pipeline(
         plan_nix::pipeline::PipelineRecorder::new(
             build_start,
             pipeline_opts.profile.clone().unwrap_or_default(),
+            &plan_units,
         )
     });
     let mut child = cmd
