@@ -397,15 +397,23 @@ pub fn diagnostic_path_remaps(
     src_store: &str,
     project_dir: &Path,
 ) -> Vec<(String, String)> {
+    let store_dir = store_paths::store_dir();
     let slices: std::collections::BTreeMap<String, String> = units
         .iter()
         .filter(|u| u.is_local)
-        .filter_map(|u| {
-            let rel = u.sliced_crate_rel.as_ref()?;
-            Some((
+        .filter_map(|u| match &u.sliced_crate_rel {
+            Some(rel) => Some((
                 format!("{}/", u.manifest_dir),
                 format!("{}/{}/", project_dir.display(), rel),
-            ))
+            )),
+            // A slice shaped like the workspace, which the root package and
+            // build-script runs with extra includes get, is rooted at the
+            // project root.
+            None => {
+                let root = store_paths::store_path_of(&u.manifest_dir, &store_dir)?;
+                (!u.manifest_dir.starts_with(src_store))
+                    .then(|| (format!("{root}/"), format!("{}/", project_dir.display())))
+            }
         })
         .collect();
     slices
@@ -1600,6 +1608,28 @@ mod slice_tests {
             root_unit(UnitKind::Compile, src),
             root_unit(UnitKind::BuildScriptRun, src),
         ]
+    }
+
+    /// Compiler diagnostics name a unit's source inside its slice. Every
+    /// local slice, the root package's included, maps back to the checkout.
+    #[test]
+    fn diagnostics_of_every_local_slice_map_to_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, vendor, _) = workspace(tmp.path());
+        let mut us = units(&src, &vendor);
+        slice(&mut us, &src, &vendor);
+        let remaps = diagnostic_path_remaps(&us, &src, Path::new("/home/me/app"));
+        let remap = |p: &str| {
+            remaps
+                .iter()
+                .fold(p.to_string(), |acc, (from, to)| acc.replace(from, to))
+        };
+        assert_eq!(remap(&us[0].source_file), "/home/me/app/crate-a/src/lib.rs");
+        assert_eq!(remap(&us[6].source_file), "/home/me/app/src/main.rs");
+        assert_eq!(
+            remap(&format!("{}/build.rs", us[5].manifest_dir)),
+            "/home/me/app/crate-b/build.rs"
+        );
     }
 
     #[test]
