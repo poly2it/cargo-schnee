@@ -300,14 +300,13 @@ whether or not the inner units decoupled. A clean end-to-end decoupling signal
 needs the emitted per-unit drvPaths captured before/after — left for the
 acceptance gate; the wiring + primitive tests are the rigorous proof.
 
-**Change 4 — superseded by Change 1, do not wire.** Change 1 slices per-crate
-source *inside the planner from the real `--src`* (via `add_to_nix_store`), so a
-skeleton `--src` would feed the slicing empty crate trees and break builds — the
-two are incompatible as written. And Change 1 already collapses the matrix
-(units cache-hit), so Change 4's only benefit — avoiding a cheap planner re-run
-— does not justify the conflict. Recommend dropping Change 4. (To revive it,
-Change 1 would have to take per-crate NARs as Nix-provided inputs rather than
-slicing from `--src`, a larger redesign.)
+**Change 4 — wired after all.** The objection recorded here held while the
+planner sliced per-crate sources out of its own `--src`. The planner now keeps
+the project as a `SourceTree` and cuts the slices from it, so the unit graph is
+planned from the skeleton without starving the slicing:
+`ProjectSource::graph_source` hands `fresh_unit_graph` the skeleton, and a
+store-resident `cargo-schnee` plans inside the `graph_drv` derivation, whose
+input is the skeleton. A body edit leaves the graph derivation's path alone.
 
 **Change 2 — wired and build-proven.** `assign_per_crate_src_stores` also slices
 vendored units. The vendor dir (`cargo-vendor-dir`) is a crane-style symlink
@@ -342,8 +341,9 @@ build-script-run's `CARGO_MANIFEST_DIR` is a per-crate `…-app-backend` store
 source input is the spec tree, not the `crates/` workspace. So the unit no
 longer re-keys on unrelated crate edits.
 
-Net: all three coordinated changes are wired into the live pipeline and proven
-by deterministic tests plus real nix builds; Change 4 is dropped. Remaining
+Net: all four changes are wired into the live pipeline. Change 2 stops short of
+its target in one place: build-script runs and linking units still list the
+vendor farm root in `inputSrcs`, so a lock bump moves their paths. Remaining
 polish (not required for the collapse): `OPENRPC_SPEC_DIR` points at the whole
 `specSrc`, so a *spec* edit in an unrelated crate's spec still re-keys
 app-backend's build-script-run — scope it to `spec/app` to remove that

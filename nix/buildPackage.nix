@@ -21,8 +21,7 @@
 #
 #   3. A thin `runCommand` install step lays out the cargo-schnee root
 #      drv's output under `$out/bin` and `$out/lib` in nixpkgs
-#      convention, applies `postInstall`, and wraps binaries with
-#      `makeWrapper` when `wrapBinaries` is set.
+#      convention and applies `postInstall`.
 #
 # This replaces the previous buildRustPackage-based implementation,
 # which wedged CI under concurrent invocations: every planner sandbox

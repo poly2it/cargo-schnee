@@ -171,10 +171,12 @@ identity*, a deterministic string derived from `package_name`, `version`,
 into a single `NixUnit`. When merging dependencies, the lexicographically
 smallest dep key per slot is chosen for determinism.
 
-Each `NixUnit` is assigned a key, the hexadecimal SHA-256 of its compilation
-identity string. This key is used to reference dependencies between units and
-to look up derivation store paths during construction. It is stable across
-builds with the same `Cargo.lock` and `Cargo.toml`.
+Each `NixUnit` is assigned a key such as `serde-1.0.228-serde-7922fbbd86da89dc`:
+the package, version and target, a suffix for the unit kind, and the first
+8 bytes of the SHA-256 of its compilation identity in hexadecimal. This key is
+used to reference dependencies between units and to look up derivation store
+paths during construction. It is stable across builds with the same
+`Cargo.lock` and `Cargo.toml`.
 
 Units exist in five kinds:
 
@@ -809,26 +811,29 @@ cargo-schnee.lib.buildPackage {
 }
 ```
 
-For cross-compilation, pass `hostPkgs` with the package set for the platform
-where the binary will run. The `rustToolchain` must include the cross target.
+For cross-compilation, pass the `target` triple and put the cross linker in
+`nativeBuildInputs`, where the planner finds `<triple>-gcc` on `PATH`. The
+`rustToolchain` must include the cross target.
 
 ```nix
 cargo-schnee.lib.buildPackage {
   inherit pkgs src rustToolchain;
-  hostPkgs = pkgs.pkgsCross.aarch64-multiplatform;
+  target = "aarch64-unknown-linux-gnu";
   cargoLock = ./Cargo.lock;
+  nativeBuildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc ];
 }
 ```
 
-Instead of `cargoLock`, you can pass `cargoHash` as a fixed-output hash for
-the vendored dependencies, or `cargoDeps` as a pre-fetched dependency store
-path.
+Instead of `cargoLock`, you can pass `cargoDeps` as a pre-fetched dependency
+store path.
 
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
-`unitSetup`, `wrapBinaries`, `buildType`, `doCheck`, `preBuild`, `postBuild`,
-`postInstall`, `postFixup`, and `meta`. Unrecognised attributes are passed
-through to `buildRustPackage`.
+`unitSetup`, `buildType`, `features`, `noDefaultFeatures`, `preBuild`,
+`postInstall`, and `meta`. `cargoHash`, `hostPkgs`, `doCheck`, `preCheck`,
+`postCheck`, `postBuild`, `postFixup`, `dontBuild` and `installPhase` are
+rejected with an error. Tests run through `lib.testPackage` instead of
+`doCheck`.
 
 #### `env`
 
