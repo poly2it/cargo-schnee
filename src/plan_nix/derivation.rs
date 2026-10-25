@@ -52,6 +52,45 @@ fn linked_build_script_keys<'a>(
         .collect()
 }
 
+/// Store paths of the vendored crates whose files `unit` reads while it
+/// builds, beyond the source files its script names.
+///
+/// A build-script run reads its own crate, and its binary may have baked in
+/// the `CARGO_MANIFEST_DIR` of a build dependency. A linking unit follows
+/// `cargo:rustc-link-search` paths into the crates whose build scripts it
+/// replays, such as pre-built `.lib` files. Listing these crates instead of
+/// the vendor farm keeps a `Cargo.lock` bump from moving units that read
+/// none of the bumped crates.
+fn vendored_crates_read_by(
+    unit: &NixUnit,
+    units: &[NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+) -> HashSet<String> {
+    let lookup = |key: &str| key_to_idx.get(key).map(|&i| &units[i]);
+    let mut read: Vec<&NixUnit> = Vec::new();
+    if unit.kind == UnitKind::BuildScriptRun {
+        read.push(unit);
+        if let Some(compile) = unit.build_script_compile_key.as_deref().and_then(lookup) {
+            read.extend(compile.all_dep_keys.iter().filter_map(|k| lookup(k)));
+        }
+        read.extend(unit.links_dep_keys.iter().filter_map(|(k, _)| lookup(k)));
+    }
+    if unit.needs_linker && unit.kind != UnitKind::BuildScriptRun {
+        read.extend(unit.build_script_dep.as_deref().and_then(lookup));
+        read.extend(
+            linked_build_script_keys(unit, units, key_to_idx)
+                .into_iter()
+                .filter_map(lookup),
+        );
+    }
+    let store_dir = super::store_paths::store_dir();
+    read.into_iter()
+        .filter(|u| !u.is_local)
+        .filter_map(|u| super::store_paths::store_path_of(&u.manifest_dir, &store_dir))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Packages whose presence among a build script's dependencies shows that
 /// running the script spawns work that honours a job server.  A crate that
 /// reads `CARGO_MAKEFLAGS` itself, such as `cc` with its `parallel` feature,
@@ -124,7 +163,6 @@ pub(super) fn construct_derivation(
     host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
     passthru_envs: &[(String, String)],
-    vendor_store: &str,
     win_sdk_lib_dirs: &[String],
     win_sdk_closure: &[String],
     src_store: &str,
@@ -335,13 +373,7 @@ pub(super) fn construct_derivation(
         }
     }
 
-    // Build scripts may reference vendor crate source files at runtime
-    // (e.g. via env!("CARGO_MANIFEST_DIR") baked into the compiled binary).
-    // Linking units also need it: build scripts emit cargo:rustc-link-search
-    // paths pointing into the vendor store (e.g. pre-built .lib files).
-    if (unit.kind == UnitKind::BuildScriptRun || unit.needs_linker) && !vendor_store.is_empty() {
-        input_srcs.insert(vendor_store.to_string());
-    }
+    input_srcs.extend(vendored_crates_read_by(unit, units, key_to_idx));
     // passthruEnv values may reference store paths whose closures must be
     // available in build-script-run sandboxes (e.g. LIBCLANG_PATH).
     if unit.kind == UnitKind::BuildScriptRun {
@@ -2198,7 +2230,6 @@ mod tests {
             &[],
             &[],
             &[],
-            "",
             &[],
             &[],
             SRC_STORE,
@@ -2212,6 +2243,113 @@ mod tests {
         )
         .unwrap();
         drv["env"]["__jobserver"].as_str().map(str::to_string)
+    }
+
+    /// `inputSrcs` of `units[idx]`.
+    fn input_srcs_of(units: &[NixUnit], idx: usize) -> Vec<String> {
+        let key_to_idx: HashMap<String, usize> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map: HashMap<String, String> = units
+            .iter()
+            .map(|u| {
+                let drv = format!("/nix/store/{}-{}.drv", "d".repeat(32), u.key);
+                (u.key.clone(), drv)
+            })
+            .collect();
+        let drv = construct_derivation(
+            units,
+            idx,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/bash/bin/bash",
+            "/nix/store/bash",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/cc/bin",
+            &[],
+            "x86_64-linux",
+            &[],
+            &None,
+            "",
+            &[],
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            false,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        drv["inputSrcs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A lock bump that changes one crate moves only the units that read
+    /// that crate, so no unit lists the vendor farm itself. A build-script
+    /// run reads its own crate and its build dependencies, and a linking
+    /// unit reads the crates whose build scripts point its linker at them.
+    #[test]
+    fn units_read_their_crates_not_the_vendor_farm() {
+        let store = |c: char, name: &str| format!("/nix/store/{}-{name}", c.to_string().repeat(32));
+        let vendor = store('v', "vendor");
+        let vendored = |key: &str, kind: UnitKind, dir: &str| {
+            let mut u = unit_of_kind(key, kind);
+            u.is_local = false;
+            u.manifest_dir = dir.to_string();
+            u.source_file = format!("{dir}/src/lib.rs");
+            u
+        };
+        let cc = vendored("cc", UnitKind::Compile, &store('a', "cc-1.0.0"));
+        let unrelated = vendored(
+            "unrelated",
+            UnitKind::Compile,
+            &store('b', "unrelated-1.0.0"),
+        );
+        let sys = store('c', "sys-1.0.0");
+        let mut bsc = vendored("sys-bsc", UnitKind::BuildScriptCompile, &sys);
+        bsc.crate_types = vec!["bin".into()];
+        bsc.all_dep_keys = vec!["cc".into()];
+        let mut bsr = vendored("sys-bsr", UnitKind::BuildScriptRun, &sys);
+        bsr.build_script_compile_key = Some("sys-bsc".into());
+        let mut lib = vendored("sys", UnitKind::Compile, &sys);
+        lib.build_script_dep = Some("sys-bsr".into());
+        let mut app = unit_of_kind("app", UnitKind::Compile);
+        app.crate_types = vec!["bin".into()];
+        app.needs_linker = true;
+        app.dep_extern = vec![("sys".into(), "sys".into())];
+        app.all_dep_keys = vec!["sys".into()];
+        let units = vec![cc, unrelated, bsc, bsr, lib, app];
+
+        let run = input_srcs_of(&units, 3);
+        assert!(run.contains(&sys), "{run:?}");
+        assert!(run.contains(&store('a', "cc-1.0.0")), "{run:?}");
+        assert!(!run.contains(&vendor), "{run:?}");
+        assert!(!run.contains(&store('b', "unrelated-1.0.0")), "{run:?}");
+
+        let link = input_srcs_of(&units, 5);
+        assert!(link.contains(&sys), "{link:?}");
+        assert!(!link.contains(&vendor), "{link:?}");
+        assert!(!link.contains(&store('b', "unrelated-1.0.0")), "{link:?}");
     }
 
     fn unit_of_kind(name: &str, kind: UnitKind) -> NixUnit {

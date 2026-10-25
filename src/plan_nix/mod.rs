@@ -2673,7 +2673,6 @@ pub fn run_plan_nix(
                 &host_cfg_envs,
                 &custom_sys_env,
                 passthru_envs,
-                &vendor_dir.to_string_lossy(),
                 &win_sdk_lib_dirs,
                 &win_sdk_closure,
                 &unit_src_store[i],
