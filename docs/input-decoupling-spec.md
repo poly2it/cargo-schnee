@@ -341,9 +341,10 @@ build-script-run's `CARGO_MANIFEST_DIR` is a per-crate `…-app-backend` store
 source input is the spec tree, not the `crates/` workspace. So the unit no
 longer re-keys on unrelated crate edits.
 
-Net: all four changes are wired into the live pipeline. Change 2 stops short of
-its target in one place: build-script runs and linking units still list the
-vendor farm root in `inputSrcs`, so a lock bump moves their paths. Remaining
+Net: all four changes are wired into the live pipeline. No unit derivation
+lists the vendor farm root: a build-script run lists its own crate, its build
+dependencies and its links dependencies, and a linking unit the crates whose
+build scripts it replays. Remaining
 polish (not required for the collapse): `OPENRPC_SPEC_DIR` points at the whole
 `specSrc`, so a *spec* edit in an unrelated crate's spec still re-keys
 app-backend's build-script-run — scope it to `spec/app` to remove that
