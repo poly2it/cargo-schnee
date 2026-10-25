@@ -25,7 +25,7 @@ use derivation::{
     construct_derivation, downstream_placeholder, nix_derivation_add, nix_store_closure,
     self_placeholder,
 };
-pub use realise::{realise_local_outputs, realise_unit_outputs};
+pub use realise::realise_unit_outputs;
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_bash, which_clippy_driver, which_command_no_deref,
@@ -414,6 +414,29 @@ pub fn diagnostic_path_remaps(
             format!("{src_store}/"),
             format!("{}/", project_dir.display()),
         )))
+        .collect()
+}
+
+/// Derivation paths of the local units whose outputs carry a `diagnostics`
+/// file, in plan order.
+pub fn diagnostic_drv_paths(units: &[NixUnit]) -> Vec<String> {
+    units
+        .iter()
+        .filter(|u| {
+            // A split library's metadata half reports the same diagnostics as
+            // its link half.
+            u.is_local
+                && u.pipeline != pipeline::PipelineRole::Metadata
+                && matches!(
+                    u.kind,
+                    UnitKind::Compile
+                        | UnitKind::Check
+                        | UnitKind::Doc
+                        | UnitKind::TestCompile
+                        | UnitKind::BuildScriptCompile
+                )
+        })
+        .filter_map(|u| u.drv_path.clone())
         .collect()
 }
 
@@ -2829,6 +2852,7 @@ pub(crate) fn construct_aggregator_drv(
     pname: &str,
     intent: &str,
     root_drvs: &[(String, String, UnitKind)],
+    diagnostic_drvs: &[String],
     system: &str,
 ) -> Result<String> {
     let (bash_path, bash_store) = which_bash()?;
@@ -2846,6 +2870,7 @@ pub(crate) fn construct_aggregator_drv(
         pname,
         intent,
         root_drvs,
+        diagnostic_drvs,
         system,
         &bash_path,
         &bash_store,
@@ -2856,10 +2881,12 @@ pub(crate) fn construct_aggregator_drv(
 
 /// The derivation IR that `construct_aggregator_drv` registers, with the
 /// tool paths passed in so it can be built without probing `PATH`.
+#[allow(clippy::too_many_arguments)]
 fn aggregator_drv_json(
     pname: &str,
     intent: &str,
     root_drvs: &[(String, String, UnitKind)],
+    diagnostic_drvs: &[String],
     system: &str,
     bash_path: &str,
     bash_store: &str,
@@ -2893,7 +2920,7 @@ fn aggregator_drv_json(
     // `rootNames` is newline-separated so each entry can hold any
     // character a target name can; target names never contain
     // newlines.
-    let script = format!(
+    let mut script = format!(
         "set -e\n\
          {coreutils}/bin/mkdir -p $out\n\
          read -r -a __outs <<< \"$rootOuts\"\n\
@@ -2906,6 +2933,31 @@ fn aggregator_drv_json(
          done\n",
         coreutils = coreutils_store
     );
+    // A remote builder hands back only this output, never the outputs of
+    // the units it built on the way, so their diagnostics are copied in as
+    // `diagnostics-N`, in plan order. A copy, unlike a symlink, keeps the
+    // unit outputs out of this output's closure.
+    let mut diagnostic_placeholders: Vec<String> = Vec::with_capacity(diagnostic_drvs.len());
+    for drv_path in diagnostic_drvs {
+        diagnostic_placeholders.push(downstream_placeholder(drv_path, "out")?);
+        input_drvs.insert(
+            drv_path.clone(),
+            serde_json::json!({"outputs": ["out"], "dynamicOutputs": {}}),
+        );
+    }
+    if !diagnostic_drvs.is_empty() {
+        script.push_str(&format!(
+            "read -r -a __diags <<< \"$diagnosticOuts\"\n\
+             i=0\n\
+             while [ \"$i\" -lt \"${{#__diags[@]}}\" ]; do\n\
+               if [ -f \"${{__diags[$i]}}/diagnostics\" ]; then\n\
+                 {coreutils}/bin/cp \"${{__diags[$i]}}/diagnostics\" \"$out/diagnostics-$i\"\n\
+               fi\n\
+               i=$((i+1))\n\
+             done\n",
+            coreutils = coreutils_store
+        ));
+    }
 
     let mut env = serde_json::Map::new();
     env.insert(
@@ -2920,6 +2972,12 @@ fn aggregator_drv_json(
         "rootNames".into(),
         serde_json::Value::String(target_names.join("\n")),
     );
+    if !diagnostic_drvs.is_empty() {
+        env.insert(
+            "diagnosticOuts".into(),
+            serde_json::Value::String(diagnostic_placeholders.join(" ")),
+        );
+    }
     // No substituter can hold a trace for a derivation whose inputs are
     // this machine's unit derivations, so without these Nix asks every
     // configured cache for one on every build and waits for a 404.
@@ -2959,6 +3017,7 @@ mod tests {
             "app",
             "build",
             &roots,
+            &[],
             "x86_64-linux",
             "/nix/store/11111111111111111111111111111111-bash/bin/bash",
             "/nix/store/11111111111111111111111111111111-bash",
@@ -2967,6 +3026,35 @@ mod tests {
         .unwrap();
         assert_eq!(json["env"]["allowSubstitutes"], "");
         assert_eq!(json["env"]["preferLocalBuild"], "1");
+    }
+
+    /// A remote builder copies back only the aggregator's output, so the
+    /// diagnostics of every local unit travel inside it.
+    #[test]
+    fn aggregator_carries_the_diagnostics_of_local_units() {
+        let roots = vec![(
+            "/nix/store/00000000000000000000000000000000-app.drv".to_string(),
+            "app".to_string(),
+            UnitKind::Compile,
+        )];
+        let lib = "/nix/store/33333333333333333333333333333333-lib.drv".to_string();
+        let json = aggregator_drv_json(
+            "app",
+            "build",
+            &roots,
+            std::slice::from_ref(&lib),
+            "x86_64-linux",
+            "/nix/store/11111111111111111111111111111111-bash/bin/bash",
+            "/nix/store/11111111111111111111111111111111-bash",
+            "/nix/store/22222222222222222222222222222222-coreutils",
+        )
+        .unwrap();
+        assert!(json["inputDrvs"].get(&lib).is_some());
+        assert_eq!(
+            json["env"]["diagnosticOuts"],
+            downstream_placeholder(&lib, "out").unwrap()
+        );
+        assert!(json["args"][1].as_str().unwrap().contains("diagnostics-$i"));
     }
 
     #[test]

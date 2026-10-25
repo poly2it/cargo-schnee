@@ -2610,10 +2610,18 @@ fn run_build_pipeline(
     } else {
         "workspace".to_string()
     };
+    // Only the CLI replays diagnostics. `lib.buildPackage` keeps an
+    // aggregator that depends on the roots alone.
+    let diagnostic_drvs = if plan_only.is_some() {
+        Vec::new()
+    } else {
+        plan_nix::diagnostic_drv_paths(&plan_units)
+    };
     let aggregator_drv = plan_nix::construct_aggregator_drv(
         &pname_for_agg,
         intent_str,
         &root_drvs,
+        &diagnostic_drvs,
         &target_config.nix_system,
     )
     .context("Constructing aggregator drv")?;
@@ -3032,17 +3040,12 @@ fn run_build_pipeline(
     // `nix build` shows no log of a successful build, so the diagnostics of
     // every local unit are replayed here, whether it was built in this run or
     // not. Each appears exactly once.
-    match plan_nix::realise_local_outputs(&plan_units) {
-        Ok(out_paths) => {
-            for out_path in out_paths {
-                diagnostics::replay_diagnostics_from_file(
-                    &mut diag_shell,
-                    &Path::new(&out_path).join("diagnostics"),
-                    &path_remaps,
-                );
-            }
-        }
-        Err(e) => tracing::warn!("Not replaying compiler diagnostics: {e:#}"),
+    for idx in 0..diagnostic_drvs.len() {
+        diagnostics::replay_diagnostics_from_file(
+            &mut diag_shell,
+            &Path::new(&aggregator_out_path).join(format!("diagnostics-{idx}")),
+            &path_remaps,
+        );
     }
 
     let elapsed = start_time.elapsed();

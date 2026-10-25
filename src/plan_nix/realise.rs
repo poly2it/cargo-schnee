@@ -9,42 +9,20 @@
 //! finds nothing, and this module repeats Nix's resolution, as in
 //! `Derivation::tryResolve`, before it queries the trace.
 
+use super::NixUnit;
 use super::aterm::{collect_drv_refs, compute_drv_store_path, serialize_derivation_aterm};
 use super::daemon::NixDaemonConn;
 use super::derivation::downstream_placeholder;
-use super::{NixUnit, UnitKind};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
 
-/// Output paths of the local units whose compiler diagnostics a build
-/// shows, in plan order. A unit without a build trace entry is left out,
-/// with one warning per call that counts the units left out.
+/// Output paths of the units of a finished build that this store holds,
+/// for its GC root.
 ///
-/// Errors when the daemon cannot be reached or keys its build trace by a
-/// hash modulo rather than by derivation path, as daemons from before the
-/// build-trace rework do.
-pub fn realise_local_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
-    let mut conn = NixDaemonConn::connect()?;
-    anyhow::ensure!(
-        conn.has_path_keyed_build_trace(),
-        "the Nix daemon does not key its build trace by derivation path"
-    );
-    let jsons: HashMap<&str, &serde_json::Value> = units
-        .iter()
-        .filter_map(|u| Some((u.drv_path.as_deref()?, u.drv_json.as_ref()?)))
-        .collect();
-    let (out, miss) = local_outputs(local_diagnostic_drv_paths(units), jsons, |key| {
-        conn.query_realisation(key, "out")
-    })?;
-    if let Some(miss) = miss {
-        tracing::warn!("{miss}");
-    }
-    Ok(out)
-}
-
-/// Output paths of every unit of a finished build, for its GC root.
-/// Errors when a unit has no build trace entry, because a root that left
-/// an output out would let a collection force a rebuild.
+/// A unit without a build trace entry is left out. A remote builder copies
+/// back only the output Nix was asked for, so a unit it built as a
+/// dependency has neither a trace entry nor an output here, and there is
+/// nothing to keep alive.
 pub fn realise_unit_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
     let mut conn = NixDaemonConn::connect()?;
     anyhow::ensure!(
@@ -56,23 +34,32 @@ pub fn realise_unit_outputs(units: &[NixUnit]) -> Result<Vec<String>> {
         .filter_map(|u| Some((u.drv_path.as_deref()?, u.drv_json.as_ref()?)))
         .collect();
     let all = units.iter().filter_map(|u| u.drv_path.as_deref());
-    let (out, miss) = local_outputs(all, jsons, |key| conn.query_realisation(key, "out"))?;
+    unit_outputs(all, jsons, |key| conn.query_realisation(key, "out"))
+}
+
+/// [`realise_unit_outputs`] with the build trace lookup supplied by `query`.
+fn unit_outputs<'a>(
+    drvs: impl Iterator<Item = &'a str>,
+    jsons: HashMap<&'a str, &'a serde_json::Value>,
+    query: impl FnMut(&str) -> Result<Option<String>>,
+) -> Result<Vec<String>> {
+    let (out, miss) = local_outputs(drvs, jsons, query)?;
     if let Some(miss) = miss {
-        anyhow::bail!(
-            "no build trace entry for {}, looked up as {}",
+        tracing::info!(
+            "{} unit output(s) are not in this store, first {} looked up as {}. \
+             A remote builder or a substituter keeps them, so the GC root leaves them out.",
+            miss.units,
             miss.drv_path,
-            miss.key
+            miss.key,
         );
     }
     Ok(out)
 }
 
-/// Local units left without a build trace entry. The build has just
-/// succeeded, so every unit's resolved derivation has one, and a miss means
-/// this module resolves differently from Nix.
+/// Units left without a build trace entry.
 #[derive(Debug)]
 struct TraceMiss {
-    /// Local units whose diagnostics are not replayed.
+    /// Units whose output was not found.
     units: usize,
     /// The first derivation whose own lookup missed.
     drv_path: String,
@@ -80,20 +67,8 @@ struct TraceMiss {
     key: String,
 }
 
-impl std::fmt::Display for TraceMiss {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Not replaying the compiler diagnostics of {} local unit(s): no build trace \
-             entry for {}, looked up as {}. cargo-schnee's derivation resolution no \
-             longer matches Nix's.",
-            self.units, self.drv_path, self.key,
-        )
-    }
-}
-
-/// [`realise_local_outputs`] with the build trace lookup supplied by
-/// `query`, which takes the derivation path the trace is keyed by.
+/// Output paths of `drvs` with the build trace lookup supplied by `query`,
+/// which takes the derivation path the trace is keyed by.
 fn local_outputs<'a>(
     local: impl Iterator<Item = &'a str>,
     jsons: HashMap<&'a str, &'a serde_json::Value>,
@@ -119,27 +94,6 @@ fn local_outputs<'a>(
         key,
     });
     Ok((out, miss))
-}
-
-/// Derivation paths of local units whose outputs carry a `diagnostics` file.
-fn local_diagnostic_drv_paths(units: &[NixUnit]) -> impl Iterator<Item = &str> {
-    units
-        .iter()
-        .filter(|u| {
-            // A split library's metadata half reports the same diagnostics as
-            // its link half.
-            u.is_local
-                && u.pipeline != super::pipeline::PipelineRole::Metadata
-                && matches!(
-                    u.kind,
-                    UnitKind::Compile
-                        | UnitKind::Check
-                        | UnitKind::Doc
-                        | UnitKind::TestCompile
-                        | UnitKind::BuildScriptCompile
-                )
-        })
-        .filter_map(|u| u.drv_path.as_deref())
 }
 
 struct BuildTrace<'a, Q> {
@@ -385,9 +339,31 @@ mod tests {
         assert_eq!(miss.units, 1);
         assert_eq!(miss.drv_path, c.drv_path);
         assert_ne!(miss.key, c.resolved_drv_path);
-        let warning = miss.to_string();
-        assert!(warning.contains("of 1 local unit(s)"), "{warning}");
-        assert!(warning.contains(&c.drv_path), "{warning}");
+    }
+
+    /// A remote builder returns only the output Nix was asked for, so the
+    /// local build trace holds no entry for a unit built as a dependency.
+    /// The root keeps the outputs this store has instead of failing.
+    #[test]
+    fn units_built_elsewhere_are_left_out_of_the_root() {
+        let c = captured();
+        let (lib_drv, _) = c.inputs.iter().next().unwrap();
+        let lib_json = serde_json::json!({"inputDrvs": {}});
+        let other = "/nix/store/00000000000000000000000000000000-other.drv";
+        let other_json = serde_json::json!({"inputDrvs": {}});
+        let jsons = HashMap::from([
+            (lib_drv.as_str(), &lib_json),
+            (c.drv_path.as_str(), &c.json),
+            (other, &other_json),
+        ]);
+        let trace = HashMap::from([(other.to_string(), "/nix/store/x-other".to_string())]);
+        let out = unit_outputs(
+            [lib_drv.as_str(), c.drv_path.as_str(), other].into_iter(),
+            jsons,
+            |key| Ok(trace.get(key).cloned()),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["/nix/store/x-other".to_string()]);
     }
 
     #[test]
