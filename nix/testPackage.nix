@@ -58,7 +58,7 @@ let
   runnerArgsStr = lib.escapeShellArgs testRunnerArgs;
 
   src = args.src;
-  pkgArg = if package != null then "/${package}" else "";
+  packageDir = built.passthru.packageDir or null;
 
 in
   pkgs.runCommand "${built.name}-result" {
@@ -81,14 +81,11 @@ in
     # running process holds open on descriptor 1000.  Open the crate
     # source there, so tests using
     # `env!("CARGO_MANIFEST_DIR").join("testdata/...")` find their
-    # fixtures.  Best-effort: `$src/<package>` if that exists, else
-    # `$src`.  Tests requiring workspace-root-prefixed paths need the
-    # consumer to lay out src to match, for example by using the
-    # workspace directory as src.
+    # fixtures.  That is the directory of the tested package when
+    # `buildPackage` knows it, and `$src` otherwise.
     target="$src"
-    if [ -n "${pkgArg}" ] && [ -d "$src${pkgArg}" ]; then
-      target="$src${pkgArg}"
-    fi
+    ${lib.optionalString (packageDir != null && packageDir != "")
+      ''target="$src/${packageDir}"''}
     exec 1000<"$target"
     found=0
     for bin in "$built"/bin/*; do

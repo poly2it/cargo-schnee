@@ -220,21 +220,34 @@ let
         ) (builtins.attrNames dirs));
     in if hasGlob then expanded else [ m ];
 
-  # Every workspace member's parsed manifest, keyed by cargo package name.
-  # Drives both the pname/version detection below and the unitSetup scoping
-  # further down, so the member manifests are read once per call.
-  memberManifests =
+  # Every workspace member with its package name, its directory relative to
+  # `src` and its parsed manifest. The manifests drive both the pname/version
+  # detection below and the unitSetup scoping further down, so each is read
+  # once per call.
+  members =
     if rootCargoToml ? workspace then
-      builtins.listToAttrs (lib.concatMap (m:
+      lib.concatMap (m:
         let cargoPath = src + "/${m}/Cargo.toml";
         in if !builtins.pathExists cargoPath then []
           else
             let
               toml = builtins.fromTOML (builtins.readFile cargoPath);
               name = toml.package.name or null;
-            in lib.optional (name != null) (lib.nameValuePair name toml)
-      ) (builtins.concatMap expandMember (rootCargoToml.workspace.members or [])))
-    else {};
+            in lib.optional (name != null) { inherit name toml; dir = m; }
+      ) (builtins.concatMap expandMember (rootCargoToml.workspace.members or []))
+    else [];
+
+  memberManifests = builtins.listToAttrs
+    (map (m: lib.nameValuePair m.name m.toml) members);
+
+  # The directory of the package this call builds, relative to `src`: a
+  # member's directory, "" for a package at the root, null when unknown.
+  packageDir =
+    let member = lib.findFirst (m: m.name == package) null members;
+    in if package == null then null
+      else if member != null then member.dir
+      else if (rootCargoToml.package.name or null) == package then ""
+      else null;
 
   memberCargoToml =
     if package != null then memberManifests.${package} or null else null;
@@ -735,7 +748,7 @@ let
     nativeBuildInputs = nativeBuildInputs
       ++ lib.optionals (!isWindows) [ pkgs.autoPatchelfHook ];
     inherit buildInputs;
-    passthru = { inherit planner aggregatorWrapper aggregatorOutput; };
+    passthru = { inherit planner aggregatorWrapper aggregatorOutput packageDir; };
   } ''
     set -euo pipefail
     ${installInit}

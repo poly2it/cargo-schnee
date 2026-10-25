@@ -102,6 +102,21 @@
 
             formatting = treefmtEval.config.build.check self;
 
+            # A test binary reads its fixtures relative to its crate, so the
+            # runner must open the member's directory, not one named after
+            # the package.
+            test-package-member-dir =
+              let
+                src = ./examples/build-package;
+                tests = self.lib.testPackage {
+                  inherit pkgs src;
+                  cargoLock = src + "/Cargo.lock";
+                  package = "greeter";
+                };
+              in
+              assert pkgs.lib.hasInfix ''target="$src/crates/greeter"'' tests.drvAttrs.buildCommand;
+              pkgs.runCommand "test-package-member-dir-check" { } "touch $out";
+
             # Runs the cargo wrapper with `echo` in place of cargo-schnee, so
             # the check sees exactly the arguments each override forwards.
             cargo-wrapper =
