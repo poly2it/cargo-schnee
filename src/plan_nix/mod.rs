@@ -2047,6 +2047,8 @@ pub fn run_plan_nix(
     // Read custom sys-env overrides from [workspace.metadata.schnee.sys-env]
     // or [package.metadata.schnee.sys-env] in the root Cargo.toml.
     let custom_sys_env = read_custom_sys_env(&String::from_utf8_lossy(&root_manifest));
+    let pkg_config_packages =
+        util::workspace_pkg_config_packages(&String::from_utf8_lossy(&root_manifest));
 
     let src_str = src.to_string_lossy().to_string();
 
@@ -2672,6 +2674,7 @@ pub fn run_plan_nix(
                 &cfg_envs,
                 &host_cfg_envs,
                 &custom_sys_env,
+                &pkg_config_packages,
                 passthru_envs,
                 &win_sdk_lib_dirs,
                 &win_sdk_closure,

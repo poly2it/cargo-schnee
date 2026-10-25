@@ -239,6 +239,16 @@ pub(crate) fn workspace_extra_includes(manifest: &str) -> Vec<String> {
     )
 }
 
+/// The packages whose build scripts `[workspace.metadata.schnee]
+/// pkg-config-packages` in the manifest text `manifest` lets reach
+/// pkg-config, beyond those cargo-schnee recognises by their dependencies.
+pub(crate) fn workspace_pkg_config_packages(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["workspace", "metadata", "schnee", "pkg-config-packages"],
+    )
+}
+
 /// The `[workspace] members` globs of the manifest text `manifest`.
 pub(crate) fn workspace_member_patterns(manifest: &str) -> Vec<String> {
     string_array(manifest, &["workspace", "members"])

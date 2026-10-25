@@ -92,6 +92,60 @@ fn vendored_crates_read_by(
 }
 
 /// Packages whose presence among a build script's dependencies shows that
+/// running the script may run pkg-config.  `cmake` and `autotools` drive
+/// build systems that call it themselves.
+const PKG_CONFIG_BUILD_DEPS: &[&str] = &[
+    "autotools",
+    "cmake",
+    "metadeps",
+    "pkg-config",
+    "system-deps",
+];
+
+/// Whether `unit` is a build-script run that may read the shell's
+/// `PKG_CONFIG_PATH`, so that the path and the closure of every package on it
+/// become its inputs.
+///
+/// Which `.pc` files a script reads is known only once it runs, so every
+/// script that can reach pkg-config gets all of them: one whose package
+/// declares `links`, as a crate that links a native library does, one that
+/// depends on a crate that runs pkg-config, and one of a package that
+/// `pkg-config-packages` names. Every other unit is left out, so a change to
+/// the shell moves only these. A linking unit needs none of it: the library
+/// paths it links against are named in the output of a build-script run it
+/// depends on, and Nix mounts the store paths an output references.
+fn reads_pkg_config(
+    unit: &NixUnit,
+    units: &[NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+    opted_in: &[String],
+) -> bool {
+    let package = |u: &NixUnit| {
+        u.cargo_envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_PKG_NAME")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    unit.kind == UnitKind::BuildScriptRun
+        && (unit.links.is_some()
+            || opted_in.contains(&package(unit))
+            || unit
+                .build_script_compile_key
+                .as_ref()
+                .and_then(|key| key_to_idx.get(key))
+                .is_some_and(|&idx| {
+                    units[idx]
+                        .all_dep_keys
+                        .iter()
+                        .filter_map(|dep_key| key_to_idx.get(dep_key))
+                        .any(|&dep_idx| {
+                            PKG_CONFIG_BUILD_DEPS.contains(&package(&units[dep_idx]).as_str())
+                        })
+                }))
+}
+
+/// Packages whose presence among a build script's dependencies shows that
 /// running the script spawns work that honours a job server.  A crate that
 /// reads `CARGO_MAKEFLAGS` itself, such as `cc` with its `parallel` feature,
 /// does so through `jobserver`.  `cmake` and `autotools` hand
@@ -162,6 +216,9 @@ pub(super) fn construct_derivation(
     cfg_envs: &[(String, String)],
     host_cfg_envs: &[(String, String)],
     custom_sys_env: &[(String, String)],
+    // Packages whose build scripts `[workspace.metadata.schnee]
+    // pkg-config-packages` lets reach pkg-config.
+    pkg_config_packages: &[String],
     passthru_envs: &[(String, String)],
     win_sdk_lib_dirs: &[String],
     win_sdk_closure: &[String],
@@ -210,6 +267,7 @@ pub(super) fn construct_derivation(
         rustc_path
     };
 
+    let pkg_config = reads_pkg_config(unit, units, key_to_idx, pkg_config_packages);
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             unit,
@@ -220,8 +278,8 @@ pub(super) fn construct_derivation(
             coreutils_store,
             rustc_path,
             cc_bin_dir,
-            pkg_config_bin,
-            pkg_config_path,
+            if pkg_config { pkg_config_bin } else { &None },
+            if pkg_config { pkg_config_path } else { "" },
             target,
             cfg_envs,
             host_cfg_envs,
@@ -359,9 +417,7 @@ pub(super) fn construct_derivation(
             input_srcs.insert(path.clone());
         }
     }
-    // System deps needed by build scripts (pkg-config, openssl-dev, etc.)
-    // and by compile units that link against system libraries.
-    if unit.kind == UnitKind::BuildScriptRun || unit.needs_linker {
+    if pkg_config {
         for path in sys_build_closure {
             input_srcs.insert(path.clone());
         }
@@ -2232,6 +2288,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             false,
             &[],
@@ -2280,6 +2337,7 @@ mod tests {
             "",
             &[],
             &TargetConfig::native(),
+            &[],
             &[],
             &[],
             &[],
@@ -2350,6 +2408,105 @@ mod tests {
         assert!(link.contains(&sys), "{link:?}");
         assert!(!link.contains(&vendor), "{link:?}");
         assert!(!link.contains(&store('b', "unrelated-1.0.0")), "{link:?}");
+    }
+
+    const PKG_CONFIG_DIR: &str = "/nix/store/ssssssssssssssssssssssssssssssss-openssl-dev";
+
+    /// The derivation of `units[idx]` in a shell whose `PKG_CONFIG_PATH`
+    /// names `PKG_CONFIG_DIR`, with the workspace opting `opted_in` in.
+    fn with_pkg_config(units: &[NixUnit], idx: usize, opted_in: &[String]) -> serde_json::Value {
+        let key_to_idx: HashMap<String, usize> = units
+            .iter()
+            .enumerate()
+            .map(|(i, u)| (u.key.clone(), i))
+            .collect();
+        let dep_drv_map: HashMap<String, String> = units
+            .iter()
+            .map(|u| {
+                let drv = format!("/nix/store/{}-{}.drv", "d".repeat(32), u.key);
+                (u.key.clone(), drv)
+            })
+            .collect();
+        construct_derivation(
+            units,
+            idx,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/bash/bin/bash",
+            "/nix/store/bash",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/cc/bin",
+            &[],
+            "x86_64-linux",
+            &[],
+            &Some("/nix/store/pkg-config/bin/pkg-config".into()),
+            &format!("{PKG_CONFIG_DIR}/lib/pkgconfig"),
+            &[PKG_CONFIG_DIR.to_string()],
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            opted_in,
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            false,
+            &[],
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn reads_pkg_config_inputs(drv: &serde_json::Value) -> bool {
+        let srcs = drv["inputSrcs"].as_array().unwrap();
+        let script = drv["args"][1].as_str().unwrap();
+        let in_srcs = srcs.iter().any(|s| s == PKG_CONFIG_DIR);
+        assert_eq!(
+            in_srcs,
+            script.contains("export PKG_CONFIG_PATH="),
+            "{script}"
+        );
+        in_srcs
+    }
+
+    /// A linking unit finds a system library through the build-script output
+    /// that names it, whose references Nix mounts, so the shell's
+    /// `PKG_CONFIG_PATH` is no input of it.
+    #[test]
+    fn linking_units_take_no_pkg_config_inputs() {
+        let mut app = unit_of_kind("app", UnitKind::Compile);
+        app.crate_types = vec!["bin".into()];
+        app.needs_linker = true;
+        assert!(!reads_pkg_config_inputs(&with_pkg_config(&[app], 0, &[])));
+    }
+
+    /// Only a build script that can reach pkg-config sees the shell's
+    /// `PKG_CONFIG_PATH`: one with a pkg-config driving build dependency, one
+    /// of a package that declares `links`, or one the workspace opts in.
+    #[test]
+    fn build_scripts_take_pkg_config_inputs_when_they_can_reach_it() {
+        let plain = build_script_units(&["cc"]);
+        assert!(!reads_pkg_config_inputs(&with_pkg_config(&plain, 2, &[])));
+
+        let probing = build_script_units(&["pkg-config"]);
+        assert!(reads_pkg_config_inputs(&with_pkg_config(&probing, 2, &[])));
+
+        let mut linking = build_script_units(&["cc"]);
+        linking[2].links = Some("ssl".into());
+        assert!(reads_pkg_config_inputs(&with_pkg_config(&linking, 2, &[])));
+
+        let opted_in = with_pkg_config(&plain, 2, &["my-lib-bsr".to_string()]);
+        assert!(reads_pkg_config_inputs(&opted_in));
     }
 
     fn unit_of_kind(name: &str, kind: UnitKind) -> NixUnit {

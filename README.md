@@ -341,8 +341,11 @@ by scanning the builder script for `/nix/store/` references and adding their
 top-level store paths. The `rustc` closure is always included, which
 transitively provides the sysroot and standard library. `coreutils` is added
 for basic shell utilities. Units that need a linker or run build scripts also
-get the `cc` closure and system library closures like `pkg-config` and
-`openssl`.
+get the `cc` closure. Build-script runs that can reach pkg-config also get
+the closure of every package on `PKG_CONFIG_PATH`, see
+[System libraries](#system-libraries). A linking unit gets no such closure:
+it reaches a system library through the output of the build-script run that
+named it, whose references Nix mounts.
 
 #### Proc-macro specifics
 
@@ -373,8 +376,9 @@ Build scripts are split into two derivations, corresponding to the
    build-script environment variables: `OUT_DIR`, `CARGO_MANIFEST_DIR`,
    `TARGET`, `HOST`, `CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_PKG_*`, and
    others. The script's stdout is captured to `$out/output` for downstream
-   derivations to parse. `PATH` includes `cc`, `coreutils`, and `pkg-config`.
-   `PKG_CONFIG_PATH` is set from the host environment.
+   derivations to parse. `PATH` includes `cc` and `coreutils`, and for a
+   build script that can reach pkg-config also `pkg-config`, with
+   `PKG_CONFIG_PATH` set from the host environment.
 
 For crates with a `links` attribute, the corresponding environment variable
 is set to tell the build script to use system libraries rather than vendoring
@@ -690,6 +694,25 @@ See [`examples/cross-windows/`](examples/cross-windows/) for the full
 `devShell` and `buildRustPackage` setup, and
 [`examples/build-package-cross-windows/`](examples/build-package-cross-windows/)
 for the `lib.buildPackage` equivalent.
+
+### System libraries
+
+A build script sees the host's `PKG_CONFIG_PATH` and `PKG_CONFIG_PATH_FOR_TARGET`,
+the closure of every package they name and `pkg-config` on `PATH` only when it
+can reach pkg-config: its package declares `links`, or its build dependencies
+include `pkg-config`, `system-deps`, `metadeps`, `cmake` or `autotools`. Every
+other derivation is independent of those variables, so a development shell and
+a `lib.buildPackage` build that differ only in them share every unit outside
+these build scripts.
+
+A build script that runs `pkg-config` by itself, without any of these
+dependencies or a `links` key, fails with `pkg-config: not found`. Name its
+package in the workspace manifest:
+
+```toml
+[workspace.metadata.schnee]
+pkg-config-packages = ["my-sys"]
+```
 
 ### Custom `-sys` crate environment variables
 

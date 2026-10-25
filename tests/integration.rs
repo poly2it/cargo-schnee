@@ -583,6 +583,51 @@ fn fixture_sys_lib_check_warning() {
 
 // Cross-compilation: build minimal-bin for aarch64-unknown-linux-gnu.
 // Requires a Rust toolchain with aarch64 target and aarch64-linux-gnu cross-linker.
+/// A crate links a system library that its build script found through
+/// pkg-config. The linking unit has no pkg-config inputs of its own: it
+/// reaches the library through the build-script output that names it. Needs
+/// `PKG_CONFIG_PATH` to name OpenSSL, as the development shell does.
+#[test]
+#[ignore]
+fn fixture_pkg_config_links_through_build_script_output() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pkg-config-link");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    let (stdout, stderr) = run_schnee_build(&manifest);
+    let binary = fixture_dir.join("target/debug/pkg-config-link");
+    assert!(
+        binary.exists(),
+        "build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let output = Command::new(&binary)
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("openssl="));
+
+    let root = std::fs::read_dir(fixture_dir.join("target/.schnee-roots"))
+        .expect("No GC root")
+        .map(|e| e.unwrap().path())
+        .next()
+        .expect("No GC root");
+    let root = std::fs::read_link(root).unwrap();
+    let kept = nix_lines(
+        "nix-store",
+        &["--query", "--references", &root.to_string_lossy()],
+    );
+    let link_drv = kept
+        .iter()
+        .find(|p| p.ends_with("-pkg-config-link-0.1.0-pkg-config-link.drv"))
+        .expect("the binary's derivation is rooted");
+    let link_drv = std::fs::read_to_string(link_drv).unwrap();
+    assert!(
+        !link_drv.contains("-openssl-"),
+        "the linking unit lists OpenSSL among its inputs: {link_drv}"
+    );
+}
+
 #[test]
 #[ignore]
 fn fixture_cross_compile_aarch64() {
