@@ -101,6 +101,33 @@
             });
 
             formatting = treefmtEval.config.build.check self;
+
+            # Runs the cargo wrapper with `echo` in place of cargo-schnee, so
+            # the check sees exactly the arguments each override forwards.
+            cargo-wrapper =
+              let
+                wrapper = self.lib.makeCargoWrapper {
+                  inherit pkgs;
+                  cargo = "${pkgs.coreutils}/bin/false";
+                  overrides = builtins.mapAttrs
+                    (_: o: o // { command = "echo"; setup = ""; postRun = ""; })
+                    (self.lib.cargoOverrides { inherit pkgs; });
+                };
+                expect = cmd: want: ''
+                  got=$(${wrapper}/bin/cargo ${cmd} 2>&1)
+                  if [ "$got" != ${pkgs.lib.escapeShellArg want} ]; then
+                    echo "cargo ${cmd}: forwarded '$got', expected '${want}'"
+                    exit 1
+                  fi
+                '';
+              in
+              pkgs.runCommand "cargo-wrapper-check" { } ''
+                ${expect "build -vv -p a" "-vv -p a"}
+                ${expect "test --verbose -p a" "--verbose -p a"}
+                ${expect "clippy -v --all-targets -p a -- -D warnings" "-v --all-targets -p a -- -D warnings"}
+                ${expect "test -p a -- --test-threads=1" "-p a -- --test-threads=1"}
+                touch $out
+              '';
           };
 
           devShells.default = pkgs.mkShell {
@@ -197,7 +224,7 @@
           clippy = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
             forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" "--no-deps" ];
+            boolArgs = [ "--no-default-features" "--no-deps" "--all-targets" ];
             setup = schneeSetup;
           };
           bench = {

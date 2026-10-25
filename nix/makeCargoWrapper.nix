@@ -42,8 +42,10 @@ let
         while [ $# -gt 0 ]; do
           case "$1" in
             ${forwardCases}
-            --) args+=("--" "$@"); shift $#; break ;;
+            --) shift; args+=("--" "$@"); shift $#; break ;;
             --release) args+=("--release"); shift ;;
+            # Every cargo-schnee subcommand takes the global verbosity flag.
+            -v|-vv|-vvv|--verbose) args+=("$1"); shift ;;
             # cargo-schnee does not support this argument; dropping it
             # silently turns e.g. `cargo test some_filter` into a
             # full-suite run, so at least say what got discarded.
