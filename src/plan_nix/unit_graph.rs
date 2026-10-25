@@ -1157,12 +1157,9 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
             .find(|(k, _)| k == "CARGO_PKG_VERSION")
             .map(|(_, v)| v.as_str())
             .unwrap_or("0.0.0");
-        let target_name_field = u
-            .cargo_envs
-            .iter()
-            .find(|(k, _)| k == "CARGO_CRATE_NAME")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or(&u.crate_name);
+        // `unit.target.name()`, which `make_unit_key` and
+        // `compute_extra_filename` see, with its hyphens.
+        let target_name_field = u.target_name.as_str();
         // pkg_name is resolved below; declare it early so extra_filename can use it.
         let pkg_name = u
             .cargo_envs
@@ -1412,7 +1409,7 @@ mod tests {
             links: None,
             links_dep_keys: Vec::new(),
             is_root: false,
-            target_name: String::new(),
+            target_name: name.replace('-', "_"),
             for_host: false,
             compile_test: false,
             sliced_crate_rel: None,
@@ -1972,6 +1969,29 @@ mod tests {
             !serde_core_unit.key.contains("serde-core"),
             "unified key should NOT convert underscores to hyphens: {}",
             serde_core_unit.key,
+        );
+    }
+
+    /// A merged unit keeps the target name in its key as `make_unit_key`
+    /// writes it, hyphens included, as for a `build-script-build` target.
+    #[test]
+    fn unify_keeps_hyphens_of_the_target_name() {
+        let variant = |features: &[&str]| {
+            let mut u = make_unit("cli-tool", "1.0.0", features, &[]);
+            u.target_name = "build-script-build".into();
+            u.kind = UnitKind::BuildScriptCompile;
+            u.crate_types = vec!["bin".into()];
+            u
+        };
+        let mut units = vec![variant(&["a"]), variant(&["a", "b"])];
+        unify_feature_variants(&mut units);
+        assert_eq!(units.len(), 1);
+        assert!(
+            units[0]
+                .key
+                .starts_with("cli-tool-1.0.0-build-script-build-build-script-"),
+            "{}",
+            units[0].key
         );
     }
 
