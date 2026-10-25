@@ -2906,7 +2906,32 @@ pub(crate) fn construct_aggregator_drv(
         &bash_store,
         &coreutils_store,
     )?;
-    nix_derivation_add(&json)
+    register_aggregator(NixDaemonConn::connect().ok().as_mut(), &json)
+}
+
+/// Register the aggregator `json` over `conn`, or with `nix derivation add`
+/// when there is no daemon or it fails. Returns the `.drv` path.
+fn register_aggregator(
+    conn: Option<&mut NixDaemonConn>,
+    json: &serde_json::Value,
+) -> Result<String> {
+    let name = json["name"]
+        .as_str()
+        .context("aggregator derivation has no name")?;
+    let drv = vendor_farm::PlannedDrv::new(name, json)?;
+    if let Some(conn) = conn {
+        match vendor_farm::register_planned_over(conn, std::slice::from_ref(&drv)) {
+            Ok(_) => return Ok(drv.path),
+            Err(e) => info!("Daemon registration of the aggregator failed: {e:#}, using the CLI"),
+        }
+    }
+    let path = nix_derivation_add(json)?;
+    anyhow::ensure!(
+        path == drv.path,
+        "nix derivation add registered the aggregator at {path}, expected {}",
+        drv.path
+    );
+    Ok(path)
 }
 
 /// The derivation IR that `construct_aggregator_drv` registers, with the
@@ -3056,6 +3081,38 @@ mod tests {
         .unwrap();
         assert_eq!(json["env"]["allowSubstitutes"], "");
         assert_eq!(json["env"]["preferLocalBuild"], "1");
+    }
+
+    /// The aggregator goes over the daemon like every unit, without a
+    /// `nix derivation add` process.
+    #[test]
+    fn aggregator_is_registered_over_the_daemon() {
+        use super::daemon::fake::{self, Request};
+        let roots = vec![(
+            "/nix/store/00000000000000000000000000000000-app.drv".to_string(),
+            "app".to_string(),
+            UnitKind::Compile,
+        )];
+        let json = aggregator_drv_json(
+            "app",
+            "build",
+            &roots,
+            &[],
+            "x86_64-linux",
+            "/nix/store/11111111111111111111111111111111-bash/bin/bash",
+            "/nix/store/11111111111111111111111111111111-bash",
+            "/nix/store/22222222222222222222222222222222-coreutils",
+        )
+        .unwrap();
+        let (mut conn, handle) = fake::connect(std::collections::HashSet::new());
+        let path = register_aggregator(Some(&mut conn), &json).unwrap();
+        drop(conn);
+        let requests = handle.join().unwrap();
+        assert!(path.ends_with("-app-build-aggregator.drv"), "{path}");
+        assert!(requests.iter().any(|r| matches!(
+            r,
+            Request::AddTextToStore { name, .. } if name == "app-build-aggregator.drv"
+        )));
     }
 
     /// A remote builder copies back only the aggregator's output, so the

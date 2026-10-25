@@ -293,6 +293,14 @@ pub(crate) fn plan_vendor_farm(crates: &[LockedCrate], tools: &BuildTools) -> Re
 /// in order. Returns how many were added.
 pub(crate) fn register_planned(drvs: &[PlannedDrv]) -> Result<usize> {
     let mut conn = NixDaemonConn::connect().context("Connecting to the Nix daemon")?;
+    register_planned_over(&mut conn, drvs)
+}
+
+/// [`register_planned`] over an open connection.
+pub(super) fn register_planned_over(
+    conn: &mut NixDaemonConn,
+    drvs: &[PlannedDrv],
+) -> Result<usize> {
     let paths: Vec<&str> = drvs.iter().map(|d| d.path.as_str()).collect();
     let valid = conn.query_valid_paths(&paths)?;
     let mut added = 0;
