@@ -1470,7 +1470,7 @@ fn intent_label(user_intent: &UserIntent) -> &'static str {
 /// what `construct_derivation` emits from the same unit.  It is deliberately
 /// not `CARGO_PKG_VERSION`, which is pinned at `0.1.0` and so can never
 /// distinguish two builds of the binary.
-const PLAN_SCHEMA_VERSION: u32 = 2;
+const PLAN_SCHEMA_VERSION: u32 = 3;
 
 /// The Cargo profile a command selects: `--release`, then `--profile`, then
 /// `dev`.

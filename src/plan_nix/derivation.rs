@@ -986,7 +986,11 @@ fn build_run_script(
     script.push_str(&format!("export RUSTC={} && ", shell_quote(rustc_path)));
     script.push_str(&format!("export HOST={} && ", target.host_triple));
     script.push_str(&format!("export TARGET={} && ", effective_target));
-    script.push_str("export NUM_JOBS=1 && ");
+    // The builder's core count, read when the script runs, so that the
+    // derivation path does not depend on the machine.
+    script.push_str(
+        "export NUM_JOBS=$(( ${NIX_BUILD_CORES:-0} > 0 ? ${NIX_BUILD_CORES:-0} : $(nproc) )) && ",
+    );
     script.push_str(&format!("export OPT_LEVEL={} && ", unit.profile.opt_level));
     script.push_str(&format!("export DEBUG={} && ", unit.profile.debug));
     script.push_str(&format!("export PROFILE={} && ", unit.profile.root));
@@ -1000,6 +1004,11 @@ fn build_run_script(
     };
     for (key, val) in effective_cfg_envs {
         script.push_str(&format!("export {}={} && ", key, shell_quote(val)));
+    }
+    // Cargo derives `debug_assertions` from the profile, not from the
+    // target, so `extract_cfg_envs` leaves it out and it is set here.
+    if unit.profile.debug_assertions {
+        script.push_str("export CARGO_CFG_DEBUG_ASSERTIONS= && ");
     }
 
     // Package env vars
@@ -1846,6 +1855,66 @@ mod tests {
         .unwrap();
         assert!(!script.contains("SCHNEE_AUX_DIR"));
         assert!(script.contains("_wdirs.c -ldl && cd $_bs_workdir"));
+    }
+
+    /// Cargo hands a build script its job count. A derivation path must not
+    /// depend on the machine, so the count is read from the builder at run
+    /// time rather than written into the script.
+    #[test]
+    fn run_script_takes_num_jobs_from_the_builder() {
+        let mut bs_compile = make_doc_unit("my-lib", &[], &[], true);
+        bs_compile.kind = UnitKind::BuildScriptCompile;
+        bs_compile.key = "my-lib-bsc".into();
+        bs_compile.crate_types = vec!["bin".into()];
+        let mut run = make_doc_unit("my-lib", &[], &[], true);
+        run.kind = UnitKind::BuildScriptRun;
+        run.key = "my-lib-bsr".into();
+        run.build_script_compile_key = Some("my-lib-bsc".into());
+        let units = vec![bs_compile, run];
+        let key_to_idx = HashMap::from([
+            ("my-lib-bsc".to_string(), 0_usize),
+            ("my-lib-bsr".to_string(), 1_usize),
+        ]);
+        let dep_drv_map = HashMap::from([(
+            "my-lib-bsc".to_string(),
+            "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
+        )]);
+        let script = build_run_script(
+            &units[1],
+            &units,
+            &key_to_idx,
+            &dep_drv_map,
+            "/nix/store/coreutils/bin/mkdir",
+            "/nix/store/coreutils",
+            "/nix/store/rustc-bin/bin/rustc",
+            "/nix/store/cc/bin",
+            &None,
+            "",
+            &TargetConfig::native(),
+            &[],
+            &[],
+            &[],
+            &[],
+            SRC_STORE,
+            &[],
+        )
+        .unwrap();
+        let jobs = |cores: &str| {
+            let fragment = script
+                .split(" && ")
+                .find(|part| part.contains("NUM_JOBS="))
+                .expect("the script exports NUM_JOBS");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("{fragment} && echo $NUM_JOBS"))
+                .env("NIX_BUILD_CORES", cores)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(jobs("12"), "12");
+        assert_eq!(jobs("3"), "3");
+        assert_ne!(jobs("0"), "0");
     }
 
     #[test]

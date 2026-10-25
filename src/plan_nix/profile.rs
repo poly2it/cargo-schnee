@@ -19,6 +19,8 @@ pub struct UnitProfile {
     pub(crate) debug: bool,
     /// `PROFILE` for a build-script run, `release` or `debug`.
     pub(crate) root: String,
+    /// Whether a build-script run sees `CARGO_CFG_DEBUG_ASSERTIONS`.
+    pub(crate) debug_assertions: bool,
 }
 
 impl UnitProfile {
@@ -120,6 +122,7 @@ impl UnitProfile {
                 ProfileRoot::Release => "release".into(),
                 ProfileRoot::Debug => "debug".into(),
             },
+            debug_assertions: p.debug_assertions,
         }
     }
 }
@@ -242,13 +245,14 @@ pub(super) mod tests {
     /// A workspace with one unit of each kind whose flags Cargo derives
     /// differently: `pmdep` is only a proc-macro dependency, `shared` is
     /// linked by the proc macro and by the binary and carries a
-    /// per-package override, `withbuild` has a build script, `app` links
+    /// per-package override, `withbuild` has a build script with its debug
+    /// assertions off, `plainbuild` has one with the profile's defaults, `app` links
     /// everything with LTO, and `plugin` is a `cdylib` that runs LTO too.
     const FIXTURE: &[(&str, &str)] = &[
         (
             "Cargo.toml",
             r#"[workspace]
-members = ["app", "plugin", "pm", "pmdep", "shared", "withbuild"]
+members = ["app", "plainbuild", "plugin", "pm", "pmdep", "shared", "withbuild"]
 resolver = "2"
 
 [profile.release]
@@ -305,6 +309,12 @@ pub fn three(_: TokenStream) -> TokenStream {
             "[package]\nname = \"withbuild\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         ),
         ("withbuild/build.rs", "fn main() {}\n"),
+        (
+            "plainbuild/Cargo.toml",
+            "[package]\nname = \"plainbuild\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("plainbuild/build.rs", "fn main() {}\n"),
+        ("plainbuild/src/lib.rs", "pub fn p() -> u32 { 5 }\n"),
         ("withbuild/src/lib.rs", "pub fn k() -> u32 { 4 }\n"),
         (
             "app/Cargo.toml",
@@ -317,11 +327,12 @@ edition = "2021"
 pm = { path = "../pm" }
 shared = { path = "../shared" }
 withbuild = { path = "../withbuild" }
+plainbuild = { path = "../plainbuild" }
 "#,
         ),
         (
             "app/src/main.rs",
-            "fn main() { println!(\"{}\", pm::three!() + shared::m() + withbuild::k()); }\n",
+            "fn main() { println!(\"{}\", pm::three!() + shared::m() + withbuild::k() + plainbuild::p()); }\n",
         ),
         (
             "plugin/Cargo.toml",
@@ -387,7 +398,8 @@ shared = { path = "../shared" }
         Some((format!("{} {}", crate_name?, crate_types.join(",")), flags))
     }
 
-    /// Build-script runs by package, as `OPT_LEVEL`, `DEBUG` and `PROFILE`.
+    /// Build-script runs by package, as `OPT_LEVEL`, `DEBUG`, `PROFILE` and
+    /// whether `CARGO_CFG_DEBUG_ASSERTIONS` is set.
     type ScriptEnvs = BTreeMap<String, Vec<String>>;
 
     fn cargo_invocations(dir: &Path, profile: &str) -> (Invocations, ScriptEnvs) {
@@ -431,10 +443,17 @@ shared = { path = "../shared" }
                         .unwrap_or_default()
                         .to_string()
                 };
+                let debug_assertions = tokens
+                    .iter()
+                    .any(|t| t.starts_with("CARGO_CFG_DEBUG_ASSERTIONS="));
                 scripts
                     .entry(env("CARGO_PKG_NAME"))
                     .or_default()
                     .extend(["OPT_LEVEL", "DEBUG", "PROFILE"].map(|n| format!("{n}={}", env(n))));
+                scripts
+                    .entry(env("CARGO_PKG_NAME"))
+                    .or_default()
+                    .push(format!("CARGO_CFG_DEBUG_ASSERTIONS={debug_assertions}"));
             }
         }
         (rustc, scripts)
@@ -477,6 +496,10 @@ shared = { path = "../shared" }
                     format!("OPT_LEVEL={}", unit.profile.opt_level),
                     format!("DEBUG={}", unit.profile.debug),
                     format!("PROFILE={}", unit.profile.root),
+                    format!(
+                        "CARGO_CFG_DEBUG_ASSERTIONS={}",
+                        unit.profile.debug_assertions
+                    ),
                 ]);
                 continue;
             }

@@ -535,7 +535,7 @@ mod tests {
             "is_local": false,
             "links": null,
             "links_dep_keys": [],
-            "profile": {"rustc_args": [], "opt_level": "3", "debug": false, "root": "release"},
+            "profile": {"rustc_args": [], "opt_level": "3", "debug": false, "root": "release", "debug_assertions": false},
             "drv_path": null,
         }))
         .unwrap();
