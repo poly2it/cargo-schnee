@@ -843,6 +843,13 @@ fn build_doc_script(
         parts.push(ct.clone());
     }
 
+    // As in `build_compile_script`, the sysroot `proc_macro` crate is only in
+    // scope for a proc-macro crate when passed explicitly.
+    if unit.crate_types.iter().any(|ct| ct == "proc-macro") {
+        parts.push("--extern".into());
+        parts.push("proc_macro".into());
+    }
+
     // --output: rustdoc writes HTML to this directory
     parts.push("--output".into());
     parts.push("$out/doc".into());
@@ -1587,6 +1594,33 @@ mod tests {
         // With no remaps there is nothing to gate, so no unstable opt-in.
         assert!(!script.contains("-Z unstable-options"));
         assert!(!script.contains("RUSTC_BOOTSTRAP"));
+        assert!(!script.contains("--extern proc_macro"));
+    }
+
+    #[test]
+    fn build_doc_script_proc_macro_externs_sysroot_proc_macro() {
+        let mut unit = make_doc_unit("my-macros", &[], &[], true);
+        unit.crate_types = vec!["proc-macro".to_string()];
+        let units = vec![unit];
+        let key_to_idx = HashMap::from([("my-macros-doc".to_string(), 0_usize)]);
+
+        let script = build_doc_script(
+            &units[0],
+            &units,
+            &key_to_idx,
+            &HashMap::new(),
+            "/nix/store/rustdoc-bin/bin/rustdoc",
+            "/nix/store/rust-sysroot",
+            "/nix/store/coreutils/bin",
+            false,
+            &[],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+            &[],
+        )
+        .unwrap();
+
+        assert!(script.contains("--crate-type proc-macro"));
+        assert!(script.contains("--extern proc_macro"));
     }
 
     #[test]

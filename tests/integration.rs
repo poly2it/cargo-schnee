@@ -1501,6 +1501,27 @@ fn fixture_minimal_lib_doc_private_items() {
     );
 }
 
+/// Doc generation for a proc-macro member that imports from the sysroot
+/// `proc_macro` crate.
+#[test]
+#[ignore]
+fn fixture_workspace_advanced_doc_proc_macro() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd("doc", &manifest, &["--no-deps"]);
+
+    let doc_index = fixture_dir.join("target/doc/my_macro/index.html");
+    assert!(
+        doc_index.exists(),
+        "Doc index not found at {}",
+        doc_index.display()
+    );
+}
+
 /// Copy `fixtures/<name>` into a fresh git repository under the test target
 /// directory, so its sources are new to the store and every unit is cold.
 fn fresh_fixture_copy(name: &str) -> PathBuf {
