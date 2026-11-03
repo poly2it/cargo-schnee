@@ -331,10 +331,6 @@ pub(super) fn construct_derivation(
         "preferLocalBuild".into(),
         serde_json::Value::String("1".into()),
     );
-    env.insert(
-        "allowSubstitutes".into(),
-        serde_json::Value::String("".into()),
-    );
     // Set on every machine, so that a unit keeps one derivation path whether
     // or not the daemon that builds it knows the attribute.  A Nix without
     // the `jobserver` experimental feature passes it through as a plain

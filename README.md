@@ -850,6 +850,21 @@ cargo-schnee.lib.buildPackage {
 Instead of `cargoLock`, you can pass `cargoDeps` as a pre-fetched dependency
 store path.
 
+Builds that share a lockfile should vendor it once with `lib.vendorCargoLock`
+and pass the result as `cargoDeps`. Nix does not memoise function calls, so
+each build given `cargoLock` instantiates a fetch derivation for every crate
+again.
+
+```nix
+let
+  cargoDeps = cargo-schnee.lib.vendorCargoLock {
+    inherit pkgs;
+    lockFile = ./Cargo.lock;
+  };
+in
+cargo-schnee.lib.buildPackage { inherit pkgs src cargoDeps; }
+```
+
 Other supported attributes include `rustToolchain`, `target`, `buildInputs`,
 `nativeBuildInputs`, `cargoExtraArgs`, `env`, `passthruEnv`, `extraSources`,
 `unitSetup`, `buildType`, `features`, `noDefaultFeatures`, `preBuild`,

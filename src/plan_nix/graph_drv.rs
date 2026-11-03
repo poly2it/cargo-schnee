@@ -88,7 +88,6 @@ pub(crate) fn plan_graph_drv(
         args = quoted.join(" "),
     );
     let mut env = serde_json::json!({
-        "allowSubstitutes": "",
         "out": self_placeholder("out"),
         "preferLocalBuild": "1",
         "vendor": downstream_placeholder(inputs.vendor_farm_drv, "out")?,
