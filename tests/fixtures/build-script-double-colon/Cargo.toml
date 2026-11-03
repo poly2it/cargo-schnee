@@ -1,0 +1,3 @@
+[workspace]
+members = ["probe-sys", "app"]
+resolver = "2"

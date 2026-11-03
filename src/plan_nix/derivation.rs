@@ -296,6 +296,7 @@ pub(super) fn construct_derivation(
             rustdoc_path,
             resolved_sysroot,
             &coreutils_bin_dir,
+            target,
             document_private_items,
             path_prefix_remaps,
             src_store,
@@ -516,6 +517,71 @@ fn setup_source_fragment(setup_scripts: &[String]) -> String {
     s
 }
 
+/// `--target` for a target unit of a cross build. Host units, which are
+/// proc macros, build scripts and their dependencies, take no `--target`.
+fn target_args(unit: &NixUnit, target: &TargetConfig) -> Vec<String> {
+    if target.is_cross() && !unit.for_host {
+        vec!["--target".into(), target.target_triple.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_proc_macro(unit: &NixUnit) -> bool {
+    unit.crate_types.iter().any(|ct| ct == "proc-macro")
+}
+
+/// `--crate-type` for each crate type of `unit`. A proc-macro crate also
+/// needs `--extern proc_macro`, because the sysroot `proc_macro` crate is
+/// only in scope when passed explicitly.
+fn crate_type_args(unit: &NixUnit) -> Vec<String> {
+    let mut parts: Vec<String> = unit
+        .crate_types
+        .iter()
+        .flat_map(|ct| ["--crate-type".to_string(), ct.clone()])
+        .collect();
+    if is_proc_macro(unit) {
+        parts.push("--extern".into());
+        parts.push("proc_macro".into());
+    }
+    parts
+}
+
+/// `--extern` for each direct dependency and `-L dependency=` for each
+/// transitive one, pointing at the outputs of their derivations.
+fn dep_args(
+    unit: &NixUnit,
+    units: &[NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+    dep_drv_map: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    for (extern_name, dep_key) in &unit.dep_extern {
+        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
+            let dep_unit = &units[key_to_idx[dep_key]];
+            let placeholder = downstream_placeholder(dep_drv, "out")?;
+            let filename = dep_unit.output_lib_filename();
+            parts.push("--extern".into());
+            parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
+        } else {
+            tracing::warn!(
+                "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
+                unit.key,
+                extern_name,
+                dep_key,
+            );
+        }
+    }
+    for dep_key in &unit.all_dep_keys {
+        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
+            let placeholder = downstream_placeholder(dep_drv, "out")?;
+            parts.push("-L".into());
+            parts.push(format!("dependency={}", placeholder));
+        }
+    }
+    Ok(parts)
+}
+
 /// Build the shell script for a regular compilation or build-script compilation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_compile_script(
@@ -558,12 +624,9 @@ pub(super) fn build_compile_script(
         unit.edition.clone(),
     ];
 
-    // For cross-compilation: target units need --target flag so rustc uses the
-    // correct sysroot subdirectory and produces the right binary format.
-    // Host units (proc-macros, build scripts) compile without --target.
-    if target.is_cross() && !unit.for_host {
-        parts.push("--target".into());
-        parts.push(target.target_triple.clone());
+    let target_flags = target_args(unit, target);
+    if !target_flags.is_empty() {
+        parts.extend(target_flags);
         // Explicitly tell rustc which linker to use for the target.
         if unit.needs_linker {
             if target.is_msvc() {
@@ -590,18 +653,10 @@ pub(super) fn build_compile_script(
         }
     }
 
-    // --crate-type
-    let is_proc_macro = unit.crate_types.iter().any(|ct| ct == "proc-macro");
-    for ct in &unit.crate_types {
-        parts.push("--crate-type".into());
-        parts.push(ct.clone());
-    }
-
-    // proc-macro crates need --extern proc_macro to access the sysroot proc_macro crate,
-    // and -C prefer-dynamic (matching cargo behavior)
+    let is_proc_macro = is_proc_macro(unit);
+    parts.extend(crate_type_args(unit));
+    // Matches Cargo, which links proc macros against a dynamic libstd.
     if is_proc_macro {
-        parts.push("--extern".into());
-        parts.push("proc_macro".into());
         parts.push("-C".into());
         parts.push("prefer-dynamic".into());
     }
@@ -662,32 +717,7 @@ pub(super) fn build_compile_script(
         parts.push("no-codegen".into());
     }
 
-    // --extern deps
-    for (extern_name, dep_key) in &unit.dep_extern {
-        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
-            let dep_unit = &units[key_to_idx[dep_key]];
-            let placeholder = downstream_placeholder(dep_drv, "out")?;
-            let filename = dep_unit.output_lib_filename();
-            parts.push("--extern".into());
-            parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
-        } else {
-            tracing::warn!(
-                "dep_drv_map miss for {}: --extern {} (key {}) will be OMITTED",
-                unit.key,
-                extern_name,
-                dep_key,
-            );
-        }
-    }
-
-    // -L dependency= for transitive deps
-    for dep_key in &unit.all_dep_keys {
-        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
-            let placeholder = downstream_placeholder(dep_drv, "out")?;
-            parts.push("-L".into());
-            parts.push(format!("dependency={}", placeholder));
-        }
-    }
+    parts.extend(dep_args(unit, units, key_to_idx, dep_drv_map)?);
 
     // `--remap-path-prefix`: rewrite source paths in diagnostics, debug
     // info, and macro expansions.  Each `(src_relative, replacement)` is
@@ -817,6 +847,7 @@ fn build_doc_script(
     rustdoc_path: &str,
     resolved_sysroot: &str,
     coreutils_bin_dir: &str,
+    target: &TargetConfig,
     document_private_items: bool,
     path_prefix_remaps: &[(String, String)],
     src_store: &str,
@@ -837,18 +868,10 @@ fn build_doc_script(
         unit.edition.clone(),
     ];
 
-    // --crate-type
-    for ct in &unit.crate_types {
-        parts.push("--crate-type".into());
-        parts.push(ct.clone());
-    }
-
-    // As in `build_compile_script`, the sysroot `proc_macro` crate is only in
-    // scope for a proc-macro crate when passed explicitly.
-    if unit.crate_types.iter().any(|ct| ct == "proc-macro") {
-        parts.push("--extern".into());
-        parts.push("proc_macro".into());
-    }
+    // The dependencies of a target unit are compiled for the target, so
+    // rustdoc must document it for the target too.
+    parts.extend(target_args(unit, target));
+    parts.extend(crate_type_args(unit));
 
     // --output: rustdoc writes HTML to this directory
     parts.push("--output".into());
@@ -899,25 +922,7 @@ fn build_doc_script(
     }
     parts.extend(remap);
 
-    // --extern deps — point to .rmeta/.rlib from dependency compile outputs
-    for (extern_name, dep_key) in &unit.dep_extern {
-        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
-            let dep_unit = &units[key_to_idx[dep_key]];
-            let placeholder = downstream_placeholder(dep_drv, "out")?;
-            let filename = dep_unit.output_lib_filename();
-            parts.push("--extern".into());
-            parts.push(format!("{}={}/{}", extern_name, placeholder, filename));
-        }
-    }
-
-    // -L dependency= for transitive deps
-    for dep_key in &unit.all_dep_keys {
-        if let Some(dep_drv) = dep_drv_map.get(dep_key) {
-            let placeholder = downstream_placeholder(dep_drv, "out")?;
-            parts.push("-L".into());
-            parts.push(format!("dependency={}", placeholder));
-        }
-    }
+    parts.extend(dep_args(unit, units, key_to_idx, dep_drv_map)?);
 
     // Build the script
     let mut script = String::new();
@@ -985,6 +990,25 @@ const MISSING_INPUT_REPORT: &str = concat!(
     r#" its sandbox. A build script sees only its package directory and the files that"#,
     r#" [package.metadata.schnee] extra-includes in its Cargo.toml names." >&2 ;;"#,
     r#" esac; done < $out/output; fi; [ $_bs_rc -eq 0 ]"#,
+);
+
+/// Shell fragment that rewrites a build script's `output` once it has run.
+/// It maps workdir paths back to the original Nix store path, so that
+/// `rustc-link-search` directives survive to the linking derivation. It
+/// also rewrites `cargo::` directives into the `cargo:` form, which is the
+/// only form the parsers of `output` read. `cargo::metadata=KEY=VALUE`
+/// becomes `cargo:KEY=VALUE`, and `cargo::error=` has no `cargo:` form, so it
+/// stays as written. The fragment uses pure bash because `sed` is not in the
+/// sandbox `PATH`.
+const OUTPUT_REWRITE: &str = concat!(
+    r#" && _tmp=$out/output.tmp && while IFS= read -r _line; do"#,
+    r#" case "$_line" in"#,
+    r#" cargo::metadata=*) _line="cargo:${_line#cargo::metadata=}" ;;"#,
+    r#" cargo::error=*) ;;"#,
+    r#" cargo::*) _line="cargo:${_line#cargo::}" ;;"#,
+    r#" esac;"#,
+    r#" printf '%s\n' "${_line//$_bs_workdir/$_orig_manifest_dir}";"#,
+    r#" done < $out/output > $_tmp && mv $_tmp $out/output"#,
 );
 
 /// Build the shell script for running a build script.
@@ -1139,7 +1163,7 @@ fn build_run_script(
             let dep_placeholder = downstream_placeholder(dep_drv, "out")?;
             let links_upper = links_name.to_uppercase().replace('-', "_");
             script.push_str(&format!(
-                r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:*=*) key="${{line#cargo:}}"; key="${{key%%=*}}"; val="${{line#*=}}"; case "$key" in rustc-cfg|rustc-env|rustc-link-lib|rustc-link-search|rerun-if-changed|rerun-if-env-changed|warning) ;; *) export "DEP_{links}_$(echo "$key" | tr '[:lower:]-' '[:upper:]_')=$val" ;; esac ;; esac; done < {ph}/output; fi && "#,
+                r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:[!:]*=*) key="${{line#cargo:}}"; key="${{key%%=*}}"; val="${{line#*=}}"; case "$key" in rustc-flags|rustc-link-lib|rustc-link-search|rustc-link-arg*|rustc-cdylib-link-arg|rustc-cfg|rustc-check-cfg|rustc-env|rerun-if-changed|rerun-if-env-changed|warning) ;; *) export "DEP_{links}_$(echo "$key" | tr '[:lower:]-' '[:upper:]_')=$val" ;; esac ;; esac; done < {ph}/output; fi && "#,
                 ph = dep_placeholder,
                 links = links_upper,
             ));
@@ -1249,14 +1273,7 @@ fn build_run_script(
     if unit.is_local {
         script.push_str(MISSING_INPUT_REPORT);
     }
-    // Rewrite workdir paths back to the original Nix store path so that
-    // cargo:rustc-link-search directives survive to the linking derivation.
-    // Use pure bash (no sed) since gnused isn't in the sandbox PATH.
-    script.push_str(concat!(
-        r#" && _tmp=$out/output.tmp && while IFS= read -r _line; do"#,
-        r#" printf '%s\n' "${_line//$_bs_workdir/$_orig_manifest_dir}";"#,
-        r#" done < $out/output > $_tmp && mv $_tmp $out/output"#,
-    ));
+    script.push_str(OUTPUT_REWRITE);
 
     Ok(script)
 }
@@ -1381,6 +1398,78 @@ mod tests {
         assert!(stderr.contains("extra-includes"), "{stderr}");
         assert!(!stderr.contains("names build.rs"), "{stderr}");
         assert!(run(0).status.success());
+    }
+
+    #[test]
+    fn output_rewrite_maps_double_colon_directives_to_single_colon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("output"),
+            concat!(
+                "cargo::rustc-cfg=probe_cfg\n",
+                "cargo::rustc-env=PROBE_ENV=a=b\n",
+                "cargo::metadata=root=/work/lib\n",
+                "cargo::error=broken\n",
+                "cargo:rustc-link-search=native=/work/lib\n",
+                "not a directive\n",
+            ),
+        )
+        .unwrap();
+        let run = Command::new("bash")
+            .arg("-c")
+            .arg(format!("true{OUTPUT_REWRITE}"))
+            .env("out", dir)
+            .env("_bs_workdir", "/work")
+            .env("_orig_manifest_dir", "/nix/store/src")
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{run:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output")).unwrap(),
+            concat!(
+                "cargo:rustc-cfg=probe_cfg\n",
+                "cargo:rustc-env=PROBE_ENV=a=b\n",
+                "cargo:root=/nix/store/src/lib\n",
+                "cargo::error=broken\n",
+                "cargo:rustc-link-search=native=/nix/store/src/lib\n",
+                "not a directive\n",
+            )
+        );
+    }
+
+    #[test]
+    fn build_doc_script_cross_target_unit_takes_target() {
+        let target = TargetConfig::with_target("aarch64-unknown-linux-gnu");
+        let mut host_unit = make_doc_unit("my-macros", &[], &[], true);
+        host_unit.for_host = true;
+        let target_unit = make_doc_unit("my-lib", &[], &[], true);
+        let units = vec![target_unit, host_unit];
+        let key_to_idx = HashMap::from([
+            ("my-lib-doc".to_string(), 0_usize),
+            ("my-macros-doc".to_string(), 1_usize),
+        ]);
+        let script = |unit: &NixUnit| {
+            build_doc_script(
+                unit,
+                &units,
+                &key_to_idx,
+                &HashMap::new(),
+                "/nix/store/rustdoc-bin/bin/rustdoc",
+                "/nix/store/rust-sysroot",
+                "/nix/store/coreutils/bin",
+                &target,
+                false,
+                &[],
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
+                &[],
+            )
+            .unwrap()
+        };
+
+        assert!(script(&units[0]).contains("--target aarch64-unknown-linux-gnu"));
+        assert!(!script(&units[1]).contains("--target"));
     }
 
     // The project-src root remap that the consumer expresses via
@@ -1560,6 +1649,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1612,6 +1702,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1638,6 +1729,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &root_remap(),
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1668,6 +1760,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             true,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1693,6 +1786,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             true,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1719,6 +1813,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1745,6 +1840,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
@@ -1862,6 +1958,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             SRC_STORE,
@@ -2054,6 +2151,7 @@ mod tests {
             "/nix/store/rustdoc-bin/bin/rustdoc",
             "/nix/store/rust-sysroot",
             "/nix/store/coreutils/bin",
+            &TargetConfig::native(),
             false,
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",

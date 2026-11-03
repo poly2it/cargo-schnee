@@ -1522,6 +1522,63 @@ fn fixture_workspace_advanced_doc_proc_macro() {
     );
 }
 
+/// Doc generation for a cross target, where every dependency is compiled for
+/// the target rather than the host.
+#[test]
+#[ignore]
+fn fixture_workspace_advanced_doc_cross_aarch64() {
+    let _guard = lock(&WORKSPACE_ADVANCED_LOCK);
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace-advanced");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_cmd(
+        "doc",
+        &manifest,
+        &["--no-deps", "--target", "aarch64-unknown-linux-gnu"],
+    );
+
+    let doc_index = fixture_dir.join("target/aarch64-unknown-linux-gnu/doc/app/index.html");
+    assert!(
+        doc_index.exists(),
+        "Doc index not found at {}",
+        doc_index.display()
+    );
+}
+
+/// Build scripts that use the `cargo::` directive syntax. `probe-sys` sets
+/// a cfg, an env var and `links` metadata, and `app`'s build script forwards
+/// the metadata it receives as `DEP_PROBE_ROOT`.
+#[test]
+#[ignore]
+fn fixture_build_script_double_colon_directives() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/build-script-double-colon");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let output = Command::new(fixture_dir.join("target/debug/app"))
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "from-env from-cfg from-metadata"
+    );
+
+    run_schnee_cmd("doc", &manifest, &["--no-deps"]);
+    let doc_index = fixture_dir.join("target/doc/probe_sys/index.html");
+    let doc_content = std::fs::read_to_string(&doc_index)
+        .unwrap_or_else(|e| panic!("Doc index not read at {}: {e}", doc_index.display()));
+    assert!(
+        doc_content.contains("CFG"),
+        "rustdoc did not see the `probe_cfg` cfg"
+    );
+}
+
 /// Copy `fixtures/<name>` into a fresh git repository under the test target
 /// directory, so its sources are new to the store and every unit is cold.
 fn fresh_fixture_copy(name: &str) -> PathBuf {
