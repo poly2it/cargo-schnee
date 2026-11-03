@@ -160,7 +160,6 @@ fn fetch_drv_json(krate: &LockedCrate) -> (String, serde_json::Value) {
         "inputDrvs": {},
         "inputSrcs": [],
         "env": {
-            "allowSubstitutes": "",
             "builder": "builtin:fetchurl",
             "executable": "",
             "name": name,
@@ -341,8 +340,17 @@ mod tests {
         let planned = PlannedDrv::new("itoa-1.0.15.crate", &json).unwrap();
         assert_eq!(
             planned.path,
-            "/nix/store/5wpfn6wh33qbfqdka6aww5cyv446hg6r-itoa-1.0.15.crate.drv"
+            "/nix/store/ifv9lzswsf249zx8dwapnc1ywa17abfx-itoa-1.0.15.crate.drv"
         );
+    }
+
+    /// A crate archive is a fixed output that any cache can hold, as for the
+    /// fetches of Nix's own `<nix/fetchurl.nix>`.
+    #[test]
+    fn fetch_drv_is_substitutable() {
+        let (_, json) = fetch_drv_json(&itoa());
+        assert!(json["env"].get("allowSubstitutes").is_none());
+        assert_eq!(json["env"]["preferLocalBuild"], "1");
     }
 
     #[test]
