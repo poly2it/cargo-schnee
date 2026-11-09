@@ -126,14 +126,6 @@ pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String 
     s
 }
 
-/// Shell fragment, run where a build script's `cargo:rustc-link-search`
-/// value is in `$d`, adding the store root it names to `__linked`.
-pub(super) fn link_search_root(store_dir: &str) -> String {
-    format!(
-        r#"d="${{d#*=}}"; case "$d" in {store_dir}/*) r="${{d#{store_dir}/}}"; __linked="$__linked {store_dir}/${{r%%/*}}" ;; esac; "#
-    )
-}
-
 /// Shell fragment, run where a build script's `cargo:rustc-env` value is in
 /// `$v`, adding a remap for the store root the value names. A path that
 /// reaches rustc this way, such as a code generator's output directory
@@ -148,8 +140,6 @@ pub(super) fn rustc_env_remap(store_dir: &str) -> String {
 pub(super) struct Policy<'a> {
     /// The derivation that builds `schnee-refs`.
     pub(super) tool_drv: &'a str,
-    /// What a linked target binary may refer to, see [`linked_runtime`].
-    pub(super) runtime: &'a [String],
     /// The paths a `runtime-references` name may match.
     pub(super) known: &'a [String],
     /// Keys of the units whose code reaches a root, see [`runtime_units`].
@@ -194,39 +184,13 @@ pub(super) enum Contract {
     /// The output may refer to these store paths alone, which Nix checks
     /// through `allowedReferences`.
     Allowed(Vec<String>),
-    /// The output may refer to these store paths and the store roots of the
-    /// `cargo:rustc-link-search` directories it links against, because the
-    /// linker records a directory it found a shared library in. Those roots
-    /// are known only once the build scripts have run, and listing every
+    /// The output may refer to these store paths and to those its dynamic
+    /// loader reads, the interpreter and the run path of each ELF file.
+    /// Those are known only once the linker has run, and listing every
     /// library pkg-config could hand out would re-key the unit on each of
-    /// them, so `schnee-refs` alone checks this contract.
+    /// them, so `schnee-refs` alone checks this contract. A PE file names
+    /// none, so a Windows binary may refer to the declared paths alone.
     Linked(Vec<String>),
-}
-
-/// The runtime closure Nix's toolchain links every Linux binary against,
-/// that is the C library and the GCC runtime, read from the cc wrapper at
-/// `cc_store`. Empty for a compiler that is not a Nix cc wrapper.
-pub(super) fn linked_runtime(cc_store: &str, store_dir: &str) -> Vec<String> {
-    let support = Path::new(cc_store).join("nix-support");
-    let read = |name: &str| std::fs::read_to_string(support.join(name)).unwrap_or_default();
-    let compiler = read("orig-cc");
-    let compiler = compiler.trim();
-    let mut paths: Vec<String> = Vec::new();
-    let libc = read("orig-libc");
-    paths.extend(libc.split_whitespace().map(str::to_string));
-    for flag in read("cc-ldflags").split_whitespace() {
-        let Some(dir) = flag.strip_prefix("-L") else {
-            continue;
-        };
-        if let Some(root) = super::store_paths::store_path_of(dir, store_dir)
-            && root != compiler
-        {
-            paths.push(root.to_string());
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
 }
 
 /// The store paths `[package.metadata.schnee] runtime-references` in the
@@ -268,23 +232,17 @@ pub(super) fn declared_runtime_references(unit: &NixUnit, known: &[String]) -> R
 
 /// The contract of `unit`. A runtime unit that compiles a library may refer
 /// to nothing, because an rlib is linked rather than loaded. A runtime unit
-/// that links may refer to the policy's runtime paths, the libraries it
-/// links and what its manifest declares, except on Windows, where nothing
-/// loads a store path at run time. Other units, tests among them, only run
-/// during the build.
-pub(super) fn contract(
-    unit: &NixUnit,
-    target: &TargetConfig,
-    policy: &Policy<'_>,
-) -> Result<Contract> {
+/// that links may refer to what its dynamic loader reads and what its
+/// manifest declares. Other units, tests among them, only run during the
+/// build.
+pub(super) fn contract(unit: &NixUnit, policy: &Policy<'_>) -> Result<Contract> {
     if unit.kind != UnitKind::Compile || !policy.runtime_units.contains(&unit.key) {
         return Ok(Contract::Unchecked);
     }
-    if !unit.needs_linker || target.is_windows() {
+    if !unit.needs_linker {
         return Ok(Contract::Allowed(Vec::new()));
     }
-    let mut allowed = policy.runtime.to_vec();
-    allowed.extend(declared_runtime_references(unit, policy.known)?);
+    let mut allowed = declared_runtime_references(unit, policy.known)?;
     allowed.sort();
     allowed.dedup();
     Ok(Contract::Linked(allowed))
@@ -293,8 +251,7 @@ pub(super) fn contract(
 /// Shell fragment that runs `schnee-refs` over `$out` once the compiler
 /// has succeeded. It rewrites the diagnostics to hash-free paths, scrubs
 /// the CodeView records of an MSVC target, and fails the unit with a
-/// report on any other reference outside `contract`. `__linked` holds the
-/// link-search roots the compile script collected.
+/// report on any other reference outside `contract`.
 pub(super) fn check_fragment(
     tool_drv: &str,
     target: &TargetConfig,
@@ -303,7 +260,7 @@ pub(super) fn check_fragment(
     let allowed = match contract {
         Contract::Unchecked => return Ok(String::new()),
         Contract::Allowed(_) => r#""$allowedReferences""#,
-        Contract::Linked(_) => r#""$schneeRuntimeReferences $__linked""#,
+        Contract::Linked(_) => r#""$schneeRuntimeReferences" --allow-loader-paths"#,
     };
     let tool = downstream_placeholder(tool_drv, "out")?;
     let scrub = if target.is_msvc() {
@@ -488,25 +445,5 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert!(srcs.contains(&wrapper), "{srcs:?}");
-    }
-
-    #[test]
-    fn linked_runtime_reads_libc_and_the_gcc_runtime() {
-        let dir = std::env::temp_dir().join(format!("schnee-cc-wrapper-{}", std::process::id()));
-        let support = dir.join("nix-support");
-        std::fs::create_dir_all(&support).unwrap();
-        let gcc = "/nix/store/xpaz3fi6ibqxb9sla4gjlp0c82v566y8-gcc-16.2.0";
-        let lib = "/nix/store/7a2cjhcgzyym5zaz6m4fksw47qvm150w-gcc-16.2.0-lib";
-        let libc = "/nix/store/pqyiidz5mi73wv5f91d48s9plcqyj5bz-glibc-2.44-57";
-        std::fs::write(support.join("orig-cc"), format!("{gcc}\n")).unwrap();
-        std::fs::write(support.join("orig-libc"), format!("{libc}\n")).unwrap();
-        std::fs::write(
-            support.join("cc-ldflags"),
-            format!("-L{gcc}/lib/gcc/x86_64-unknown-linux-gnu/16.2.0 -L{lib}/lib -L{lib}/lib "),
-        )
-        .unwrap();
-        let runtime = linked_runtime(&dir.to_string_lossy(), "/nix/store");
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(runtime, vec![lib.to_string(), libc.to_string()]);
     }
 }

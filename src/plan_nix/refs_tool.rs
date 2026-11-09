@@ -111,6 +111,9 @@ struct Args {
     allowed: Vec<String>,
     scrub_suffixes: Vec<String>,
     rewrite_names: Vec<String>,
+    /// Lets each ELF file refer to the store paths its dynamic loader
+    /// reads, see [`elf_loader_roots`].
+    allow_loader_paths: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -128,13 +131,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 .extend(value()?.split_whitespace().map(String::from)),
             "--scrub" => parsed.scrub_suffixes.push(value()?),
             "--rewrite" => parsed.rewrite_names.push(value()?),
+            "--allow-loader-paths" => parsed.allow_loader_paths = true,
             _ if parsed.out.as_os_str().is_empty() => parsed.out = PathBuf::from(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
     if parsed.out.as_os_str().is_empty() {
         return Err(
-            "usage: schnee-refs <out> [--allowed <paths>] [--scrub <suffix>] [--rewrite <name>]"
+            "usage: schnee-refs <out> [--allowed <paths>] [--allow-loader-paths] [--scrub <suffix>] [--rewrite <name>]"
                 .into(),
         );
     }
@@ -211,6 +215,121 @@ fn literal_paths(data: &[u8], store: &str, allowed: &[&str]) -> HashMap<Vec<u8>,
             .or_insert_with(|| format!("{prefix}{root}"));
     }
     found
+}
+
+/// The interpreter and the run path entries of the ELF file `data`, the
+/// paths its dynamic loader reads. Empty for any other file, so a PE file
+/// or an archive gets nothing from them.
+fn elf_loader_paths(data: &[u8]) -> Vec<String> {
+    elf_loader_paths_of(data).unwrap_or_default()
+}
+
+fn elf_loader_paths_of(data: &[u8]) -> Option<Vec<String>> {
+    const PT_LOAD: u64 = 1;
+    const PT_DYNAMIC: u64 = 2;
+    const PT_INTERP: u64 = 3;
+    const DT_STRTAB: u64 = 5;
+    const DT_RPATH: u64 = 15;
+    const DT_RUNPATH: u64 = 29;
+    if data.get(..4)? != b"\x7fELF" {
+        return None;
+    }
+    let wide = match data.get(4)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let little = match data.get(5)? {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let read = |at: u64, len: usize| -> Option<u64> {
+        let at = usize::try_from(at).ok()?;
+        let bytes = data.get(at..at.checked_add(len)?)?;
+        let mut value = 0u64;
+        for i in 0..len {
+            let byte = if little { bytes[len - 1 - i] } else { bytes[i] };
+            value = value << 8 | u64::from(byte);
+        }
+        Some(value)
+    };
+    let word = if wide { 8 } else { 4 };
+    let (phoff, phentsize, phnum) = if wide {
+        (read(0x20, 8)?, read(0x36, 2)?, read(0x38, 2)?)
+    } else {
+        (read(0x1c, 4)?, read(0x2a, 2)?, read(0x2c, 2)?)
+    };
+    let c_string = |at: u64| -> Option<String> {
+        let rest = data.get(usize::try_from(at).ok()?..)?;
+        let len = rest.iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&rest[..len]).into_owned())
+    };
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    let mut paths = Vec::new();
+    for i in 0..phnum {
+        let header = phoff + i * phentsize;
+        let kind = read(header, 4)?;
+        let (offset, vaddr, filesz) = if wide {
+            (
+                read(header + 8, 8)?,
+                read(header + 16, 8)?,
+                read(header + 32, 8)?,
+            )
+        } else {
+            (
+                read(header + 4, 4)?,
+                read(header + 8, 4)?,
+                read(header + 16, 4)?,
+            )
+        };
+        match kind {
+            PT_LOAD => loads.push((vaddr, offset, filesz)),
+            PT_DYNAMIC => dynamic = Some((offset, filesz)),
+            PT_INTERP => paths.extend(c_string(offset)),
+            _ => {}
+        }
+    }
+    let Some((offset, size)) = dynamic else {
+        return Some(paths);
+    };
+    let mut strtab = None;
+    let mut run_paths = Vec::new();
+    let mut entry = offset;
+    while entry + 2 * word <= offset + size {
+        let tag = read(entry, word as usize)?;
+        let value = read(entry + word, word as usize)?;
+        match tag {
+            0 => break,
+            DT_STRTAB => strtab = Some(value),
+            DT_RPATH | DT_RUNPATH => run_paths.push(value),
+            _ => {}
+        }
+        entry += 2 * word;
+    }
+    // `DT_STRTAB` is an address, which a load segment maps to a file offset.
+    let strtab = strtab?;
+    let (vaddr, file_offset, _) = loads
+        .iter()
+        .find(|&&(vaddr, _, filesz)| (vaddr..vaddr + filesz).contains(&strtab))?;
+    let strtab = strtab - vaddr + file_offset;
+    for at in run_paths {
+        paths.extend(c_string(strtab + at)?.split(':').map(String::from));
+    }
+    Some(paths)
+}
+
+/// The store roots among the paths the dynamic loader reads for `data`.
+fn elf_loader_roots(data: &[u8], store: &str) -> Vec<String> {
+    let prefix = format!("{store}/");
+    elf_loader_paths(data)
+        .iter()
+        .filter_map(|p| p.strip_prefix(&prefix))
+        .filter_map(|rest| rest.split('/').next())
+        .filter(|base| hash_of(base).is_some())
+        .map(|base| format!("{prefix}{base}"))
+        .collect()
 }
 
 /// Hashes of the store paths named in `allowed`.
@@ -296,7 +415,13 @@ fn check(args: &Args) -> Result<String, String> {
         } else {
             std::fs::read(&path).map_err(|e| io(&path, e))?
         };
-        let hashes = hashes_in(&data);
+        let mut hashes = hashes_in(&data);
+        if args.allow_loader_paths {
+            let roots = elf_loader_roots(&data, &store_str);
+            for hash in allowed_hashes(&roots) {
+                hashes.remove(hash.as_bytes());
+            }
+        }
         let mut by_path: Vec<(&str, Vec<usize>)> = Vec::new();
         for (at, hash) in find_hashes(&data, &hashes) {
             let target = hashes[hash].as_str();
@@ -401,6 +526,76 @@ mod tests {
             found[SRC.as_bytes()],
             format!("/nix/store/{SRC}-skeptiva-ai-master")
         );
+    }
+
+    /// A 64-bit little-endian ELF file with an interpreter and a run path,
+    /// the shape of every binary a Nix cc wrapper links for Linux.
+    fn elf_with(interp: &str, runpath: &str) -> Vec<u8> {
+        let mut strtab = vec![0u8];
+        strtab.extend_from_slice(runpath.as_bytes());
+        strtab.push(0);
+        let interp_at = 0x200u64;
+        let strtab_at = 0x300u64;
+        let dynamic_at = 0x400u64;
+        let vaddr = 0x40_0000u64;
+        let mut data = vec![0u8; 0x500];
+        data[..4].copy_from_slice(b"\x7fELF");
+        data[4] = 2;
+        data[5] = 1;
+        let put = |data: &mut Vec<u8>, at: u64, value: u64, len: usize| {
+            let at = at as usize;
+            data[at..at + len].copy_from_slice(&value.to_le_bytes()[..len]);
+        };
+        put(&mut data, 0x20, 0x40, 8);
+        put(&mut data, 0x36, 56, 2);
+        put(&mut data, 0x38, 3, 2);
+        let headers = [
+            (3u64, interp_at, interp_at + vaddr, interp.len() as u64 + 1),
+            (1, 0, vaddr, 0x500),
+            (2, dynamic_at, dynamic_at + vaddr, 48),
+        ];
+        for (i, (kind, offset, address, size)) in headers.into_iter().enumerate() {
+            let header = 0x40 + 56 * i as u64;
+            put(&mut data, header, kind, 4);
+            put(&mut data, header + 8, offset, 8);
+            put(&mut data, header + 16, address, 8);
+            put(&mut data, header + 32, size, 8);
+        }
+        data[0x200..0x200 + interp.len()].copy_from_slice(interp.as_bytes());
+        data[0x300..0x300 + strtab.len()].copy_from_slice(&strtab);
+        put(&mut data, dynamic_at, 5, 8);
+        put(&mut data, dynamic_at + 8, strtab_at + vaddr, 8);
+        put(&mut data, dynamic_at + 16, 29, 8);
+        put(&mut data, dynamic_at + 24, 1, 8);
+        data
+    }
+
+    #[test]
+    fn elf_loader_roots_are_the_interpreter_and_the_run_path() {
+        let interp = format!("/nix/store/{LIBC}-glibc/lib/ld-linux-x86-64.so.2");
+        let runpath = format!("/nix/store/{LIBC}-glibc/lib:/nix/store/{SRC}-openssl/lib:$ORIGIN");
+        let roots = elf_loader_roots(&elf_with(&interp, &runpath), "/nix/store");
+        assert_eq!(
+            roots,
+            vec![
+                format!("/nix/store/{LIBC}-glibc"),
+                format!("/nix/store/{LIBC}-glibc"),
+                format!("/nix/store/{SRC}-openssl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn elf_loader_paths_of_this_test_binary_name_its_interpreter() {
+        let data = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let paths = elf_loader_paths(&data);
+        assert!(paths.iter().any(|p| p.contains("ld-linux")), "{paths:?}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_elf_has_no_loader_paths() {
+        assert!(elf_loader_paths(b"MZ\x90\0 a PE file").is_empty());
+        assert!(elf_loader_paths(b"\x7fELF").is_empty());
     }
 
     #[test]

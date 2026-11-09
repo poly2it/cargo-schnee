@@ -2557,9 +2557,6 @@ pub fn run_plan_nix(
         }
     }
 
-    // A linked Linux binary may refer to the C library and the GCC runtime
-    // besides the libraries it links, which only its build sees.
-    let linked_runtime = references::linked_runtime(&target_cc_store, &store_paths::store_dir());
     let mut known_runtime: Vec<String> = target_cc_closure
         .iter()
         .chain(&sys_build_closure)
@@ -2610,7 +2607,6 @@ pub fn run_plan_nix(
     let runtime_units = references::runtime_units(&nix_units, &key_to_idx);
     let reference_policy = references::Policy {
         tool_drv: &refs_tool_drv,
-        runtime: &linked_runtime,
         known: &known_runtime,
         runtime_units: &runtime_units,
     };

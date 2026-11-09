@@ -780,12 +780,12 @@ PDB, and clang-cl records each object's own path in its CodeView data. Neither
 offers a remapping, so the hashes in PDB, rlib and `.lib` files are overwritten
 with `e`.
 
-Each unit whose code reaches a root declares what its output may refer to in
-`allowedReferences`. A library may refer to nothing, and neither may a Windows
-binary. A linked Linux binary may refer to the C library, the GCC runtime and
-the store paths of the `cargo:rustc-link-search` directories it links against.
-Those paths are known only once the build scripts have run, so `schnee-refs`
-checks this contract inside the build instead of Nix. A unit with any other
+Each unit whose code reaches a root declares what its output may refer to. A
+library may refer to nothing, which Nix checks through `allowedReferences`. A
+linked binary may refer to the store paths its dynamic loader reads, that is
+the interpreter and the run path of each ELF file, so a Windows binary may
+refer to nothing. The linker writes those paths, so `schnee-refs` checks this
+contract inside the build instead of Nix. A unit with any other
 reference fails and names the file and the bytes around the path:
 
 ```
