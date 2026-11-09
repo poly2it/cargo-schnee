@@ -205,6 +205,7 @@ fn literal_paths(data: &[u8], store: &str, allowed: &[&str]) -> HashMap<Vec<u8>,
         }
         let len = rest.iter().take_while(|b| name_char(b)).count();
         let root = String::from_utf8_lossy(&rest[..len]);
+        let root = root.trim_end_matches('.');
         found
             .entry(hash.as_bytes().to_vec())
             .or_insert_with(|| format!("{prefix}{root}"));
@@ -398,7 +399,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[SRC.as_bytes()],
-            format!("/nix/store/{SRC}-skeptiva-ai-master..")
+            format!("/nix/store/{SRC}-skeptiva-ai-master")
         );
     }
 

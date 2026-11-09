@@ -288,12 +288,11 @@ pub(super) fn contract(
 
 /// Shell fragment that runs `schnee-refs` over `$out` once the compiler
 /// has succeeded. It rewrites the diagnostics to hash-free paths, scrubs
-/// the CodeView records of an MSVC target, and fails the unit with a report on any other
-/// reference outside `contract`. `__linked` holds the link-search roots
-/// the compile script collected.
+/// the CodeView records of an MSVC target, and fails the unit with a
+/// report on any other reference outside `contract`. `__linked` holds the
+/// link-search roots the compile script collected.
 pub(super) fn check_fragment(
     tool_drv: &str,
-    unit: &NixUnit,
     target: &TargetConfig,
     contract: &Contract,
 ) -> Result<String> {

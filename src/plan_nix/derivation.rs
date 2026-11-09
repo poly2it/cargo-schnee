@@ -257,7 +257,7 @@ pub(super) fn construct_derivation(
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
     let contract = super::references::contract(unit, target, references)?;
-    let check = super::references::check_fragment(references.tool_drv, unit, target, &contract)?;
+    let check = super::references::check_fragment(references.tool_drv, target, &contract)?;
     let rustc_remaps = rustc_remaps(unit, dep_drv_map, src_store, resolved_sysroot)?;
 
     // Decide whether this unit should be linted.  Doc and BuildScriptRun
