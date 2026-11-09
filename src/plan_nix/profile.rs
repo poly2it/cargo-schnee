@@ -517,8 +517,10 @@ shared = { path = "../shared" }
                 &[],
                 &[],
                 &[],
+                &[],
                 "/src",
                 &[],
+                "",
             )
             .unwrap();
             let tokens: Vec<&str> = script.split_whitespace().collect();

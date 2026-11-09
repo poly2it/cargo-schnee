@@ -112,10 +112,12 @@ impl<Q: FnMut(&str) -> Result<Option<String>>> BuildTrace<'_, Q> {
         if let Some(known) = self.outputs.get(drv_path) {
             return Ok(known.clone());
         }
-        let json = *self
-            .jsons
-            .get(drv_path)
-            .with_context(|| format!("no derivation recorded for {drv_path}"))?;
+        // The only input that is not a unit is the `schnee-refs` tool,
+        // which has no inputs of its own and so is keyed by its own path.
+        let Some(&json) = self.jsons.get(drv_path) else {
+            let path = (self.query)(drv_path)?;
+            return Ok(self.remember(drv_path, path));
+        };
         let mut inputs = HashMap::new();
         for input in input_drv_paths(json)? {
             match self.output(&input)? {

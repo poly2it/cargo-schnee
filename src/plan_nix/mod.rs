@@ -14,6 +14,7 @@ pub(crate) mod graph_drv;
 pub mod pipeline;
 mod profile;
 mod realise;
+mod references;
 mod refs_tool;
 pub(crate) mod store_paths;
 mod unit_graph;
@@ -417,12 +418,19 @@ pub fn diagnostic_path_remaps(
             }
         })
         .collect();
+    // rustc reports each source under its hash-free path, see
+    // `references`, and a build script or the linker under its store path.
     slices
         .into_iter()
         .chain(std::iter::once((
             format!("{src_store}/"),
             format!("{}/", project_dir.display()),
         )))
+        .flat_map(|(from, to)| {
+            let virtual_from = references::virtual_path(from.trim_end_matches('/'))
+                .map(|v| (format!("{v}/"), to.clone()));
+            std::iter::once((from, to)).chain(virtual_from)
+        })
         .collect()
 }
 
@@ -2549,6 +2557,36 @@ pub fn run_plan_nix(
         }
     }
 
+    // A linked Linux binary may refer to the C library, the GCC runtime and
+    // the libraries pkg-config hands its build scripts.
+    let store_dir = store_paths::store_dir();
+    let mut linked_runtime = references::linked_runtime(&target_cc_store, &store_dir);
+    linked_runtime.extend(sys_build_closure.iter().cloned());
+    linked_runtime.sort();
+    linked_runtime.dedup();
+    let mut known_runtime: Vec<String> = target_cc_closure
+        .iter()
+        .chain(&sys_build_closure)
+        .chain(&passthru_closure)
+        .cloned()
+        .collect();
+    known_runtime.sort();
+    known_runtime.dedup();
+    let refs_tool_drv = register_standalone(
+        daemon.as_mut(),
+        &references::tool_drv_json(
+            &rustc_str,
+            &rustc_store,
+            &rustc_closure,
+            &host_cc_bin_dir,
+            &host_cc_closure,
+            &bash_path,
+            &bash_store,
+            &coreutils_store,
+            &target.nix_system,
+        ),
+    )?;
+
     // Pre-flight: warn about system libraries that pkg-config can't find.
     check_system_libraries(&nix_units, &pkg_config_bin, &pkg_config_path_env);
 
@@ -2573,6 +2611,13 @@ pub fn run_plan_nix(
         .enumerate()
         .map(|(i, u)| (u.key.clone(), i))
         .collect();
+    let runtime_units = references::runtime_units(&nix_units, &key_to_idx);
+    let reference_policy = references::Policy {
+        tool_drv: &refs_tool_drv,
+        runtime: &linked_runtime,
+        known: &known_runtime,
+        runtime_units: &runtime_units,
+    };
 
     let topo_levels = {
         let _s = tracing::info_span!("compute_topo_levels", units = nix_units.len()).entered();
@@ -2691,6 +2736,7 @@ pub fn run_plan_nix(
                 clippy_lint_args,
                 path_prefix_remaps,
                 &setup_scripts,
+                &reference_policy,
             )?;
             tracing::debug!(
                 "Adding derivation for {}: {}",
@@ -2909,29 +2955,28 @@ pub(crate) fn construct_aggregator_drv(
         &bash_store,
         &coreutils_store,
     )?;
-    register_aggregator(NixDaemonConn::connect().ok().as_mut(), &json)
+    register_standalone(NixDaemonConn::connect().ok().as_mut(), &json)
 }
 
-/// Register the aggregator `json` over `conn`, or with `nix derivation add`
-/// when there is no daemon or it fails. Returns the `.drv` path.
-fn register_aggregator(
+/// Register `drv`, a derivation outside the unit graph, over `conn`, or with
+/// `nix derivation add` when there is no daemon or it fails. Returns the
+/// `.drv` path.
+fn register_standalone(
     conn: Option<&mut NixDaemonConn>,
     json: &serde_json::Value,
 ) -> Result<String> {
-    let name = json["name"]
-        .as_str()
-        .context("aggregator derivation has no name")?;
+    let name = json["name"].as_str().context("derivation has no name")?;
     let drv = vendor_farm::PlannedDrv::new(name, json)?;
     if let Some(conn) = conn {
         match vendor_farm::register_planned_over(conn, std::slice::from_ref(&drv)) {
             Ok(_) => return Ok(drv.path),
-            Err(e) => info!("Daemon registration of the aggregator failed: {e:#}, using the CLI"),
+            Err(e) => info!("Daemon registration of {name} failed: {e:#}, using the CLI"),
         }
     }
     let path = nix_derivation_add(json)?;
     anyhow::ensure!(
         path == drv.path,
-        "nix derivation add registered the aggregator at {path}, expected {}",
+        "nix derivation add registered {name} at {path}, expected {}",
         drv.path
     );
     Ok(path)
@@ -3101,7 +3146,7 @@ mod tests {
         )
         .unwrap();
         let (mut conn, handle) = fake::connect(std::collections::HashSet::new());
-        let path = register_aggregator(Some(&mut conn), &json).unwrap();
+        let path = register_standalone(Some(&mut conn), &json).unwrap();
         drop(conn);
         let requests = handle.join().unwrap();
         assert!(path.ends_with("-app-build-aggregator.drv"), "{path}");

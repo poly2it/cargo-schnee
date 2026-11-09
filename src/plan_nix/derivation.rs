@@ -1,4 +1,5 @@
 use super::pipeline::PipelineRole;
+use super::references::{Contract, Policy, Remap, normalised};
 use super::util::{TEST_MANIFEST_DIR_FD, collect_store_paths, shell_quote, test_manifest_dir};
 use super::{NixUnit, TargetConfig, UnitKind};
 use crate::nix_encoding::{extract_hash_part, nix_base32_encode};
@@ -251,9 +252,18 @@ pub(super) fn construct_derivation(
     // text, so the scripts and their reference closures are mounted with
     // no extra plumbing.
     setup_scripts: &[String],
+    references: &Policy<'_>,
 ) -> Result<serde_json::Value> {
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
+    let contract = super::references::contract(unit, target, references)?;
+    let check = match contract {
+        Contract::Allowed(_) => {
+            super::references::check_fragment(references.tool_drv, unit, target)?
+        }
+        Contract::Unchecked => String::new(),
+    };
+    let rustc_remaps = rustc_remaps(unit, dep_drv_map, src_store, resolved_sysroot)?;
 
     // Decide whether this unit should be linted.  Doc and BuildScriptRun
     // are excluded — Doc runs rustdoc, BuildScriptRun executes a binary.
@@ -270,6 +280,16 @@ pub(super) fn construct_derivation(
     let pkg_config = reads_pkg_config(unit, units, key_to_idx, pkg_config_packages);
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
+            &c_remaps(
+                unit,
+                dep_drv_map,
+                [
+                    cc_closure,
+                    if pkg_config { sys_build_closure } else { &[] },
+                    passthru_closure,
+                ],
+                vendored_crates_read_by(unit, units, key_to_idx),
+            )?,
             unit,
             units,
             key_to_idx,
@@ -298,6 +318,7 @@ pub(super) fn construct_derivation(
             &coreutils_bin_dir,
             target,
             document_private_items,
+            &rustc_remaps,
             path_prefix_remaps,
             src_store,
             setup_scripts,
@@ -315,9 +336,11 @@ pub(super) fn construct_derivation(
             target,
             win_sdk_lib_dirs,
             if use_clippy { clippy_lint_args } else { &[] },
+            &rustc_remaps,
             path_prefix_remaps,
             src_store,
             setup_scripts,
+            &check,
         )?,
     };
 
@@ -337,6 +360,12 @@ pub(super) fn construct_derivation(
     // environment variable.
     if joins_jobserver(unit, units, key_to_idx) {
         env.insert("__jobserver".into(), serde_json::Value::String("1".into()));
+    }
+    if let Contract::Allowed(allowed) = &contract {
+        env.insert(
+            "allowedReferences".into(),
+            serde_json::Value::String(allowed.join(" ")),
+        );
     }
 
     // inputDrvs
@@ -376,6 +405,11 @@ pub(super) fn construct_derivation(
                 .entry(drv.clone())
                 .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
         }
+    }
+    if let Contract::Allowed(_) = contract {
+        input_drvs
+            .entry(references.tool_drv.to_string())
+            .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
     }
     // For linking: add every build-script-run output whose link directives
     // this unit replays.  The script builder walks the same set, so an output
@@ -450,6 +484,58 @@ pub(super) fn construct_derivation(
         "inputSrcs": input_srcs_vec,
         "outputs": { "out": { "hashAlgo": "sha256", "method": "nar" } }
     }))
+}
+
+/// The inputs rustc or rustdoc may name in `unit`'s output: its sources,
+/// the sysroot whose `rust-src` component the standard library's debug
+/// info points into, and the build script output `include!` reads from.
+/// Dependency outputs are left out, because only the linker sees them.
+fn rustc_remaps(
+    unit: &NixUnit,
+    dep_drv_map: &HashMap<String, String>,
+    src_store: &str,
+    sysroot: &str,
+) -> Result<Vec<Remap>> {
+    let store_dir = super::store_paths::store_dir();
+    let mut remaps: Vec<Remap> = [src_store, &unit.manifest_dir, &unit.source_file, sysroot]
+        .into_iter()
+        .filter_map(|p| super::store_paths::store_path_of(p, &store_dir))
+        .filter_map(Remap::store)
+        .collect();
+    if let Some(drv) = unit
+        .build_script_dep
+        .as_ref()
+        .and_then(|k| dep_drv_map.get(k))
+    {
+        remaps.push(Remap::output_of(drv)?);
+    }
+    Ok(normalised(remaps))
+}
+
+/// The inputs a C or C++ compiler run by `unit`, a build script run, may
+/// name in its objects: the toolchain and the headers of `closures`, the
+/// crates the script reads, the outputs of the build scripts it takes
+/// `DEP_*` variables from, and its own `OUT_DIR`.
+fn c_remaps<const N: usize>(
+    unit: &NixUnit,
+    dep_drv_map: &HashMap<String, String>,
+    closures: [&[String]; N],
+    vendored: HashSet<String>,
+) -> Result<Vec<Remap>> {
+    let mut remaps: Vec<Remap> = closures
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .chain(vendored.iter().map(String::as_str))
+        .filter_map(Remap::store)
+        .collect();
+    for (key, _) in &unit.links_dep_keys {
+        if let Some(drv) = dep_drv_map.get(key) {
+            remaps.push(Remap::output_of(drv)?);
+        }
+    }
+    remaps.push(Remap::own_output(unit));
+    Ok(normalised(remaps))
 }
 
 /// Build the `--remap-path-prefix` argument tokens for a unit.
@@ -596,6 +682,8 @@ pub(super) fn build_compile_script(
     // arg.  Used to forward post-`--` clippy lint flags such as
     // `--deny warnings`; empty for normal compile units.
     extra_rustc_args: &[String],
+    // Inputs rustc reports under hash-free paths, see `rustc_remaps`.
+    remaps: &[Remap],
     // `--remap-path-prefix` rules.  See `construct_derivation` doc.
     path_prefix_remaps: &[(String, String)],
     // Project-src store path; remaps with `src_relative = ""` rewrite this
@@ -603,6 +691,8 @@ pub(super) fn build_compile_script(
     src_store: &str,
     // Matched setup script store paths.  See `construct_derivation` doc.
     setup_scripts: &[String],
+    // Runs `schnee-refs` once rustc succeeds, empty for an unchecked unit.
+    check: &str,
 ) -> Result<String> {
     let mut parts = vec![
         // Source file
@@ -667,14 +757,15 @@ pub(super) fn build_compile_script(
     }
 
     // --emit: check units emit metadata only (no codegen/link),
-    // proc-macro crates don't emit metadata (matching cargo).
+    // proc-macro crates don't emit metadata (matching cargo).  Nothing
+    // reads dep-info, which lists every input by its store path.
     parts.push("--emit".into());
     if unit.kind == UnitKind::Check {
-        parts.push("dep-info,metadata".into());
+        parts.push("metadata".into());
     } else if is_proc_macro {
-        parts.push("dep-info,link".into());
+        parts.push("link".into());
     } else {
-        parts.push("dep-info,metadata,link".into());
+        parts.push("metadata,link".into());
     }
 
     // --out-dir $out
@@ -721,7 +812,9 @@ pub(super) fn build_compile_script(
     // per-build content-addressed hash; empty `src_relative` rewrites the
     // project-src root itself.  rustc resolves multiple remaps with
     // "last matching wins" — sort shortest-first so longer (more specific)
-    // entries override shorter ones for paths that match both.
+    // entries override shorter ones for paths that match both.  The
+    // caller's rules come after the hash-free ones so they win.
+    parts.extend(super::references::rustc_args(remaps));
     parts.extend(remap_args(
         path_prefix_remaps,
         src_store,
@@ -755,8 +848,9 @@ pub(super) fn build_compile_script(
         let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
         // Read cargo: directives from own build script output
         script.push_str(&format!(
-            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; export "${{kv%%=*}}=${{kv#*=}}" ;; cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
+            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; v="${{kv#*=}}"; export "${{kv%%=*}}=$v"; {env_remap};; cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
             ph = bs_placeholder,
+            env_remap = super::references::rustc_env_remap(&super::store_paths::store_dir()),
         ));
     }
 
@@ -828,6 +922,7 @@ pub(super) fn build_compile_script(
             unit.extra_filename,
         ));
     }
+    script.push_str(check);
     script.push_str("exit $__rs");
 
     Ok(script)
@@ -845,6 +940,7 @@ fn build_doc_script(
     coreutils_bin_dir: &str,
     target: &TargetConfig,
     document_private_items: bool,
+    remaps: &[Remap],
     path_prefix_remaps: &[(String, String)],
     src_store: &str,
     // Matched setup script store paths.  See `construct_derivation` doc.
@@ -906,11 +1002,12 @@ fn build_doc_script(
     // flag behind `-Z unstable-options`. The pinned toolchain reports as
     // stable, so `RUSTC_BOOTSTRAP` is exported below to let rustdoc accept the
     // unstable flag. Only emit the gate when there are remaps to apply.
-    let remap = remap_args(
+    let mut remap = super::references::rustc_args(remaps);
+    remap.extend(remap_args(
         path_prefix_remaps,
         src_store,
         unit.sliced_crate_rel.as_deref(),
-    );
+    ));
     let needs_unstable_options = !remap.is_empty();
     if needs_unstable_options {
         parts.push("-Z".into());
@@ -938,8 +1035,9 @@ fn build_doc_script(
     {
         let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
         script.push_str(&format!(
-            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; export "${{kv%%=*}}=${{kv#*=}}" ;; esac; done < {ph}/output; fi && "#,
+            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; v="${{kv#*=}}"; export "${{kv%%=*}}=$v"; {env_remap};; esac; done < {ph}/output; fi && "#,
             ph = bs_placeholder,
+            env_remap = super::references::rustc_env_remap(&super::store_paths::store_dir()),
         ));
     }
 
@@ -1010,6 +1108,8 @@ const OUTPUT_REWRITE: &str = concat!(
 /// Build the shell script for running a build script.
 #[allow(clippy::too_many_arguments)]
 fn build_run_script(
+    // Inputs C and C++ compilers report under hash-free paths, see `c_remaps`.
+    c_remaps: &[Remap],
     unit: &NixUnit,
     units: &[NixUnit],
     key_to_idx: &HashMap<String, usize>,
@@ -1152,6 +1252,7 @@ fn build_run_script(
     for (k, v) in passthru_envs {
         script.push_str(&format!("export {}={} && ", k, shell_quote(v)));
     }
+    script.push_str(&super::references::c_flag_exports(c_remaps, target));
 
     // DEP_<LINKS>_<KEY> env vars from dependency build scripts
     for (dep_key, links_name) in &unit.links_dep_keys {
@@ -1363,6 +1464,16 @@ pub(super) fn self_placeholder(output_name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A policy under which no unit reaches a root, so no unit is checked.
+    fn test_policy() -> Policy<'static> {
+        Policy {
+            tool_drv: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-schnee-refs.drv",
+            runtime: &[],
+            known: &[],
+            runtime_units: Box::leak(Box::default()),
+        }
+    }
+
     #[test]
     fn missing_input_report_names_the_absent_path_and_keeps_the_status() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1457,6 +1568,7 @@ mod tests {
                 "/nix/store/coreutils/bin",
                 &target,
                 false,
+                &[],
                 &[],
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
                 &[],
@@ -1648,6 +1760,7 @@ mod tests {
             &TargetConfig::native(),
             false,
             &[],
+            &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
         )
@@ -1701,6 +1814,7 @@ mod tests {
             &TargetConfig::native(),
             false,
             &[],
+            &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
         )
@@ -1727,6 +1841,7 @@ mod tests {
             "/nix/store/coreutils/bin",
             &TargetConfig::native(),
             false,
+            &[],
             &root_remap(),
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
@@ -1759,6 +1874,7 @@ mod tests {
             &TargetConfig::native(),
             true,
             &[],
+            &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
         )
@@ -1784,6 +1900,7 @@ mod tests {
             "/nix/store/coreutils/bin",
             &TargetConfig::native(),
             true,
+            &[],
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
@@ -1812,6 +1929,7 @@ mod tests {
             &TargetConfig::native(),
             false,
             &[],
+            &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
         )
@@ -1838,6 +1956,7 @@ mod tests {
             "/nix/store/coreutils/bin",
             &TargetConfig::native(),
             false,
+            &[],
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
@@ -1877,8 +1996,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             setup_scripts,
+            "",
         )
         .unwrap()
     }
@@ -1957,6 +2078,7 @@ mod tests {
             &TargetConfig::native(),
             false,
             &[],
+            &[],
             SRC_STORE,
             &[SETUP_A.to_string()],
         )
@@ -1993,6 +2115,7 @@ mod tests {
             "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
         )]);
         let script = build_run_script(
+            &[],
             &units[1],
             &units,
             &key_to_idx,
@@ -2049,6 +2172,7 @@ mod tests {
             "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
         )]);
         let script = build_run_script(
+            &[],
             &units[1],
             &units,
             &key_to_idx,
@@ -2095,6 +2219,7 @@ mod tests {
             "/nix/store/dddddddddddddddddddddddddddddddd-bs.drv".to_string(),
         )]);
         let script = build_run_script(
+            &[],
             &units[1],
             &units,
             &key_to_idx,
@@ -2149,6 +2274,7 @@ mod tests {
             "/nix/store/coreutils/bin",
             &TargetConfig::native(),
             false,
+            &[],
             &[],
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project-src",
             &[],
@@ -2213,8 +2339,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-my-lib",
             &[],
+            "",
         )
         .unwrap()
     }
@@ -2323,8 +2451,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             &[],
+            "",
         )
         .unwrap()
     }
@@ -2425,6 +2555,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &test_policy(),
         )
         .unwrap();
         drv["env"]["__jobserver"].as_str().map(str::to_string)
@@ -2480,6 +2611,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &test_policy(),
         )
         .unwrap();
         drv["inputSrcs"]
@@ -2591,6 +2723,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &test_policy(),
         )
         .unwrap()
     }
@@ -2777,8 +2910,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             &[],
+            "",
         )
         .unwrap();
 
@@ -2851,8 +2986,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             &[],
+            "",
         )
         .unwrap();
 
@@ -2935,8 +3072,10 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             SRC_STORE,
             &[],
+            "",
         )
         .unwrap()
     }

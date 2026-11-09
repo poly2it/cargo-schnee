@@ -230,6 +230,15 @@ pub(crate) fn package_extra_includes(manifest: &str) -> Vec<String> {
     )
 }
 
+/// The `[package.metadata.schnee] runtime-references` entries of the
+/// manifest text `manifest`, each a store path or a store path name.
+pub(crate) fn package_runtime_references(manifest: &str) -> Vec<String> {
+    string_array(
+        manifest,
+        &["package", "metadata", "schnee", "runtime-references"],
+    )
+}
+
 /// The `[workspace.metadata.schnee] extra-includes` globs of the manifest
 /// text `manifest`, written relative to the workspace root.
 pub(crate) fn workspace_extra_includes(manifest: &str) -> Vec<String> {

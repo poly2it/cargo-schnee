@@ -74,7 +74,10 @@ fn context(data: &[u8], at: usize) -> String {
 
 /// Replaces each candidate hash in `data` with `e` repeated.
 fn scrub(data: &mut [u8], hashes: &HashMap<Vec<u8>, String>) -> usize {
-    let found: Vec<usize> = find_hashes(data, hashes).into_iter().map(|(at, _)| at).collect();
+    let found: Vec<usize> = find_hashes(data, hashes)
+        .into_iter()
+        .map(|(at, _)| at)
+        .collect();
     for &at in &found {
         data[at..at + HASH_LEN].fill(b'e');
     }
@@ -129,7 +132,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         }
     }
     if parsed.out.as_os_str().is_empty() {
-        return Err("usage: schnee-refs <out> [--allowed <paths>] [--scrub <suffix>] [--rewrite <name>]".into());
+        return Err(
+            "usage: schnee-refs <out> [--allowed <paths>] [--scrub <suffix>] [--rewrite <name>]"
+                .into(),
+        );
     }
     Ok(parsed)
 }
@@ -142,20 +148,27 @@ fn hash_of(base: &str) -> Option<&str> {
 
 /// Hashes of the store entries visible to the builder that `allowed` does
 /// not name, each with the entry's full path.
-fn disallowed_candidates(store: &Path, allowed: &[String]) -> Result<HashMap<Vec<u8>, String>, String> {
+fn disallowed_candidates(
+    store: &Path,
+    allowed: &[String],
+) -> Result<HashMap<Vec<u8>, String>, String> {
     let allowed: Vec<&str> = allowed
         .iter()
         .filter_map(|p| Path::new(p).file_name()?.to_str())
         .filter_map(hash_of)
         .collect();
-    let entries = std::fs::read_dir(store).map_err(|e| format!("cannot list {}: {e}", store.display()))?;
+    let entries =
+        std::fs::read_dir(store).map_err(|e| format!("cannot list {}: {e}", store.display()))?;
     let mut candidates = HashMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(hash) = hash_of(name) else { continue };
         if !allowed.contains(&hash) {
-            candidates.insert(hash.as_bytes().to_vec(), format!("{}/{name}", store.display()));
+            candidates.insert(
+                hash.as_bytes().to_vec(),
+                format!("{}/{name}", store.display()),
+            );
         }
     }
     Ok(candidates)
@@ -189,14 +202,28 @@ fn check(args: &Args) -> Result<String, String> {
         .ok_or_else(|| format!("{} is not a store path", out.display()))?;
     let candidates = disallowed_candidates(store, &args.allowed)?;
     let io = |path: &Path, e: std::io::Error| format!("{}: {e}", path.display());
-    let files = if out.is_dir() { files_below(out).map_err(|e| io(out, e))? } else { vec![out.clone()] };
+    let files = if out.is_dir() {
+        files_below(out).map_err(|e| io(out, e))?
+    } else {
+        vec![out.clone()]
+    };
     let mut report = String::new();
     for path in files {
         let meta = std::fs::symlink_metadata(&path).map_err(|e| io(&path, e))?;
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         let data = if meta.file_type().is_symlink() {
-            std::fs::read_link(&path).map_err(|e| io(&path, e))?.into_os_string().into_encoded_bytes()
-        } else if args.scrub_suffixes.iter().any(|s| name.ends_with(s.as_str())) {
+            std::fs::read_link(&path)
+                .map_err(|e| io(&path, e))?
+                .into_os_string()
+                .into_encoded_bytes()
+        } else if args
+            .scrub_suffixes
+            .iter()
+            .any(|s| name.ends_with(s.as_str()))
+        {
             let mut data = std::fs::read(&path).map_err(|e| io(&path, e))?;
             if scrub(&mut data, &candidates) > 0 {
                 std::fs::write(&path, &data).map_err(|e| io(&path, e))?;
@@ -222,9 +249,12 @@ fn check(args: &Args) -> Result<String, String> {
         }
         let shown = path.strip_prefix(out).unwrap_or(&path).display();
         for (target, offsets) in by_path {
+            let places = match offsets.len() {
+                1 => "1 place".to_string(),
+                n => format!("{n} places"),
+            };
             report.push_str(&format!(
-                "cargo-schnee: {shown} refers to {target} {} times, which is not a runtime reference of this unit:\n",
-                offsets.len()
+                "cargo-schnee: {shown} refers to {target} in {places}, which is not a runtime reference of this unit:\n"
             ));
             for &at in offsets.iter().take(3) {
                 report.push_str(&format!("    at byte {at}: {}\n", context(&data, at)));
@@ -287,7 +317,10 @@ mod tests {
         assert_eq!(scrub(&mut data, &candidates(&[SRC])), 1);
         assert_eq!(data.len(), len);
         let text = String::from_utf8(data).unwrap();
-        assert!(text.contains(&format!("/nix/store/{}-win-sdk/libucrt.lib", "e".repeat(32))));
+        assert!(text.contains(&format!(
+            "/nix/store/{}-win-sdk/libucrt.lib",
+            "e".repeat(32)
+        )));
     }
 
     #[test]
@@ -327,7 +360,11 @@ mod tests {
             format!("\0{store_str}/{LIBC}-glibc/lib\0{store_str}/{SRC}-src/main.rs\0"),
         )
         .unwrap();
-        std::fs::write(out.join("diagnostics"), format!("{store_str}/{SRC}-src/main.rs")).unwrap();
+        std::fs::write(
+            out.join("diagnostics"),
+            format!("{store_str}/{SRC}-src/main.rs"),
+        )
+        .unwrap();
         let args = Args {
             out: out.clone(),
             allowed: vec![libc.to_string_lossy().into_owned()],
