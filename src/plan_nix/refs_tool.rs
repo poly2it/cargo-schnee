@@ -11,8 +11,9 @@
 //!
 //! - In a file named by `--scrub`, the hash becomes `e` repeated, which no
 //!   store path hash contains. lld-link records every input it read in a
-//!   PDB and has no option to remap them, so this is the only way to keep
-//!   them out of a Windows unit's references.
+//!   PDB, and clang-cl records each object's own path in it, and neither
+//!   offers an option to remap them, so this is the only way to keep them
+//!   out of a Windows unit's references.
 //! - In a file named by `--rewrite`, `<store>/<hash>-<name>` becomes
 //!   `/schnee/<name>`, the name rustc already gives remapped paths.
 //! - Anywhere else, the reference is reported with the file and the bytes

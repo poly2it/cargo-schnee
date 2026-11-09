@@ -775,8 +775,9 @@ output under their store paths. rustc and rustdoc get `--remap-path-prefix`
 and C and C++ compilers run by build scripts get `-ffile-prefix-map` for every
 input they may name, so a source file, an `OUT_DIR` file read through
 `include!` or a C header appears as `/schnee/<name>/...` in panic messages and
-debug info. The PDB that lld-link writes for a Windows target records each
-library it read and offers no remapping, so the hashes in it are overwritten
+debug info. For a Windows target, lld-link records each library it read in the
+PDB, and clang-cl records each object's own path in its CodeView data. Neither
+offers a remapping, so the hashes in PDB, rlib and `.lib` files are overwritten
 with `e`.
 
 Each unit whose code reaches a root declares what its output may refer to in

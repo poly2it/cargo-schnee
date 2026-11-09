@@ -99,6 +99,8 @@ pub(super) fn rustc_args(remaps: &[Remap]) -> Vec<String> {
 /// The cc crate prefers `CFLAGS_<target>` over `CFLAGS`, so a target whose
 /// compiler is clang-cl gets its own variables, with each flag passed
 /// through `/clang:` because clang-cl accepts no `-f` flag of its own.
+/// clang-cl also leaves its `-cc1` command line out of the CodeView data,
+/// because the command line names the compiler's resource directory.
 pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String {
     let flags = |prefix: &str| {
         remaps
@@ -113,7 +115,7 @@ pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String 
     let mut s = export("CFLAGS", &gnu) + &export("CXXFLAGS", &gnu);
     if target.is_msvc() {
         let triple = target.target_triple.replace('-', "_");
-        let cl = flags("/clang:");
+        let cl = format!("{} /clang:-gno-codeview-command-line", flags("/clang:"));
         s += &export(&format!("CFLAGS_{triple}"), &cl);
         s += &export(&format!("CXXFLAGS_{triple}"), &cl);
     }
@@ -286,7 +288,7 @@ pub(super) fn contract(
 
 /// Shell fragment that runs `schnee-refs` over `$out` once the compiler
 /// has succeeded. It rewrites the diagnostics to hash-free paths, scrubs
-/// the PDB lld-link writes, and fails the unit with a report on any other
+/// the CodeView records of an MSVC target, and fails the unit with a report on any other
 /// reference outside `contract`. `__linked` holds the link-search roots
 /// the compile script collected.
 pub(super) fn check_fragment(
@@ -301,8 +303,8 @@ pub(super) fn check_fragment(
         Contract::Linked(_) => r#""$schneeRuntimeReferences $__linked""#,
     };
     let tool = downstream_placeholder(tool_drv, "out")?;
-    let scrub = if unit.needs_linker && target.is_msvc() {
-        " --scrub .pdb"
+    let scrub = if target.is_msvc() {
+        " --scrub .pdb --scrub .rlib --scrub .lib"
     } else {
         ""
     };
