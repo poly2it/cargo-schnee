@@ -257,12 +257,7 @@ pub(super) fn construct_derivation(
     let unit = &units[idx];
     let coreutils_bin_dir = format!("{}/bin", coreutils_store);
     let contract = super::references::contract(unit, target, references)?;
-    let check = match contract {
-        Contract::Allowed(_) => {
-            super::references::check_fragment(references.tool_drv, unit, target)?
-        }
-        Contract::Unchecked => String::new(),
-    };
+    let check = super::references::check_fragment(references.tool_drv, unit, target, &contract)?;
     let rustc_remaps = rustc_remaps(unit, dep_drv_map, src_store, resolved_sysroot)?;
 
     // Decide whether this unit should be linted.  Doc and BuildScriptRun
@@ -361,11 +356,20 @@ pub(super) fn construct_derivation(
     if joins_jobserver(unit, units, key_to_idx) {
         env.insert("__jobserver".into(), serde_json::Value::String("1".into()));
     }
-    if let Contract::Allowed(allowed) = &contract {
-        env.insert(
-            "allowedReferences".into(),
-            serde_json::Value::String(allowed.join(" ")),
-        );
+    match &contract {
+        Contract::Allowed(allowed) => {
+            env.insert(
+                "allowedReferences".into(),
+                serde_json::Value::String(allowed.join(" ")),
+            );
+        }
+        Contract::Linked(allowed) => {
+            env.insert(
+                "schneeRuntimeReferences".into(),
+                serde_json::Value::String(allowed.join(" ")),
+            );
+        }
+        Contract::Unchecked => {}
     }
 
     // inputDrvs
@@ -406,7 +410,7 @@ pub(super) fn construct_derivation(
                 .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
         }
     }
-    if let Contract::Allowed(_) = contract {
+    if contract != Contract::Unchecked {
         input_drvs
             .entry(references.tool_drv.to_string())
             .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
@@ -839,7 +843,7 @@ pub(super) fn build_compile_script(
     }
 
     // Initialize EXTRA_ARGS for build script directives
-    script.push_str(r#"EXTRA_ARGS="" && "#);
+    script.push_str(r#"EXTRA_ARGS="" && __linked="" && "#);
 
     // Parse build script output if we depend on one
     if let Some(ref bs_key) = unit.build_script_dep
@@ -848,9 +852,10 @@ pub(super) fn build_compile_script(
         let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
         // Read cargo: directives from own build script output
         script.push_str(&format!(
-            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; v="${{kv#*=}}"; export "${{kv%%=*}}=$v"; {env_remap};; cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
+            r#"export OUT_DIR={ph}/out_dir && if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-cfg=*) EXTRA_ARGS="$EXTRA_ARGS --cfg ${{line#cargo:rustc-cfg=}}" ;; cargo:rustc-env=*) kv="${{line#cargo:rustc-env=}}"; v="${{kv#*=}}"; export "${{kv%%=*}}=$v"; {env_remap};; cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) d="${{line#cargo:rustc-link-search=}}"; EXTRA_ARGS="$EXTRA_ARGS -L $d"; {link_root};; esac; done < {ph}/output; fi && "#,
             ph = bs_placeholder,
             env_remap = super::references::rustc_env_remap(&super::store_paths::store_dir()),
+            link_root = super::references::link_search_root(&super::store_paths::store_dir()),
         ));
     }
 
@@ -862,8 +867,9 @@ pub(super) fn build_compile_script(
             if let Some(bs_drv) = dep_drv_map.get(bs_key) {
                 let bs_placeholder = downstream_placeholder(bs_drv, "out")?;
                 script.push_str(&format!(
-                    r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) EXTRA_ARGS="$EXTRA_ARGS -L ${{line#cargo:rustc-link-search=}}" ;; esac; done < {ph}/output; fi && "#,
+                    r#"if [ -f {ph}/output ]; then while IFS= read -r line; do case "$line" in cargo:rustc-link-lib=*) EXTRA_ARGS="$EXTRA_ARGS -l ${{line#cargo:rustc-link-lib=}}" ;; cargo:rustc-link-search=*) d="${{line#cargo:rustc-link-search=}}"; EXTRA_ARGS="$EXTRA_ARGS -L $d"; {link_root};; esac; done < {ph}/output; fi && "#,
                     ph = bs_placeholder,
+                    link_root = super::references::link_search_root(&super::store_paths::store_dir()),
                 ));
             }
         }

@@ -2557,13 +2557,9 @@ pub fn run_plan_nix(
         }
     }
 
-    // A linked Linux binary may refer to the C library, the GCC runtime and
-    // the libraries pkg-config hands its build scripts.
-    let store_dir = store_paths::store_dir();
-    let mut linked_runtime = references::linked_runtime(&target_cc_store, &store_dir);
-    linked_runtime.extend(sys_build_closure.iter().cloned());
-    linked_runtime.sort();
-    linked_runtime.dedup();
+    // A linked Linux binary may refer to the C library and the GCC runtime
+    // besides the libraries it links, which only its build sees.
+    let linked_runtime = references::linked_runtime(&target_cc_store, &store_paths::store_dir());
     let mut known_runtime: Vec<String> = target_cc_closure
         .iter()
         .chain(&sys_build_closure)

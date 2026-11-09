@@ -120,6 +120,14 @@ pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String 
     s
 }
 
+/// Shell fragment, run where a build script's `cargo:rustc-link-search`
+/// value is in `$d`, adding the store root it names to `__linked`.
+pub(super) fn link_search_root(store_dir: &str) -> String {
+    format!(
+        r#"d="${{d#*=}}"; case "$d" in {store_dir}/*) r="${{d#{store_dir}/}}"; __linked="$__linked {store_dir}/${{r%%/*}}" ;; esac; "#
+    )
+}
+
 /// Shell fragment, run where a build script's `cargo:rustc-env` value is in
 /// `$v`, adding a remap for the store root the value names. A path that
 /// reaches rustc this way, such as a code generator's output directory
@@ -177,8 +185,16 @@ pub(super) enum Contract {
     /// The output is a build-time intermediate, such as a build script's
     /// output or a proc macro, and may refer to anything.
     Unchecked,
-    /// The output may refer to these store paths alone.
+    /// The output may refer to these store paths alone, which Nix checks
+    /// through `allowedReferences`.
     Allowed(Vec<String>),
+    /// The output may refer to these store paths and the store roots of the
+    /// `cargo:rustc-link-search` directories it links against, because the
+    /// linker records a directory it found a shared library in. Those roots
+    /// are known only once the build scripts have run, and listing every
+    /// library pkg-config could hand out would re-key the unit on each of
+    /// them, so `schnee-refs` alone checks this contract.
+    Linked(Vec<String>),
 }
 
 /// The runtime closure Nix's toolchain links every Linux binary against,
@@ -246,9 +262,10 @@ pub(super) fn declared_runtime_references(unit: &NixUnit, known: &[String]) -> R
 
 /// The contract of `unit`. A runtime unit that compiles a library may refer
 /// to nothing, because an rlib is linked rather than loaded. A runtime unit
-/// that links may refer to the policy's runtime paths and what its manifest
-/// declares, except on Windows, where nothing loads a store path at run
-/// time. Other units, tests among them, only run during the build.
+/// that links may refer to the policy's runtime paths, the libraries it
+/// links and what its manifest declares, except on Windows, where nothing
+/// loads a store path at run time. Other units, tests among them, only run
+/// during the build.
 pub(super) fn contract(
     unit: &NixUnit,
     target: &TargetConfig,
@@ -264,18 +281,25 @@ pub(super) fn contract(
     allowed.extend(declared_runtime_references(unit, policy.known)?);
     allowed.sort();
     allowed.dedup();
-    Ok(Contract::Allowed(allowed))
+    Ok(Contract::Linked(allowed))
 }
 
 /// Shell fragment that runs `schnee-refs` over `$out` once the compiler
 /// has succeeded. It rewrites the diagnostics to hash-free paths, scrubs
 /// the PDB lld-link writes, and fails the unit with a report on any other
-/// reference outside `allowedReferences`.
+/// reference outside `contract`. `__linked` holds the link-search roots
+/// the compile script collected.
 pub(super) fn check_fragment(
     tool_drv: &str,
     unit: &NixUnit,
     target: &TargetConfig,
+    contract: &Contract,
 ) -> Result<String> {
+    let allowed = match contract {
+        Contract::Unchecked => return Ok(String::new()),
+        Contract::Allowed(_) => r#""$allowedReferences""#,
+        Contract::Linked(_) => r#""$schneeRuntimeReferences $__linked""#,
+    };
     let tool = downstream_placeholder(tool_drv, "out")?;
     let scrub = if unit.needs_linker && target.is_msvc() {
         " --scrub .pdb"
@@ -283,7 +307,7 @@ pub(super) fn check_fragment(
         ""
     };
     Ok(format!(
-        r#"if [ $__rs = 0 ]; then {tool}/bin/schnee-refs $out --allowed "$allowedReferences" --rewrite diagnostics{scrub} || __rs=$?; fi; "#
+        r#"if [ $__rs = 0 ]; then {tool}/bin/schnee-refs $out --allowed {allowed} --rewrite diagnostics{scrub} || __rs=$?; fi; "#
     ))
 }
 

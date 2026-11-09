@@ -780,9 +780,11 @@ library it read and offers no remapping, so the hashes in it are overwritten
 with `e`.
 
 Each unit whose code reaches a root declares what its output may refer to in
-`allowedReferences`. A library may refer to nothing. A linked Linux binary may
-refer to the C library, the GCC runtime and the libraries pkg-config hands its
-build scripts. A Windows binary may refer to nothing. A unit with any other
+`allowedReferences`. A library may refer to nothing, and neither may a Windows
+binary. A linked Linux binary may refer to the C library, the GCC runtime and
+the store paths of the `cargo:rustc-link-search` directories it links against.
+Those paths are known only once the build scripts have run, so `schnee-refs`
+checks this contract inside the build instead of Nix. A unit with any other
 reference fails and names the file and the bytes around the path:
 
 ```
