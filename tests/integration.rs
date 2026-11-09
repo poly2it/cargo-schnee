@@ -1870,3 +1870,88 @@ fn fixture_concurrent_test_runs_see_their_own_checkout() {
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
 }
+
+/// The store path in `.schnee-roots` that roots the most recent build of
+/// `fixture_dir`.
+fn gc_root(fixture_dir: &Path) -> String {
+    let root = std::fs::read_dir(fixture_dir.join("target/.schnee-roots"))
+        .expect("No GC root")
+        .map(|e| e.unwrap().path())
+        .next()
+        .expect("No GC root");
+    std::fs::read_link(root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+/// A binary's runtime closure holds what it loads when it runs, here the C
+/// library and the GCC runtime. Its sources, the build script's `OUT_DIR`,
+/// the C headers and the toolchain stay build-time inputs, although
+/// `file!()`, `include!` and the debug info of C compiled into `OUT_DIR` all
+/// name them.
+#[test]
+#[ignore]
+fn fixture_runtime_references_are_declared() {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime-references");
+    let manifest = fixture_dir.join("Cargo.toml");
+
+    clean_target(&fixture_dir);
+    run_schnee_build(&manifest);
+
+    let output = Command::new(fixture_dir.join("target/debug/runtime-references"))
+        .output()
+        .expect("Failed to run built binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let printed: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(printed.len(), 3, "{stdout}");
+    assert!(printed[0].starts_with("/schnee/"), "{stdout}");
+    assert!(printed[1].starts_with("/schnee/"), "{stdout}");
+    assert!(printed[1].ends_with("/out_dir/generated.rs"), "{stdout}");
+    assert_eq!(printed[2], "42");
+
+    let alive = nix_lines("nix-store", &["--query", "--requisites", &gc_root(&fixture_dir)]);
+    let binary = alive
+        .iter()
+        .find(|p| p.ends_with("-runtime-references-0.1.0-runtime-references"))
+        .expect("the binary's output is rooted");
+    let name = |path: &str| path["/nix/store/".len() + 33..].to_string();
+    for reference in nix_lines("nix-store", &["--query", "--references", binary]) {
+        let n = name(&reference);
+        assert!(
+            n.starts_with("glibc-") || (n.starts_with("gcc-") && n.ends_with("-lib")),
+            "the binary refers to the build-time input {reference}"
+        );
+    }
+}
+
+/// `env!("CARGO_MANIFEST_DIR")` bakes the crate's source path into the
+/// binary, which no remapping can hide. The build fails and names the file
+/// and the path.
+#[test]
+#[ignore]
+fn fixture_runtime_reference_violation_names_the_file() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/runtime-references-violation");
+    clean_target(&fixture_dir);
+
+    let output = Command::new(cargo_schnee_bin())
+        .arg("schnee")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(fixture_dir.join("Cargo.toml"))
+        .output()
+        .expect("Failed to execute cargo-schnee");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(!output.status.success(), "the build succeeded:\n{stderr}");
+    assert!(
+        stderr.contains("not a runtime reference"),
+        "the failure does not explain itself:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("runtime-references-violation-"),
+        "the failure does not name the file:\n{stderr}"
+    );
+}
