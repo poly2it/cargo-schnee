@@ -153,11 +153,7 @@ fn disallowed_candidates(
     store: &Path,
     allowed: &[String],
 ) -> Result<HashMap<Vec<u8>, String>, String> {
-    let allowed: Vec<&str> = allowed
-        .iter()
-        .filter_map(|p| Path::new(p).file_name()?.to_str())
-        .filter_map(hash_of)
-        .collect();
+    let allowed = allowed_hashes(allowed);
     let entries =
         std::fs::read_dir(store).map_err(|e| format!("cannot list {}: {e}", store.display()))?;
     let mut candidates = HashMap::new();
@@ -173,6 +169,56 @@ fn disallowed_candidates(
         }
     }
     Ok(candidates)
+}
+
+/// Hashes of the store paths written out as `<store>/<hash>-<name>` in
+/// `data` that `allowed` does not name, each with the path's root.
+///
+/// Nix only looks for the hashes of a build's inputs, so a path baked in
+/// from another derivation's inputs, such as the source directory of a
+/// library compiled elsewhere, is not a reference here. It still names a
+/// build-time input, and any later derivation with that input among its
+/// own turns it into one.
+fn literal_paths(data: &[u8], store: &str, allowed: &[&str]) -> HashMap<Vec<u8>, String> {
+    let prefix = format!("{store}/");
+    let name_char = |b: &u8| b.is_ascii_alphanumeric() || b"+-._?=".contains(b);
+    let mut found = HashMap::new();
+    let mut at = 0;
+    while let Some(i) = data[at..]
+        .windows(prefix.len())
+        .position(|w| w == prefix.as_bytes())
+    {
+        let start = at + i + prefix.len();
+        at = start;
+        let rest = &data[start..];
+        let Some(hash) = rest.get(..HASH_LEN) else {
+            break;
+        };
+        let Ok(hash) = std::str::from_utf8(hash) else {
+            continue;
+        };
+        if rest.get(HASH_LEN) != Some(&b'-')
+            || !hash.bytes().all(is_hash_char)
+            || allowed.contains(&hash)
+        {
+            continue;
+        }
+        let len = rest.iter().take_while(|b| name_char(b)).count();
+        let root = String::from_utf8_lossy(&rest[..len]);
+        found
+            .entry(hash.as_bytes().to_vec())
+            .or_insert_with(|| format!("{prefix}{root}"));
+    }
+    found
+}
+
+/// Hashes of the store paths named in `allowed`.
+fn allowed_hashes(allowed: &[String]) -> Vec<&str> {
+    allowed
+        .iter()
+        .filter_map(|p| Path::new(p).file_name()?.to_str())
+        .filter_map(hash_of)
+        .collect()
 }
 
 /// Every regular file and symlink below `dir`, sorted so reports are stable.
@@ -202,6 +248,14 @@ fn check(args: &Args) -> Result<String, String> {
         .parent()
         .ok_or_else(|| format!("{} is not a store path", out.display()))?;
     let candidates = disallowed_candidates(store, &args.allowed)?;
+    let allowed = allowed_hashes(&args.allowed);
+    let store_str = store.to_string_lossy();
+    // The sandbox's inputs, plus the paths a file writes out in full.
+    let hashes_in = |data: &[u8]| {
+        let mut hashes = literal_paths(data, &store_str, &allowed);
+        hashes.extend(candidates.iter().map(|(h, p)| (h.clone(), p.clone())));
+        hashes
+    };
     let io = |path: &Path, e: std::io::Error| format!("{}: {e}", path.display());
     let files = if out.is_dir() {
         files_below(out).map_err(|e| io(out, e))?
@@ -226,13 +280,14 @@ fn check(args: &Args) -> Result<String, String> {
             .any(|s| name.ends_with(s.as_str()))
         {
             let mut data = std::fs::read(&path).map_err(|e| io(&path, e))?;
-            if scrub(&mut data, &candidates) > 0 {
+            let hashes = hashes_in(&data);
+            if scrub(&mut data, &hashes) > 0 {
                 std::fs::write(&path, &data).map_err(|e| io(&path, e))?;
             }
             continue;
         } else if args.rewrite_names.iter().any(|n| n == name) {
             let data = std::fs::read(&path).map_err(|e| io(&path, e))?;
-            let rewritten = rewrite(&data, &store.to_string_lossy(), &candidates);
+            let rewritten = rewrite(&data, &store_str, &hashes_in(&data));
             if rewritten != data {
                 std::fs::write(&path, &rewritten).map_err(|e| io(&path, e))?;
             }
@@ -240,9 +295,10 @@ fn check(args: &Args) -> Result<String, String> {
         } else {
             std::fs::read(&path).map_err(|e| io(&path, e))?
         };
+        let hashes = hashes_in(&data);
         let mut by_path: Vec<(&str, Vec<usize>)> = Vec::new();
-        for (at, hash) in find_hashes(&data, &candidates) {
-            let target = candidates[hash].as_str();
+        for (at, hash) in find_hashes(&data, &hashes) {
+            let target = hashes[hash].as_str();
             match by_path.iter_mut().find(|(p, _)| *p == target) {
                 Some((_, offsets)) => offsets.push(at),
                 None => by_path.push((target, vec![at])),
@@ -331,6 +387,18 @@ mod tests {
         assert_eq!(
             String::from_utf8(rewritten).unwrap(),
             format!("error at /schnee/src/main.rs:3 and bare {SRC}")
+        );
+    }
+
+    #[test]
+    fn literal_paths_name_paths_outside_the_inputs() {
+        let data =
+            format!("\0/nix/store/{SRC}-skeptiva-ai-master../x\0/nix/store/{LIBC}-glibc/lib");
+        let found = literal_paths(data.as_bytes(), "/nix/store", &[LIBC]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[SRC.as_bytes()],
+            format!("/nix/store/{SRC}-skeptiva-ai-master..")
         );
     }
 
