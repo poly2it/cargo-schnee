@@ -1912,7 +1912,10 @@ fn fixture_runtime_references_are_declared() {
     assert!(printed[1].ends_with("/out_dir/generated.rs"), "{stdout}");
     assert_eq!(printed[2], "42");
 
-    let alive = nix_lines("nix-store", &["--query", "--requisites", &gc_root(&fixture_dir)]);
+    let alive = nix_lines(
+        "nix-store",
+        &["--query", "--requisites", &gc_root(&fixture_dir)],
+    );
     let binary = alive
         .iter()
         .find(|p| p.ends_with("-runtime-references-0.1.0-runtime-references"))

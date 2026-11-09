@@ -3039,7 +3039,8 @@ fn aggregator_drv_json(
     // A remote builder hands back only this output, never the outputs of
     // the units it built on the way, so their diagnostics are copied in as
     // `diagnostics-N`, in plan order. A copy, unlike a symlink, keeps the
-    // unit outputs out of this output's closure.
+    // unit outputs out of this output's closure, and each store path in it
+    // becomes its hash-free path so it does not keep an input alive either.
     let mut diagnostic_placeholders: Vec<String> = Vec::with_capacity(diagnostic_drvs.len());
     for drv_path in diagnostic_drvs {
         diagnostic_placeholders.push(downstream_placeholder(drv_path, "out")?);
@@ -3054,11 +3055,13 @@ fn aggregator_drv_json(
              i=0\n\
              while [ \"$i\" -lt \"${{#__diags[@]}}\" ]; do\n\
                if [ -f \"${{__diags[$i]}}/diagnostics\" ]; then\n\
-                 {coreutils}/bin/cp \"${{__diags[$i]}}/diagnostics\" \"$out/diagnostics-$i\"\n\
+                 while IFS= read -r __line || [ -n \"$__line\" ]; do printf '%s\\n' \"${{__line//{store}\\/{hash}-/{virtual}/}}\"; done < \"${{__diags[$i]}}/diagnostics\" > \"$out/diagnostics-$i\"\n\
                fi\n\
                i=$((i+1))\n\
              done\n",
-            coreutils = coreutils_store
+            store = store_paths::store_dir().replace('/', "\\/"),
+            hash = "[0-9a-z]".repeat(32),
+            virtual = references::VIRTUAL_ROOT,
         ));
     }
 
@@ -3069,6 +3072,10 @@ fn aggregator_drv_json(
     );
     env.insert(
         "rootOuts".into(),
+        serde_json::Value::String(placeholders.join(" ")),
+    );
+    env.insert(
+        "allowedReferences".into(),
         serde_json::Value::String(placeholders.join(" ")),
     );
     env.insert(

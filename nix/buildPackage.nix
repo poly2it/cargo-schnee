@@ -94,6 +94,11 @@
   preBuild ? "",
   postBuild ? "",
   postInstall ? "",
+  # Store paths the installed output may refer to beyond the C library,
+  # the compiler runtime and the libraries of `buildInputs`, such as a
+  # program `postInstall` wraps the binary with.  Any other reference
+  # fails the build, and a Windows target may refer to nothing.
+  runtimeReferences ? [],
   postFixup ? "",
   meta ? {},
   dontBuild ? false,
@@ -704,7 +709,7 @@ let
     if intent == "doc" then ""
     else ''rmdir --ignore-fail-on-non-empty $out/bin $out/lib 2>/dev/null || true'';
 
-  installed = pkgs.runCommand "${finalPname}-${finalVersion}" {
+  installed = pkgs.runCommand "${finalPname}-${finalVersion}" ({
     inherit meta;
     aggregator = aggregatorOutput;
     # Forward the caller's `nativeBuildInputs` so their setup hooks
@@ -717,7 +722,13 @@ let
       ++ lib.optionals (!isWindows) [ pkgs.autoPatchelfHook ];
     inherit buildInputs;
     passthru = { inherit planner aggregatorWrapper aggregatorOutput packageDir; };
-  } ''
+  } // lib.optionalAttrs (intent != "doc") {
+    allowedReferences =
+      if isWindows then runtimeReferences
+      else [ pkgs.stdenv.cc.libc (lib.getLib pkgs.stdenv.cc.cc) ]
+        ++ map lib.getLib buildInputs
+        ++ runtimeReferences;
+  }) ''
     set -euo pipefail
     ${installInit}
     # Walk each root-N symlink in the aggregator output.  Each
