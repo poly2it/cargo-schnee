@@ -96,28 +96,32 @@ pub(super) fn rustc_args(remaps: &[Remap]) -> Vec<String> {
 /// Shell fragment exporting `-ffile-prefix-map` for every remap in
 /// `CFLAGS` and `CXXFLAGS`, ahead of any value already set.
 ///
-/// The cc crate prefers `CFLAGS_<target>` over `CFLAGS`, so a target whose
-/// compiler is clang-cl gets its own variables, with each flag passed
-/// through `/clang:` because clang-cl accepts no `-f` flag of its own.
-/// clang-cl also leaves its `-cc1` command line out of the CodeView data,
-/// because the command line names the compiler's resource directory.
+/// The cc crate prefers `CFLAGS_<target>` over `CFLAGS`, so an MSVC target
+/// gets its own variables, which also keep the compiler's command line out
+/// of the CodeView data because it names the compiler's resource directory.
+/// Their form follows the compiler `CC_<target>` or `CXX_<target>` names,
+/// which is known once the passthrough variables are set. clang-cl takes
+/// each flag through `/clang:`, and the plain clang driver, which ring
+/// requires for Windows AArch64, reads such a flag as an input file. Any
+/// other compiler gets the plain form, which clang-cl would only warn about.
 pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String {
-    let flags = |prefix: &str| {
-        remaps
-            .iter()
-            .map(|r| format!("{prefix}-ffile-prefix-map={}={}", r.from, r.to))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+    let maps: Vec<String> = remaps
+        .iter()
+        .map(|r| format!("-ffile-prefix-map={}={}", r.from, r.to))
+        .collect();
     let export =
         |var: &str, value: &str| format!("export {var}=\"{value}${{{var}:+ ${var}}}\" && ");
-    let gnu = flags("");
-    let mut s = export("CFLAGS", &gnu) + &export("CXXFLAGS", &gnu);
+    let mut s = format!("__maps=\"{}\" && ", maps.join(" "));
+    s += &export("CFLAGS", "$__maps");
+    s += &export("CXXFLAGS", "$__maps");
     if target.is_msvc() {
         let triple = target.target_triple.replace('-', "_");
-        let cl = format!("{} /clang:-gno-codeview-command-line", flags("/clang:"));
-        s += &export(&format!("CFLAGS_{triple}"), &cl);
-        s += &export(&format!("CXXFLAGS_{triple}"), &cl);
+        for (compiler, flags) in [("CC", "CFLAGS"), ("CXX", "CXXFLAGS")] {
+            s += &format!(
+                r#"case "${{{compiler}_{triple}:-$CC_{triple}}}" in */clang-cl*|clang-cl*) __f=""; for __m in $__maps -gno-codeview-command-line; do __f="$__f${{__f:+ }}/clang:$__m"; done ;; *) __f="$__maps -gno-codeview-command-line" ;; esac && "#
+            );
+            s += &export(&format!("{flags}_{triple}"), "$__f");
+        }
     }
     s
 }
@@ -390,18 +394,73 @@ mod tests {
         );
     }
 
+    /// The value of `var` after the shell runs `fragment` with `env` set.
+    /// The fragment is POSIX, and `sh` is the one shell both a developer's
+    /// machine and the package build's sandbox, whose `PATH` holds no
+    /// bash, provide.
+    fn exported(fragment: &str, env: &[(&str, &str)], var: &str) -> String {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{fragment}printf '%s' \"${var}\""))
+            .env_clear()
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn glibc() -> Remap {
+        Remap::store("/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44").unwrap()
+    }
+
+    const MAP: &str = "-ffile-prefix-map=/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44=/schnee/glibc-2.44";
+
     #[test]
     fn c_flags_keep_a_value_already_set() {
-        let remap = Remap::store("/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44").unwrap();
-        let exports = c_flag_exports(
-            &[remap],
-            &TargetConfig::with_target("x86_64-unknown-linux-gnu"),
+        let target = TargetConfig::with_target("x86_64-unknown-linux-gnu");
+        let exports = c_flag_exports(&[glibc()], &target);
+        assert_eq!(
+            exported(&exports, &[("CFLAGS", "-O2")], "CFLAGS"),
+            format!("{MAP} -O2")
+        );
+        assert_eq!(exported(&exports, &[], "CXXFLAGS"), MAP);
+    }
+
+    /// ring rejects clang-cl for Windows AArch64, so that target's build
+    /// scripts compile with the plain clang driver, which reads a `/clang:`
+    /// flag as an input file.
+    #[test]
+    fn c_flags_for_the_plain_clang_driver_take_the_gnu_form() {
+        let target = TargetConfig::with_target("aarch64-pc-windows-msvc");
+        let exports = c_flag_exports(&[glibc()], &target);
+        let env = [(
+            "CC_aarch64_pc_windows_msvc",
+            "/nix/store/x-clang-21/bin/clang",
+        )];
+        assert_eq!(
+            exported(&exports, &env, "CFLAGS_aarch64_pc_windows_msvc"),
+            format!("{MAP} -gno-codeview-command-line")
         );
         assert_eq!(
-            exports,
-            "export CFLAGS=\"-ffile-prefix-map=/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44=/schnee/glibc-2.44${CFLAGS:+ $CFLAGS}\" && \
-             export CXXFLAGS=\"-ffile-prefix-map=/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44=/schnee/glibc-2.44${CXXFLAGS:+ $CXXFLAGS}\" && "
+            exported(&exports, &env, "CXXFLAGS_aarch64_pc_windows_msvc"),
+            format!("{MAP} -gno-codeview-command-line")
         );
+    }
+
+    #[test]
+    fn c_flags_for_clang_cl_take_the_clang_form() {
+        let target = TargetConfig::with_target("x86_64-pc-windows-msvc");
+        let exports = c_flag_exports(&[glibc()], &target);
+        let env = [(
+            "CC_x86_64_pc_windows_msvc",
+            "/nix/store/x-clang-21/bin/clang-cl",
+        )];
+        assert_eq!(
+            exported(&exports, &env, "CFLAGS_x86_64_pc_windows_msvc"),
+            format!("/clang:{MAP} /clang:-gno-codeview-command-line")
+        );
+        assert_eq!(exported(&exports, &env, "CFLAGS"), MAP);
     }
 
     /// nixpkgs' rustc is a wrapper outside the sysroot whose closure the
