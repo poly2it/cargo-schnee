@@ -335,14 +335,19 @@ pub(super) fn tool_drv_json(
         coreutils = coreutils_store,
         rustc = shell_quote(rustc_path),
     );
-    let mut input_srcs: Vec<String> = rustc_closure
+    // Like a unit, the derivation also mounts every store path its script
+    // runs, such as nixpkgs' rustc wrapper, which lives outside the sysroot
+    // `rustc_closure` was queried for.
+    let mut input_srcs: std::collections::BTreeSet<String> = rustc_closure
         .iter()
         .chain(host_cc_closure)
         .cloned()
         .chain([bash_store.to_string(), coreutils_store.to_string()])
         .collect();
-    input_srcs.sort();
-    input_srcs.dedup();
+    let mut named = HashSet::new();
+    super::util::collect_store_paths(&script, &mut named);
+    input_srcs.extend(named);
+    let input_srcs: Vec<String> = input_srcs.into_iter().collect();
     serde_json::json!({
         "name": "schnee-refs",
         "system": system,
@@ -397,6 +402,33 @@ mod tests {
             "export CFLAGS=\"-ffile-prefix-map=/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44=/schnee/glibc-2.44${CFLAGS:+ $CFLAGS}\" && \
              export CXXFLAGS=\"-ffile-prefix-map=/nix/store/0hqrgnc1vab3i7nz3ysx9dcdill8kwk9-glibc-2.44=/schnee/glibc-2.44${CXXFLAGS:+ $CXXFLAGS}\" && "
         );
+    }
+
+    /// nixpkgs' rustc is a wrapper outside the sysroot whose closure the
+    /// planner queries, so the tool derivation must mount it from the path
+    /// its script runs.
+    #[test]
+    fn tool_drv_mounts_a_wrapped_rustc() {
+        let wrapper = "/nix/store/6l9kbzxwq9ij2lcmwl2qb1jdpqisjr8l-rustc-wrapper-1.99.0";
+        let sysroot = "/nix/store/1qg7z7i461qsv0lczc40nyi8ps6snlca-rustc-1.99.0";
+        let json = tool_drv_json(
+            &format!("{wrapper}/bin/rustc"),
+            sysroot,
+            &[sysroot.to_string()],
+            "/nix/store/r5ri78axx1qggkjq3vawywlzglg70b5w-gcc-wrapper-16.2.0/bin",
+            &[],
+            "/nix/store/nnm9gdr70ihc6zc9298mzz8jpcgaciql-bash-5.3p20/bin/bash",
+            "/nix/store/nnm9gdr70ihc6zc9298mzz8jpcgaciql-bash-5.3p20",
+            "/nix/store/cb987zkxvsv0490753ilrvn5yk7ylgxi-coreutils-9.12",
+            "x86_64-linux",
+        );
+        let srcs: Vec<&str> = json["inputSrcs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(srcs.contains(&wrapper), "{srcs:?}");
     }
 
     #[test]
