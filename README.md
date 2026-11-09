@@ -803,8 +803,8 @@ package's `Cargo.toml`, by store path or by name:
 runtime-references = ["tesseract"]
 ```
 
-`lib.buildPackage` holds its installed output to the C library, the compiler
-runtime, the libraries of `buildInputs` and `runtimeReferences`.
+`lib.buildPackage` holds the installed output of a Windows target to
+`runtimeReferences`, which is empty unless `postInstall` adds a store path.
 
 ### Sharing a resolution across packages
 

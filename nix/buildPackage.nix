@@ -94,10 +94,9 @@
   preBuild ? "",
   postBuild ? "",
   postInstall ? "",
-  # Store paths the installed output may refer to beyond the C library,
-  # the compiler runtime and the libraries of `buildInputs`, such as a
-  # program `postInstall` wraps the binary with.  Any other reference
-  # fails the build, and a Windows target may refer to nothing.
+  # Store paths the installed output of a Windows target may refer to,
+  # such as a file `postInstall` adds.  Any other reference fails the
+  # build.
   runtimeReferences ? [],
   postFixup ? "",
   meta ? {},
@@ -722,12 +721,12 @@ let
       ++ lib.optionals (!isWindows) [ pkgs.autoPatchelfHook ];
     inherit buildInputs;
     passthru = { inherit planner aggregatorWrapper aggregatorOutput packageDir; };
-  } // lib.optionalAttrs (intent != "doc") {
-    allowedReferences =
-      if isWindows then runtimeReferences
-      else [ pkgs.stdenv.cc.libc (lib.getLib pkgs.stdenv.cc.cc) ]
-        ++ map lib.getLib buildInputs
-        ++ runtimeReferences;
+  } // lib.optionalAttrs (isWindows && intent != "doc") {
+    # A Linux binary's references were checked in its own unit against the
+    # libraries its build scripts found, which no list written here can
+    # name. A Windows binary refers to nothing that `postInstall` does not
+    # add.
+    allowedReferences = runtimeReferences;
   }) ''
     set -euo pipefail
     ${installInit}
