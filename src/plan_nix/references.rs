@@ -96,14 +96,15 @@ pub(super) fn rustc_args(remaps: &[Remap]) -> Vec<String> {
 /// Shell fragment exporting `-ffile-prefix-map` for every remap in
 /// `CFLAGS` and `CXXFLAGS`, ahead of any value already set.
 ///
-/// The cc crate prefers `CFLAGS_<target>` over `CFLAGS`, so an MSVC target
-/// gets its own variables, which also keep the compiler's command line out
-/// of the CodeView data because it names the compiler's resource directory.
-/// Their form follows the compiler `CC_<target>` or `CXX_<target>` names,
-/// which is known once the passthrough variables are set. clang-cl takes
-/// each flag through `/clang:`, and the plain clang driver, which ring
-/// requires for Windows AArch64, reads such a flag as an input file. Any
-/// other compiler gets the plain form, which clang-cl would only warn about.
+/// The cc crate prefers `CFLAGS_<target>` over `CFLAGS`, so a cross target
+/// whose compiler the build names in `CC_<target>` or `TARGET_CC` gets its
+/// own variables, which start with the value the cc crate would otherwise
+/// have read. Their form comes from asking that compiler which form it
+/// takes, see [`C_FLAG_PROBE`], because clang-cl only takes clang flags
+/// through `/clang:` while the plain clang driver reads such a flag as an
+/// input file. A compiler that accepts `-gno-codeview-command-line` also
+/// gets it, because the command line it would record in CodeView names its
+/// resource directory.
 pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String {
     let maps: Vec<String> = remaps
         .iter()
@@ -111,20 +112,47 @@ pub(super) fn c_flag_exports(remaps: &[Remap], target: &TargetConfig) -> String 
         .collect();
     let export =
         |var: &str, value: &str| format!("export {var}=\"{value}${{{var}:+ ${var}}}\" && ");
-    let mut s = format!("__maps=\"{}\" && ", maps.join(" "));
+    let mut s = format!(
+        "__maps=\"{}\" && __cflags=\"$CFLAGS\" && __cxxflags=\"$CXXFLAGS\" && ",
+        maps.join(" ")
+    );
     s += &export("CFLAGS", "$__maps");
     s += &export("CXXFLAGS", "$__maps");
-    if target.is_msvc() {
-        let triple = target.target_triple.replace('-', "_");
-        for (compiler, flags) in [("CC", "CFLAGS"), ("CXX", "CXXFLAGS")] {
+    if target.is_cross() {
+        let t = target.target_triple.replace('-', "_");
+        s += C_FLAG_PROBE;
+        let cc = format!("${{CC_{t}:-${{TARGET_CC:-}}}}");
+        for (compiler, flags, saved) in [
+            (cc.clone(), "CFLAGS", "__cflags"),
+            (
+                format!("${{CXX_{t}:-${{TARGET_CXX:-{cc}}}}}"),
+                "CXXFLAGS",
+                "__cxxflags",
+            ),
+        ] {
             s += &format!(
-                r#"case "${{{compiler}_{triple}:-$CC_{triple}}}" in */clang-cl*|clang-cl*) __f=""; for __m in $__maps -gno-codeview-command-line; do __f="$__f${{__f:+ }}/clang:$__m"; done ;; *) __f="$__maps -gno-codeview-command-line" ;; esac && "#
+                r#"__cc="{compiler}" && __prev="${{{flags}_{t}:-${{TARGET_{flags}:-${saved}}}}}" && if [ -n "$__cc" ] && __f=$(__schnee_c_flags "$__cc"); then export {flags}_{t}="$__f${{__prev:+ $__prev}}"; fi && "#
             );
-            s += &export(&format!("{flags}_{triple}"), "$__f");
         }
     }
     s
 }
+
+/// Shell functions that find the form of `-ffile-prefix-map` the compiler
+/// `$1` accepts. A form counts as accepted when the compiler builds an
+/// empty file with it and prints nothing, because clang-cl only warns
+/// about a flag it ignores. `__schnee_c_flags` prints `$__maps` in that
+/// form, or fails when the compiler takes neither. An empty file needs no
+/// debug info, so the probe silences clang's warning that a debug flag
+/// went unused, which GCC and clang-cl accept as well.
+const C_FLAG_PROBE: &str = concat!(
+    r#"__schnee_accepts() { __e=$("$1" -Wno-unused-command-line-argument "$2" -c "$TMPDIR/__schnee_probe.c" -o "$TMPDIR/__schnee_probe.o" 2>&1) && [ -z "$__e" ]; } && "#,
+    r#"__schnee_c_flags() { : > "$TMPDIR/__schnee_probe.c"; for __p in "" /clang:; do "#,
+    r#"if __schnee_accepts "$1" "${__p}-ffile-prefix-map=/schnee=/schnee"; then __o=""; "#,
+    r#"for __m in $__maps; do __o="$__o${__o:+ }$__p$__m"; done; "#,
+    r#"if __schnee_accepts "$1" "${__p}-gno-codeview-command-line"; then __o="$__o${__o:+ }${__p}-gno-codeview-command-line"; fi; "#,
+    r#"printf '%s' "$__o"; return 0; fi; done; return 1; } && "#,
+);
 
 /// Shell fragment, run where a build script's `cargo:rustc-env` value is in
 /// `$v`, adding a remap for the store root the value names. A path that
@@ -384,40 +412,83 @@ mod tests {
         assert_eq!(exported(&exports, &[], "CXXFLAGS"), MAP);
     }
 
+    /// A fake compiler at `<dir>/<name>` that writes its `-o` file and
+    /// answers each flag the way `on_flag`, a `case` arm over `$a`, says.
+    /// `$quiet` is set once `-Wno-unused-command-line-argument` was seen.
+    fn fake_compiler(dir: &Path, name: &str, on_flag: &str) -> String {
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do a=$1; shift; case \"$a\" in -o) out=$1; shift ;; -Wno-unused-command-line-argument) quiet=1 ;; {on_flag} esac; done\n: > \"$out\"\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// clang-cl accepts a clang flag only through `/clang:` and warns about
+    /// any other `-f` or `-g` flag. Like clang, it warns about a debug flag
+    /// that a build without debug info leaves unused.
+    const CL: &str = r#"/clang:-gno-codeview*) [ -n "$quiet" ] || echo "warning: argument unused: $a" >&2 ;; /clang:*) ;; -f*|-g*) echo "warning: unknown argument ignored: $a" >&2 ;;"#;
+    /// The plain clang driver reads `/clang:...` as an input file.
+    const CLANG: &str = r#"/clang:*) echo "error: no such file: $a" >&2; exit 1 ;; -gno-codeview*) [ -n "$quiet" ] || echo "warning: argument unused: $a" >&2 ;;"#;
+    /// GCC knows no CodeView flags.
+    const GCC: &str = r#"/clang:*|-gno-codeview*) echo "error: unrecognized: $a" >&2; exit 1 ;;"#;
+
+    /// A directory of its own for each test's compilers and probe files.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("schnee-cc-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `CFLAGS_<triple>` the exports give a build script whose target
+    /// compiler answers flags the way `on_flag` says, with `env` set too.
+    fn target_cflags(triple: &str, on_flag: &str, env: &[(&str, &str)]) -> String {
+        let dir = scratch(triple);
+        let compiler = fake_compiler(&dir, "cc", on_flag);
+        let exports = c_flag_exports(&[glibc()], &TargetConfig::with_target(triple));
+        let triple_u = triple.replace('-', "_");
+        let cc_var = format!("CC_{triple_u}");
+        let tmpdir = dir.to_string_lossy().into_owned();
+        let mut all: Vec<(&str, &str)> = vec![(&cc_var, &compiler), ("TMPDIR", &tmpdir)];
+        all.extend_from_slice(env);
+        let flags = exported(&exports, &all, &format!("CFLAGS_{triple_u}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        flags
+    }
+
+    /// A clang-cl the build names otherwise, through a wrapper for
+    /// instance, still gets the `/clang:` form.
+    #[test]
+    fn c_flags_follow_what_a_cl_style_compiler_accepts() {
+        assert_eq!(
+            target_cflags("x86_64-pc-windows-msvc", CL, &[]),
+            format!("/clang:{MAP} /clang:-gno-codeview-command-line")
+        );
+    }
+
     /// ring rejects clang-cl for Windows AArch64, so that target's build
     /// scripts compile with the plain clang driver, which reads a `/clang:`
     /// flag as an input file.
     #[test]
     fn c_flags_for_the_plain_clang_driver_take_the_gnu_form() {
-        let target = TargetConfig::with_target("aarch64-pc-windows-msvc");
-        let exports = c_flag_exports(&[glibc()], &target);
-        let env = [(
-            "CC_aarch64_pc_windows_msvc",
-            "/nix/store/x-clang-21/bin/clang",
-        )];
         assert_eq!(
-            exported(&exports, &env, "CFLAGS_aarch64_pc_windows_msvc"),
-            format!("{MAP} -gno-codeview-command-line")
-        );
-        assert_eq!(
-            exported(&exports, &env, "CXXFLAGS_aarch64_pc_windows_msvc"),
+            target_cflags("aarch64-pc-windows-msvc", CLANG, &[]),
             format!("{MAP} -gno-codeview-command-line")
         );
     }
 
+    /// A cross GCC gets the maps without the CodeView flag it rejects, and
+    /// keeps the `CFLAGS` the build set, which the cc crate stops reading
+    /// once `CFLAGS_<triple>` exists.
     #[test]
-    fn c_flags_for_clang_cl_take_the_clang_form() {
-        let target = TargetConfig::with_target("x86_64-pc-windows-msvc");
-        let exports = c_flag_exports(&[glibc()], &target);
-        let env = [(
-            "CC_x86_64_pc_windows_msvc",
-            "/nix/store/x-clang-21/bin/clang-cl",
-        )];
+    fn c_flags_for_a_cross_gcc_keep_the_build_cflags() {
         assert_eq!(
-            exported(&exports, &env, "CFLAGS_x86_64_pc_windows_msvc"),
-            format!("/clang:{MAP} /clang:-gno-codeview-command-line")
+            target_cflags("aarch64-unknown-linux-gnu", GCC, &[("CFLAGS", "-O2")]),
+            format!("{MAP} -O2")
         );
-        assert_eq!(exported(&exports, &env, "CFLAGS"), MAP);
     }
 
     /// nixpkgs' rustc is a wrapper outside the sysroot whose closure the
