@@ -767,6 +767,42 @@ Only that package's build-script run sees those files, at their usual place
 relative to its directory. When a build script names a missing path in
 `cargo:rerun-if-changed`, cargo-schnee prints the path and points at this key.
 
+### Runtime references
+
+Nix treats every store path whose hash appears in an output as a runtime
+dependency of it. A unit's build-time inputs therefore never appear in its
+output under their store paths. rustc and rustdoc get `--remap-path-prefix`
+and C and C++ compilers run by build scripts get `-ffile-prefix-map` for every
+input they may name, so a source file, an `OUT_DIR` file read through
+`include!` or a C header appears as `/schnee/<name>/...` in panic messages and
+debug info. The PDB that lld-link writes for a Windows target records each
+library it read and offers no remapping, so the hashes in it are overwritten
+with `e`.
+
+Each unit whose code reaches a root declares what its output may refer to in
+`allowedReferences`. A library may refer to nothing. A linked Linux binary may
+refer to the C library, the GCC runtime and the libraries pkg-config hands its
+build scripts. A Windows binary may refer to nothing. A unit with any other
+reference fails and names the file and the bytes around the path:
+
+```
+cargo-schnee: app-1f0c2e5d9a3b4c71 refers to /nix/store/2m61q77i5frsajxw3k8w13q23hl4r5dn-app in 1 place, which is not a runtime reference of this unit:
+    at byte 34283: /nix/store/2m61q77i5frsajxw3k8w13q23hl4r5dn-app
+```
+
+No remapping hides a path compiled in through `env!("CARGO_MANIFEST_DIR")` or
+another environment variable, so such a value has to come from somewhere else
+at run time. A binary that loads a library at run time names it in its
+package's `Cargo.toml`, by store path or by name:
+
+```toml
+[package.metadata.schnee]
+runtime-references = ["tesseract"]
+```
+
+`lib.buildPackage` holds its installed output to the C library, the compiler
+runtime, the libraries of `buildInputs` and `runtimeReferences`.
+
 ### Sharing a resolution across packages
 
 Cargo unifies features across whatever a single command line names, so
