@@ -1,0 +1,3 @@
+[workspace]
+members = ["warn-lib", "warn-bin"]
+resolver = "2"

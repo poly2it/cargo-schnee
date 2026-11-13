@@ -101,6 +101,48 @@
             });
 
             formatting = treefmtEval.config.build.check self;
+
+            # A test binary reads its fixtures relative to its crate, so the
+            # runner must open the member's directory, not one named after
+            # the package.
+            test-package-member-dir =
+              let
+                src = ./examples/build-package;
+                tests = self.lib.testPackage {
+                  inherit pkgs src;
+                  cargoLock = src + "/Cargo.lock";
+                  package = "greeter";
+                };
+              in
+              assert pkgs.lib.hasInfix ''target="$src/crates/greeter"'' tests.drvAttrs.buildCommand;
+              pkgs.runCommand "test-package-member-dir-check" { } "touch $out";
+
+            # Runs the cargo wrapper with `echo` in place of cargo-schnee, so
+            # the check sees exactly the arguments each override forwards.
+            cargo-wrapper =
+              let
+                wrapper = self.lib.makeCargoWrapper {
+                  inherit pkgs;
+                  cargo = "${pkgs.coreutils}/bin/false";
+                  overrides = builtins.mapAttrs
+                    (_: o: o // { command = "echo"; setup = ""; postRun = ""; })
+                    (self.lib.cargoOverrides { inherit pkgs; });
+                };
+                expect = cmd: want: ''
+                  got=$(${wrapper}/bin/cargo ${cmd} 2>&1)
+                  if [ "$got" != ${pkgs.lib.escapeShellArg want} ]; then
+                    echo "cargo ${cmd}: forwarded '$got', expected '${want}'"
+                    exit 1
+                  fi
+                '';
+              in
+              pkgs.runCommand "cargo-wrapper-check" { } ''
+                ${expect "build -vv -p a" "-vv -p a"}
+                ${expect "test --verbose -p a" "--verbose -p a"}
+                ${expect "clippy -v --all-targets -p a -- -D warnings" "-v --all-targets -p a -- -D warnings"}
+                ${expect "test -p a -- --test-threads=1" "-p a -- --test-threads=1"}
+                touch $out
+              '';
           };
 
           devShells.default = pkgs.mkShell {
@@ -137,7 +179,11 @@
     {
       lib.buildPackage = import ./nix/buildPackage.nix { inherit self; };
       lib.buildDoc = import ./nix/buildDoc.nix { inherit self; };
+      lib.testPackage = import ./nix/testPackage.nix { inherit self; };
+      lib.clippyPackage = import ./nix/clippyPackage.nix { inherit self; };
+      lib.unitGraph = import ./nix/unitGraph.nix { inherit self; };
       lib.makeCargoWrapper = import ./nix/makeCargoWrapper.nix;
+      lib.vendorCargoLock = import ./nix/vendorCargoLock.nix;
 
       lib.cargoOverrides = { pkgs }:
         let cargoSchnee = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
@@ -147,17 +193,21 @@
               fi
               export HOME=''${HOME:-$(mktemp -d)}
             '';
+            # Cargo's target selection flags, which every compiling
+            # subcommand except `run` and `doc` takes.
+            targetArgs = [ "--bin" "--test" "--example" "--bench" ];
+            targetBoolArgs = [ "--lib" "--bins" "--tests" "--examples" "--benches" "--all-targets" ];
         in {
           check = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee check";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           build = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee build";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" "--bin" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
             postRun = ''
               if [ -n "$__target" ]; then
@@ -187,14 +237,20 @@
           };
           test = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee test";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
+            setup = schneeSetup;
+          };
+          clippy = {
+            command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" "--no-deps" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           bench = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee bench";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           doc = {

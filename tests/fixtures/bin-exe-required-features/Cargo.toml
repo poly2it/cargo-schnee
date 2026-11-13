@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "bin-exe-required-features"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+perf-harness = []
+
+[[bin]]
+name = "bin-exe-tool"
+path = "src/main.rs"
+
+[[bin]]
+name = "perf-only"
+path = "src/perf.rs"
+required-features = ["perf-harness"]

@@ -1,0 +1,3 @@
+[workspace]
+members = ["app", "my-macro", "host-only-sys"]
+resolver = "2"

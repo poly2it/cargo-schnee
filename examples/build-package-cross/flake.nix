@@ -36,8 +36,10 @@
         {
           packages.default = cargo-schnee.lib.buildPackage {
             inherit pkgs src rustToolchain;
-            hostPkgs = pkgs.pkgsCross.aarch64-multiplatform;
+            target = "aarch64-unknown-linux-gnu";
             cargoLock = ./Cargo.lock;
+            # The planner finds `aarch64-unknown-linux-gnu-gcc` on `PATH`.
+            nativeBuildInputs = [ pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc ];
           };
         };
 

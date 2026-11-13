@@ -23,6 +23,10 @@ pub enum DrvKind {
     TestCompile,
     BuildScriptCompile,
     BuildScriptRun,
+    /// The synthetic aggregator drv emitted by the planner.  Has no
+    /// user-facing content (just symlinks to its dependencies); the
+    /// renderer suppresses status output for these.
+    Aggregator,
 }
 
 /// Parse a Nix derivation store path into (pkg_name, version, kind).
@@ -51,6 +55,14 @@ pub fn parse_drv_display(drv_path: &str) -> (String, String, DrvKind) {
         (n, DrvKind::Check)
     } else if let Some(n) = name.strip_suffix("-doc") {
         (n, DrvKind::Doc)
+    } else if let Some(n) = name
+        .strip_suffix("-build-aggregator")
+        .or_else(|| name.strip_suffix("-check-aggregator"))
+        .or_else(|| name.strip_suffix("-test-aggregator"))
+        .or_else(|| name.strip_suffix("-clippy-aggregator"))
+        .or_else(|| name.strip_suffix("-doc-aggregator"))
+    {
+        (n, DrvKind::Aggregator)
     } else {
         (name, DrvKind::Compile)
     };
