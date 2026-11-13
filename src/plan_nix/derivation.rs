@@ -273,6 +273,13 @@ pub(super) fn construct_derivation(
     };
 
     let pkg_config = reads_pkg_config(unit, units, key_to_idx, pkg_config_packages);
+    // Bash cannot export a name such as `CARGO_BIN_EXE_my-tool`, but it
+    // passes one it inherits on to the compiler or build script, so such
+    // variables are set on the derivation itself.
+    let (passthru_exports, passthru_inherited): (Vec<_>, Vec<_>) = passthru_envs
+        .iter()
+        .cloned()
+        .partition(|(name, _)| is_shell_name(name));
     let script = match unit.kind {
         UnitKind::BuildScriptRun => build_run_script(
             &c_remaps(
@@ -299,7 +306,7 @@ pub(super) fn construct_derivation(
             cfg_envs,
             host_cfg_envs,
             custom_sys_env,
-            passthru_envs,
+            &passthru_exports,
             src_store,
             setup_scripts,
         )?,
@@ -371,6 +378,13 @@ pub(super) fn construct_derivation(
         }
         Contract::Unchecked => {}
     }
+    let inherited = match unit.kind {
+        UnitKind::BuildScriptRun => passthru_inherited,
+        _ => bin_exe_envs(unit, units, key_to_idx, dep_drv_map, target)?,
+    };
+    for (name, value) in inherited {
+        env.insert(name, serde_json::Value::String(value));
+    }
 
     // inputDrvs
     let mut input_drvs = serde_json::Map::new();
@@ -401,6 +415,13 @@ pub(super) fn construct_derivation(
         input_drvs
             .entry(drv.clone())
             .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
+    }
+    for dep_key in unit.bin_exes.iter().filter_map(|(_, k)| k.as_ref()) {
+        if let Some(drv) = dep_drv_map.get(dep_key) {
+            input_drvs
+                .entry(drv.clone())
+                .or_insert_with(|| serde_json::json!({"dynamicOutputs": {}, "outputs": ["out"]}));
+        }
     }
     // Links deps (other BuildScriptRun units this depends on for DEP_* env vars)
     for (dep_key, _links_name) in &unit.links_dep_keys {
@@ -488,6 +509,44 @@ pub(super) fn construct_derivation(
         "inputSrcs": input_srcs_vec,
         "outputs": { "out": { "hashAlgo": "sha256", "method": "nar" } }
     }))
+}
+
+/// Whether Bash accepts `name` in `export`.
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `CARGO_BIN_EXE_<name>` for each binary in `unit.bin_exes`. A linked
+/// binary is named by its path in its unit's output. One this plan does not
+/// link gets the `placeholder:<name>` value Cargo gives it in a check, so
+/// that `env!` still compiles.
+fn bin_exe_envs(
+    unit: &NixUnit,
+    units: &[NixUnit],
+    key_to_idx: &HashMap<String, usize>,
+    dep_drv_map: &HashMap<String, String>,
+    target: &TargetConfig,
+) -> Result<Vec<(String, String)>> {
+    let exe_suffix = if target.is_windows() { ".exe" } else { "" };
+    unit.bin_exes
+        .iter()
+        .map(|(name, key)| {
+            let linked = key.as_ref().and_then(|k| Some((k, dep_drv_map.get(k)?)));
+            let value = match linked {
+                Some((key, drv)) => format!(
+                    "{}/{}{exe_suffix}",
+                    downstream_placeholder(drv, "out")?,
+                    units[key_to_idx[key]].output_lib_filename(),
+                ),
+                None => format!("placeholder:{name}"),
+            };
+            Ok((format!("CARGO_BIN_EXE_{name}"), value))
+        })
+        .collect()
 }
 
 /// The inputs rustc or rustdoc may name in `unit`'s output: its sources,
@@ -1737,6 +1796,7 @@ mod tests {
             target_name: name.to_string(),
             for_host: false,
             compile_test: false,
+            bin_exes: Vec::new(),
             sliced_crate_rel: None,
             profile: Default::default(),
             pipeline: Default::default(),
@@ -2318,6 +2378,7 @@ mod tests {
             target_name: name.to_string(),
             for_host: false,
             compile_test: true,
+            bin_exes: Vec::new(),
             sliced_crate_rel: Some(name.to_string()),
             profile: Default::default(),
             pipeline: Default::default(),
@@ -2564,8 +2625,13 @@ mod tests {
         drv["env"]["__jobserver"].as_str().map(str::to_string)
     }
 
-    /// `inputSrcs` of `units[idx]`.
-    fn input_srcs_of(units: &[NixUnit], idx: usize) -> Vec<String> {
+    /// The derivation of `units[idx]`, with `passthru_envs` forwarded and
+    /// every unit registered under a distinct derivation path.
+    fn drv_of(
+        units: &[NixUnit],
+        idx: usize,
+        passthru_envs: &[(String, String)],
+    ) -> serde_json::Value {
         let key_to_idx: HashMap<String, usize> = units
             .iter()
             .enumerate()
@@ -2573,12 +2639,9 @@ mod tests {
             .collect();
         let dep_drv_map: HashMap<String, String> = units
             .iter()
-            .map(|u| {
-                let drv = format!("/nix/store/{}-{}.drv", "d".repeat(32), u.key);
-                (u.key.clone(), drv)
-            })
+            .map(|u| (u.key.clone(), drv_path_of(&u.key)))
             .collect();
-        let drv = construct_derivation(
+        construct_derivation(
             units,
             idx,
             &key_to_idx,
@@ -2603,7 +2666,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
+            passthru_envs,
             &[],
             &[],
             SRC_STORE,
@@ -2616,13 +2679,71 @@ mod tests {
             &[],
             &test_policy(),
         )
-        .unwrap();
-        drv["inputSrcs"]
+        .unwrap()
+    }
+
+    fn drv_path_of(key: &str) -> String {
+        format!("/nix/store/{}-{}.drv", "d".repeat(32), key)
+    }
+
+    /// `inputSrcs` of `units[idx]`.
+    fn input_srcs_of(units: &[NixUnit], idx: usize) -> Vec<String> {
+        drv_of(units, idx, &[])["inputSrcs"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// An integration test names each binary of its package through
+    /// `CARGO_BIN_EXE_<name>`, whose hyphen Bash cannot export, so the
+    /// variable is a derivation attribute pointing into the binary's
+    /// output.
+    #[test]
+    fn integration_test_reads_package_binaries_from_derivation_env() {
+        let mut tool = unit_of_kind("tool", UnitKind::Compile);
+        tool.crate_name = "app_tool".into();
+        tool.crate_types = vec!["bin".into()];
+        let mut test = unit_of_kind("runs", UnitKind::TestCompile);
+        test.bin_exes = vec![
+            ("app-tool".into(), Some("tool".into())),
+            ("perf-only".into(), None),
+        ];
+        let drv = drv_of(&[tool.clone(), test], 1, &[]);
+
+        let placeholder = downstream_placeholder(&drv_path_of("tool"), "out").unwrap();
+        assert_eq!(
+            drv["env"]["CARGO_BIN_EXE_app-tool"],
+            format!("{placeholder}/{}", tool.output_lib_filename())
+        );
+        assert_eq!(
+            drv["env"]["CARGO_BIN_EXE_perf-only"],
+            "placeholder:perf-only"
+        );
+        assert!(drv["inputDrvs"].get(drv_path_of("tool")).is_some(), "{drv}");
+        assert!(!drv["args"][1].as_str().unwrap().contains("CARGO_BIN_EXE"));
+    }
+
+    /// A passthrough variable whose name Bash cannot export reaches the
+    /// build script through the derivation's environment. One Bash accepts
+    /// stays an export, so its derivation does not move.
+    #[test]
+    fn hyphenated_passthru_env_is_a_derivation_attribute() {
+        let mut units = build_script_units(&[]);
+        let passthru = [
+            ("MY_FLAG".to_string(), "a".to_string()),
+            ("MY-FLAG".to_string(), "b".to_string()),
+        ];
+        let drv = drv_of(&units, 1, &passthru);
+        let script = drv["args"][1].as_str().unwrap();
+        assert!(script.contains("export MY_FLAG=a && "), "{script}");
+        assert!(!script.contains("MY-FLAG"), "{script}");
+        assert_eq!(drv["env"]["MY-FLAG"], "b");
+        assert!(drv["env"].get("MY_FLAG").is_none());
+
+        units[1].kind = UnitKind::Compile;
+        assert!(drv_of(&units, 1, &passthru)["env"].get("MY-FLAG").is_none());
     }
 
     /// A lock bump that changes one crate moves only the units that read

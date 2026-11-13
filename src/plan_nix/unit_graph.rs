@@ -173,7 +173,8 @@ pub(super) fn extract_units_from_bcx(
             .get(&identity)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let mut dep_extern_map: HashMap<String, (String, bool)> = HashMap::new();
+        let mut dep_extern_map: HashMap<String, String> = HashMap::new();
+        let mut bin_keys: HashMap<String, String> = HashMap::new();
         let mut build_script_dep: Option<String> = None;
         let mut build_script_compile_key: Option<String> = None;
         let mut links_dep_map: HashMap<String, String> = HashMap::new();
@@ -215,25 +216,16 @@ pub(super) fn extract_units_from_bcx(
                         Some(ref existing) => existing.clone(),
                         None => dep_key.clone(),
                     });
+                } else if dep.unit.target.is_bin() {
+                    // Cargo links the package's binaries for an integration
+                    // test or bench to run, not to link against.
+                    keep_smallest(&mut bin_keys, dep.unit.target.name().to_string(), dep_key);
                 } else {
-                    let extern_name = dep.extern_crate_name.to_string();
-                    // When a package has both lib and bin targets with the same
-                    // extern name, prefer the lib target — downstream --extern
-                    // needs the .rlib, not the binary.
-                    let dep_is_lib = dep.unit.target.is_lib();
-                    dep_extern_map
-                        .entry(extern_name)
-                        .and_modify(|(existing_key, existing_is_lib)| {
-                            if dep_is_lib && !*existing_is_lib {
-                                // Replace bin with lib unconditionally
-                                *existing_key = dep_key.clone();
-                                *existing_is_lib = true;
-                            } else if dep_is_lib == *existing_is_lib && *dep_key < *existing_key {
-                                // Same kind: pick lexicographically smallest
-                                *existing_key = dep_key.clone();
-                            }
-                        })
-                        .or_insert_with(|| (dep_key.clone(), dep_is_lib));
+                    keep_smallest(
+                        &mut dep_extern_map,
+                        dep.extern_crate_name.to_string(),
+                        dep_key,
+                    );
                 }
             }
         }
@@ -380,14 +372,25 @@ pub(super) fn extract_units_from_bcx(
                     dep_key,
                     key,
                 );
-                dep_extern_map.insert(extern_name, (dep_key, true));
+                dep_extern_map.insert(extern_name, dep_key);
             }
         }
 
-        let mut dep_extern: Vec<(String, String)> = dep_extern_map
-            .into_iter()
-            .map(|(name, (key, _))| (name, key))
-            .collect();
+        let mut dep_extern: Vec<(String, String)> = dep_extern_map.into_iter().collect();
+        let mut bin_exes: Vec<(String, Option<String>)> =
+            if unit.target.is_test() || unit.target.is_bench() {
+                unit.pkg
+                    .targets()
+                    .iter()
+                    .filter(|t| t.is_bin())
+                    .map(|t| {
+                        let name = t.binary_filename().unwrap_or_else(|| t.name().to_string());
+                        (name, bin_keys.get(t.name()).cloned())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let mut links_dep_keys: Vec<(String, String)> = links_dep_map
             .into_iter()
             .map(|(links_name, dep_key)| (dep_key, links_name))
@@ -397,6 +400,7 @@ pub(super) fn extract_units_from_bcx(
         // cargo's unit graph may iterate HashMap entries in non-deterministic order.
         dep_extern.sort_by(|a, b| a.0.cmp(&b.0));
         links_dep_keys.sort_by(|a, b| a.1.cmp(&b.1));
+        bin_exes.sort();
 
         // Extra-filename hash
         let extra_filename = compute_extra_filename(
@@ -473,6 +477,7 @@ pub(super) fn extract_units_from_bcx(
             target_name,
             for_host,
             compile_test,
+            bin_exes,
             sliced_crate_rel: None,
             profile,
             pipeline: Default::default(),
@@ -967,7 +972,7 @@ fn find_linkable_lib_unit<'a>(
 /// `(extern_name, dep_unit_key)` pairs it can provide.  Only entries whose
 /// `extern_name` is absent from `dep_extern` are returned.
 fn find_missing_feature_deps(
-    dep_extern: &HashMap<String, (String, bool)>,
+    dep_extern: &HashMap<String, String>,
     enabled_features: &[String],
     feature_dep_activations: &HashMap<String, Vec<(String, String)>>,
 ) -> Vec<(String, String)> {
@@ -984,6 +989,19 @@ fn find_missing_feature_deps(
         }
     }
     result
+}
+
+/// Record `key` under `name`, keeping the lexicographically smallest key
+/// when several cargo units with one identity name different variants of a
+/// dependency, so the derivation JSON is the same on every run.
+fn keep_smallest(map: &mut HashMap<String, String>, name: String, key: &str) {
+    map.entry(name)
+        .and_modify(|existing| {
+            if key < existing.as_str() {
+                *existing = key.to_string();
+            }
+        })
+        .or_insert_with(|| key.to_string());
 }
 
 /// Compute topological levels for parallel derivation registration.
@@ -1021,12 +1039,13 @@ pub(super) fn compute_topo_levels(nix_units: &[NixUnit]) -> Vec<Vec<usize>> {
             // metadata halves reaches their link halves only through
             // `all_dep_keys`, and each is an input that must be registered
             // before it.
-            let lib_deps = unit
+            let deps = unit
                 .dep_extern
                 .iter()
                 .map(|(_, k)| k)
-                .chain(&unit.all_dep_keys);
-            for dep_key in lib_deps {
+                .chain(&unit.all_dep_keys)
+                .chain(unit.bin_exes.iter().filter_map(|(_, k)| k.as_ref()));
+            for dep_key in deps {
                 if let Some(&dep_idx) = key_to_idx.get(dep_key) {
                     max_dep = max_dep.max(unit_level[dep_idx] + 1);
                 }
@@ -1294,6 +1313,9 @@ fn unify_feature_variants(nix_units: &mut Vec<NixUnit>) {
         for (dep_key, _) in &mut u.links_dep_keys {
             *dep_key = apply(dep_key);
         }
+        for dep_key in u.bin_exes.iter_mut().filter_map(|(_, k)| k.as_mut()) {
+            *dep_key = apply(dep_key);
+        }
     }
 
     // Remove merged-away units (iterate in reverse to keep indices stable).
@@ -1412,6 +1434,7 @@ mod tests {
             target_name: name.replace('-', "_"),
             for_host: false,
             compile_test: false,
+            bin_exes: Vec::new(),
             sliced_crate_rel: None,
             profile: Default::default(),
             pipeline: Default::default(),
@@ -1699,8 +1722,8 @@ mod tests {
         // dep:serde, but cargo omits both from the unit graph because serde is
         // under [target.'cfg(any())'.dependencies].
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("equivalent".into(), ("equivalent-key".into(), true));
-        dep_extern.insert("hashbrown".into(), ("hashbrown-key".into(), true));
+        dep_extern.insert("equivalent".into(), "equivalent-key".into());
+        dep_extern.insert("hashbrown".into(), "hashbrown-key".into());
 
         let features = vec!["default".into(), "std".into(), "serde".into()];
 
@@ -1739,7 +1762,7 @@ mod tests {
         // If serde is already in dep_extern (normal case without cfg(any())),
         // no additions should be made.
         let mut dep_extern = HashMap::new();
-        dep_extern.insert("serde".into(), ("serde-key".into(), true));
+        dep_extern.insert("serde".into(), "serde-key".into());
 
         let features = vec!["serde".into()];
         let mut activations = HashMap::new();
@@ -2048,7 +2071,7 @@ mod tests {
 #[cfg(test)]
 mod build_script_dep_tests {
     use super::super::profile::tests::PLANNER;
-    use super::super::{TargetConfig, fresh_unit_graph};
+    use super::super::{TargetConfig, TargetSelection, fresh_unit_graph};
     use super::*;
 
     const FILES: &[(&str, &str)] = &[
@@ -2105,7 +2128,7 @@ mod build_script_dep_tests {
             &[],
             &[],
             false,
-            false,
+            &TargetSelection::default(),
             None,
         )
         .unwrap();
@@ -2137,5 +2160,135 @@ mod build_script_dep_tests {
 
         let lib = serde_unit(UnitKind::Compile);
         assert!(lib.dep_extern.iter().any(|(_, k)| names_derive(k)));
+    }
+}
+
+#[cfg(test)]
+mod target_selection_tests {
+    use super::super::profile::tests::PLANNER;
+    use super::super::{TargetConfig, TargetSelection, fresh_unit_graph};
+    use super::*;
+
+    const FILES: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [features]\nperf-harness = []\n\n\
+             [[bin]]\nname = \"app-tool\"\npath = \"src/main.rs\"\n\n\
+             [[bin]]\nname = \"perf-only\"\npath = \"src/perf.rs\"\n\
+             required-features = [\"perf-harness\"]\n",
+        ),
+        ("src/lib.rs", ""),
+        ("src/main.rs", "fn main() {}\n"),
+        ("src/perf.rs", "fn main() {}\n"),
+        ("tests/runs.rs", "#[test]\nfn t() {}\n"),
+        (
+            "Cargo.lock",
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        ),
+    ];
+
+    fn plan(intent: UserIntent, targets: &TargetSelection) -> Result<Vec<NixUnit>> {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in FILES {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vendor = tempfile::tempdir().unwrap();
+        let _planner = PLANNER.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_unit_graph(
+            dir.path(),
+            vendor.path(),
+            "dev",
+            &TargetConfig::native(),
+            intent,
+            &[],
+            &[],
+            &[],
+            false,
+            targets,
+            None,
+        )
+        .map(|(units, _, _)| units)
+    }
+
+    fn named<'a>(units: &'a [NixUnit], kind: UnitKind, target: &str) -> Option<&'a NixUnit> {
+        units
+            .iter()
+            .find(|u| u.kind == kind && u.target_name == target)
+    }
+
+    /// Plain Cargo skips a binary whose required features are off when no
+    /// target flag names it.
+    #[test]
+    fn default_selection_skips_binary_missing_required_features() {
+        let units = plan(UserIntent::Build, &TargetSelection::default()).unwrap();
+        assert!(named(&units, UnitKind::Compile, "app-tool").is_some());
+        assert!(named(&units, UnitKind::Compile, "perf-only").is_none());
+    }
+
+    #[test]
+    fn bin_selects_one_binary() {
+        let units = plan(
+            UserIntent::Build,
+            &TargetSelection::bins(["app-tool".into()]),
+        )
+        .unwrap();
+        let roots: Vec<_> = units
+            .iter()
+            .filter(|u| u.is_root)
+            .map(|u| &u.target_name)
+            .collect();
+        assert_eq!(roots, ["app-tool"]);
+    }
+
+    /// Cargo fails a plan that names a binary whose required features are
+    /// off, rather than skipping it.
+    #[test]
+    fn bin_naming_binary_missing_required_features_fails() {
+        let err = plan(
+            UserIntent::Build,
+            &TargetSelection::bins(["perf-only".into()]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("perf-harness"), "{err}");
+    }
+
+    #[test]
+    fn lib_selects_only_library_tests() {
+        let lib = TargetSelection {
+            lib: true,
+            ..TargetSelection::default()
+        };
+        let units = plan(UserIntent::Test, &lib).unwrap();
+        let roots: Vec<_> = units
+            .iter()
+            .filter(|u| u.is_root)
+            .map(|u| (u.kind, u.target_name.as_str()))
+            .collect();
+        assert_eq!(roots, [(UnitKind::TestCompile, "app")]);
+    }
+
+    /// An integration test reads `CARGO_BIN_EXE_<name>` for every binary of
+    /// its package. The linked binary is not a library, so it is no
+    /// `--extern` of the test.
+    #[test]
+    fn integration_test_carries_package_binaries() {
+        let units = plan(UserIntent::Test, &TargetSelection::default()).unwrap();
+        let tool = named(&units, UnitKind::Compile, "app-tool").unwrap();
+        let test = named(&units, UnitKind::TestCompile, "runs").unwrap();
+        assert_eq!(
+            test.bin_exes,
+            vec![
+                ("app-tool".to_string(), Some(tool.key.clone())),
+                ("perf-only".to_string(), None),
+            ]
+        );
+        assert!(
+            !test.dep_extern.iter().any(|(_, k)| k == &tool.key),
+            "{:?}",
+            test.dep_extern
+        );
     }
 }

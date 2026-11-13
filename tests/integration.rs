@@ -849,7 +849,8 @@ fn fixture_extra_includes() {
 }
 
 /// CARGO_SCHNEE_PASSTHRU_ENVS forwards env vars into ALL build script
-/// derivations, including transitive vendored dependencies.
+/// derivations, including transitive vendored dependencies, whether or not
+/// Bash accepts the name in `export`.
 #[test]
 #[ignore]
 fn fixture_passthru_env_manifest() {
@@ -863,8 +864,12 @@ fn fixture_passthru_env_manifest() {
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
-        .env("CARGO_SCHNEE_PASSTHRU_ENVS", "MY_CUSTOM_FLAG")
+        .env(
+            "CARGO_SCHNEE_PASSTHRU_ENVS",
+            "MY_CUSTOM_FLAG MY-HYPHEN-FLAG",
+        )
         .env("MY_CUSTOM_FLAG", "hello-from-env")
+        .env("MY-HYPHEN-FLAG", "hyphen-from-env")
         .output()
         .expect("Failed to execute cargo-schnee");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -886,6 +891,11 @@ fn fixture_passthru_env_manifest() {
     let run_stdout = String::from_utf8_lossy(&run_output.stdout);
     assert!(
         run_stdout.contains("flag=hello-from-env"),
+        "Unexpected output: {}",
+        run_stdout
+    );
+    assert!(
+        run_stdout.contains("hyphen=hyphen-from-env"),
         "Unexpected output: {}",
         run_stdout
     );
@@ -1415,6 +1425,56 @@ fn fixture_lib_bin_integration_test() {
 
     clean_target(&fixture_dir);
     run_schnee_test(&manifest);
+}
+
+static BIN_EXE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn bin_exe_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin-exe-required-features")
+}
+
+/// A binary whose required features are off is skipped, as plain Cargo
+/// skips it when no target flag names it.
+#[test]
+#[ignore]
+fn fixture_build_skips_binary_missing_required_features() {
+    let _guard = lock(&BIN_EXE_LOCK);
+    let fixture_dir = bin_exe_fixture();
+    clean_target(&fixture_dir);
+    run_schnee_build(&fixture_dir.join("Cargo.toml"));
+    assert!(fixture_dir.join("target/debug/bin-exe-tool").exists());
+    assert!(!fixture_dir.join("target/debug/perf-only").exists());
+}
+
+/// The integration test runs the package binary it finds through
+/// `env!("CARGO_BIN_EXE_bin-exe-tool")`.
+#[test]
+#[ignore]
+fn fixture_integration_test_runs_package_binary() {
+    let _guard = lock(&BIN_EXE_LOCK);
+    let fixture_dir = bin_exe_fixture();
+    clean_target(&fixture_dir);
+    let (stdout, _) = run_schnee_test(&fixture_dir.join("Cargo.toml"));
+    assert!(
+        stdout.contains("test runs_the_package_binary ... ok"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("test lib_unit ... ok"), "{stdout}");
+}
+
+#[test]
+#[ignore]
+fn fixture_target_flags_select_one_target() {
+    let _guard = lock(&BIN_EXE_LOCK);
+    let fixture_dir = bin_exe_fixture();
+    let manifest = fixture_dir.join("Cargo.toml");
+    clean_target(&fixture_dir);
+    run_schnee_cmd("build", &manifest, &["--bin", "bin-exe-tool"]);
+    assert!(fixture_dir.join("target/debug/bin-exe-tool").exists());
+
+    let (stdout, _) = run_schnee_cmd("test", &manifest, &["--lib"]);
+    assert!(stdout.contains("test lib_unit ... ok"), "{stdout}");
+    assert!(!stdout.contains("runs_the_package_binary"), "{stdout}");
 }
 
 /// Workspace where two crates form a dev-dep cycle: `lib-upper` depends on

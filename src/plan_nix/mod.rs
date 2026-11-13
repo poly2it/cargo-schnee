@@ -17,6 +17,7 @@ mod realise;
 mod references;
 mod refs_tool;
 pub(crate) mod store_paths;
+pub(crate) mod target_selection;
 mod unit_graph;
 pub(crate) mod util;
 pub(crate) mod vendor_farm;
@@ -28,6 +29,7 @@ use derivation::{
     self_placeholder,
 };
 pub use realise::realise_unit_outputs;
+pub use target_selection::TargetSelection;
 use unit_graph::{compute_topo_levels, extract_units_from_bcx};
 use util::{
     find_cross_linker, find_sysroot_rlib, which_bash, which_clippy_driver, which_command_no_deref,
@@ -318,6 +320,13 @@ pub struct NixUnit {
     /// time with E0601 (`main function not found in crate ...`).
     #[serde(default)]
     pub(crate) compile_test: bool,
+    /// The binaries an integration test or bench names through
+    /// `CARGO_BIN_EXE_<name>`, which are all binaries of its package. Each
+    /// carries the key of the unit that links it, or `None` when this plan
+    /// links none, as in a check or for a binary whose required features
+    /// are off.
+    #[serde(default)]
+    pub(crate) bin_exes: Vec<(String, Option<String>)>,
     /// Set when this local unit was per-crate sliced off the project-src tree
     /// (see `assign_per_crate_src_stores`): the crate's directory relative to
     /// the project-src root, e.g. `app-common`. Slicing rewrites the
@@ -755,7 +764,8 @@ pub fn narrow_to_requested_roots(
             .iter()
             .chain(unit.build_script_compile_key.iter())
             .map(|k| k.as_str());
-        for dep_key in direct.chain(transitive).chain(scripts) {
+        let bins = unit.bin_exes.iter().filter_map(|(_, k)| k.as_deref());
+        for dep_key in direct.chain(transitive).chain(scripts).chain(bins) {
             if let Some(&dep_idx) = key_to_idx.get(dep_key) {
                 stack.push(dep_idx);
             }
@@ -1107,7 +1117,7 @@ pub fn fresh_unit_graph(
     exclude: &[String],
     features: &[String],
     no_default_features: bool,
-    all_targets: bool,
+    targets: &TargetSelection,
     // Declared feature-resolution scope. When present it — not the `-p`
     // list — is what cargo resolves over, so every invocation naming the
     // same scope gets the same graph; `packages` then only picks roots
@@ -1210,11 +1220,7 @@ pub fn fresh_unit_graph(
         )?;
     }
 
-    // --all-targets: extend cargo's default target set (lib + bins) to
-    // include tests, examples, and benches.  Mirrors `cargo --all-targets`.
-    if all_targets {
-        options.filter = ops::CompileFilter::new_all_targets();
-    }
+    options.filter = targets.compile_filter();
 
     // Extract unit graph and target cfg — NO compilation happens here
     let interner = UnitInterner::new();
@@ -1505,6 +1511,7 @@ mod slice_tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
+            bin_exes: Vec::new(),
             sliced_crate_rel: None,
             profile: Default::default(),
             pipeline: Default::default(),
@@ -1800,6 +1807,7 @@ mod unit_setup_tests {
             target_name: String::new(),
             for_host: false,
             compile_test: false,
+            bin_exes: Vec::new(),
             sliced_crate_rel: None,
             profile: Default::default(),
             pipeline: Default::default(),
@@ -2030,11 +2038,9 @@ pub fn run_plan_nix(
     // before the driver invocation; non-matching units are byte-identical
     // to a run without rules.
     unit_setup: &[UnitSetupRule],
-    // Mirror of `cargo --all-targets`: when true, plan tests, examples
-    // and benches alongside the default lib + bins.  Used by
-    // `cargo schnee clippy --all-targets` so lint coverage extends to
-    // test modules and example crates.
-    all_targets: bool,
+    // The targets of the selected packages to plan, from Cargo's target
+    // flags such as `--bin` and `--all-targets`.
+    targets: &TargetSelection,
     // Declared feature-resolution scope, already read from the workspace
     // manifest by the caller.  Applies identically to the fresh and the
     // cached path: `is_root` and `target_name` are serialised into the
@@ -2109,7 +2115,7 @@ pub fn run_plan_nix(
                 exclude,
                 features,
                 no_default_features,
-                all_targets,
+                targets,
                 resolution,
             )?;
             for unit in &mut units {
@@ -3408,6 +3414,7 @@ mod narrow_tests {
             target_name: pkg.to_string(),
             for_host: false,
             compile_test: false,
+            bin_exes: Vec::new(),
             sliced_crate_rel: None,
             profile: Default::default(),
             pipeline: Default::default(),

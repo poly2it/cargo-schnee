@@ -193,17 +193,21 @@
               fi
               export HOME=''${HOME:-$(mktemp -d)}
             '';
+            # Cargo's target selection flags, which every compiling
+            # subcommand except `run` and `doc` takes.
+            targetArgs = [ "--bin" "--test" "--example" "--bench" ];
+            targetBoolArgs = [ "--lib" "--bins" "--tests" "--examples" "--benches" "--all-targets" ];
         in {
           check = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee check";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           build = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee build";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" "--bin" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
             postRun = ''
               if [ -n "$__target" ]; then
@@ -233,20 +237,20 @@
           };
           test = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee test";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           clippy = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee clippy";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" "--no-deps" "--all-targets" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" "--no-deps" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           bench = {
             command = "${cargoSchnee}/bin/cargo-schnee schnee bench";
-            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ];
-            boolArgs = [ "--no-default-features" ];
+            forwardArgs = [ "--manifest-path" "--target" "--profile" "-p" "--package" "--exclude" "--features" ] ++ targetArgs;
+            boolArgs = [ "--no-default-features" ] ++ targetBoolArgs;
             setup = schneeSetup;
           };
           doc = {

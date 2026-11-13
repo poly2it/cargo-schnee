@@ -19,6 +19,7 @@ use cargo::util::command_prelude::UserIntent;
 use cargo::util::context::GlobalContext;
 use cargo::util::{Progress, ProgressStyle};
 use clap::{Parser, Subcommand};
+use plan_nix::TargetSelection;
 use sha2::{Digest, Sha256};
 use source_tree::{ProjectSource, SourceTree};
 use std::collections::{HashMap, HashSet};
@@ -137,6 +138,8 @@ enum SchneeCommand {
         /// Do not activate the `default` feature
         #[arg(long)]
         no_default_features: bool,
+        #[command(flatten)]
+        targets: TargetSelection,
     },
     /// Build the project via dynamic derivations (nix build)
     Build {
@@ -169,6 +172,8 @@ enum SchneeCommand {
         /// Do not activate the `default` feature
         #[arg(long)]
         no_default_features: bool,
+        #[command(flatten)]
+        targets: TargetSelection,
     },
     /// Build and run a binary target
     Run {
@@ -235,6 +240,8 @@ enum SchneeCommand {
         /// Do not activate the `default` feature
         #[arg(long)]
         no_default_features: bool,
+        #[command(flatten)]
+        targets: TargetSelection,
         /// Arguments passed to the test harness after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -268,6 +275,8 @@ enum SchneeCommand {
         /// Do not activate the `default` feature
         #[arg(long)]
         no_default_features: bool,
+        #[command(flatten)]
+        targets: TargetSelection,
         /// Arguments passed to the bench harness after --
         #[arg(last = true)]
         args: Vec<String>,
@@ -301,10 +310,8 @@ enum SchneeCommand {
         /// Skip linting dependencies (forwarded as cargo clippy --no-deps)
         #[arg(long)]
         no_deps: bool,
-        /// Lint test, example, and bench targets in addition to the
-        /// default lib + bin set (forwarded as cargo clippy --all-targets).
-        #[arg(long)]
-        all_targets: bool,
+        #[command(flatten)]
+        targets: TargetSelection,
         /// Space or comma separated list of features to activate
         #[arg(long)]
         features: Vec<String>,
@@ -435,13 +442,12 @@ enum SchneeCommand {
         /// (e.g. `test` and `doc` add additional units).
         #[arg(long, default_value = "build")]
         intent: String,
-        /// Plan test, example, and bench targets alongside the default
-        /// lib + bin set.  A graph shared with a clippy gate needs this:
-        /// `cargo clippy --all-targets` plans a strictly larger unit set,
-        /// and the cache key records the difference, so a graph computed
-        /// without it is rejected rather than reused.
-        #[arg(long)]
-        all_targets: bool,
+        /// The targets to plan.  The cache key records them, so a graph
+        /// shared with a clippy gate that runs `--all-targets` has to be
+        /// computed with it, or the gate rejects the graph rather than
+        /// reusing it.
+        #[command(flatten)]
+        targets: TargetSelection,
         /// Where to write the resulting graph JSON.
         #[arg(long)]
         output: PathBuf,
@@ -1470,7 +1476,7 @@ fn intent_label(user_intent: &UserIntent) -> &'static str {
 /// what `construct_derivation` emits from the same unit.  It is deliberately
 /// not `CARGO_PKG_VERSION`, which is pinned at `0.1.0` and so can never
 /// distinguish two builds of the binary.
-const PLAN_SCHEMA_VERSION: u32 = 3;
+const PLAN_SCHEMA_VERSION: u32 = 4;
 
 /// The Cargo profile a command selects: `--release`, then `--profile`, then
 /// `dev`.
@@ -1505,7 +1511,7 @@ fn compose_unit_graph_key(
     exclude: &[String],
     features: &[String],
     no_default_features: bool,
-    all_targets: bool,
+    targets: &TargetSelection,
     resolution: Option<&plan_nix::ResolutionScope>,
 ) -> String {
     // With a declared scope the graph covers the whole scope and `-p`
@@ -1530,7 +1536,7 @@ fn compose_unit_graph_key(
         selection,
         features.join(","),
         no_default_features,
-        all_targets,
+        targets.args().join(" "),
     )
 }
 
@@ -1808,7 +1814,7 @@ fn compute_graph_args(
     exclude: &[String],
     features: &[String],
     no_default_features: bool,
-    all_targets: bool,
+    targets: &TargetSelection,
     resolution_scope: Option<&str>,
 ) -> Option<Vec<String>> {
     let intent = match user_intent {
@@ -1846,9 +1852,7 @@ fn compute_graph_args(
     if no_default_features {
         args.push("--no-default-features".into());
     }
-    if all_targets {
-        args.push("--all-targets".into());
-    }
+    args.extend(targets.args());
     args.extend(["--intent".to_string(), intent.to_string()]);
     Some(args)
 }
@@ -2356,10 +2360,9 @@ fn run_build_pipeline(
     // When `Some(path)` (and `plan_only` is set), additionally register
     // an aggregator drv covering all roots and write its drv path here.
     plan_aggregator_out: Option<&Path>,
-    // When true, plan all targets (lib + bins + tests + examples +
-    // benches) instead of cargo's default selection.  Mirrors `cargo
-    // ... --all-targets`; useful for `cargo clippy --all-targets`.
-    all_targets: bool,
+    // The targets of the selected packages to plan, from Cargo's target
+    // flags.
+    targets: &TargetSelection,
     // Key into `[workspace.metadata.schnee.resolution]`.  See
     // `SchneeArgs::resolution_scope`.
     resolution_scope: Option<&str>,
@@ -2428,7 +2431,7 @@ fn run_build_pipeline(
         exclude,
         features,
         no_default_features,
-        all_targets,
+        targets,
         resolution,
     );
     // `nix/buildPackage.nix` computes the graph in the `lib.unitGraph`
@@ -2468,7 +2471,7 @@ fn run_build_pipeline(
                 exclude,
                 features,
                 no_default_features,
-                all_targets,
+                targets,
                 resolution_scope,
             )
             .map(|args| GraphRequest {
@@ -2588,7 +2591,7 @@ fn run_build_pipeline(
         clippy_lint_args,
         &path_prefix_remaps,
         &unit_setup,
-        all_targets,
+        targets,
         resolution,
         pipeline_opts.profile.as_ref(),
     )?;
@@ -3246,6 +3249,7 @@ fn main() -> Result<()> {
             ref exclude,
             ref features,
             no_default_features,
+            ref targets,
         } => {
             run_build_pipeline(
                 manifest_path,
@@ -3268,7 +3272,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                targets,
                 resolution_scope,
             )?;
         }
@@ -3282,6 +3286,7 @@ fn main() -> Result<()> {
             ref exclude,
             ref features,
             no_default_features,
+            ref targets,
         } => {
             run_build_pipeline(
                 manifest_path,
@@ -3304,7 +3309,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                targets,
                 resolution_scope,
             )?;
         }
@@ -3342,7 +3347,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                &TargetSelection::bins(bin.iter().cloned()),
                 resolution_scope,
             )?;
 
@@ -3406,6 +3411,7 @@ fn main() -> Result<()> {
             ref exclude,
             ref features,
             no_default_features,
+            ref targets,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -3429,7 +3435,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                targets,
                 resolution_scope,
             )?;
 
@@ -3480,6 +3486,7 @@ fn main() -> Result<()> {
             ref exclude,
             ref features,
             no_default_features,
+            ref targets,
             ref args,
         } => {
             let result = run_build_pipeline(
@@ -3503,7 +3510,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                targets,
                 resolution_scope,
             )?;
 
@@ -3606,7 +3613,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 &[],
-                false,
+                &TargetSelection::default(),
                 None,
                 pipeline_opts.profile.as_ref(),
             )?;
@@ -3628,7 +3635,7 @@ fn main() -> Result<()> {
             // implicitly always-on; we accept the flag for cargo-clippy
             // CLI compatibility but it is a no-op.
             no_deps: _no_deps,
-            all_targets,
+            ref targets,
             ref features,
             no_default_features,
             ref args,
@@ -3666,7 +3673,7 @@ fn main() -> Result<()> {
                 &lint_args,
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                all_targets,
+                targets,
                 resolution_scope,
             )?;
         }
@@ -3707,7 +3714,7 @@ fn main() -> Result<()> {
                 &[],
                 plan_only_ref,
                 plan_aggregator_out_ref,
-                false,
+                &TargetSelection::default(),
                 resolution_scope,
             )?;
 
@@ -3801,7 +3808,7 @@ fn main() -> Result<()> {
                 &[],
                 &[],
                 &[],
-                false,
+                &TargetSelection::default(),
                 None,
                 None,
             )?;
@@ -3821,7 +3828,7 @@ fn main() -> Result<()> {
             ref features,
             no_default_features,
             ref intent,
-            all_targets,
+            ref targets,
             ref output,
         } => {
             let manifest_path = resolve_manifest(manifest_path)?;
@@ -3875,7 +3882,7 @@ fn main() -> Result<()> {
                 exclude,
                 features,
                 no_default_features,
-                all_targets,
+                targets,
                 resolution,
             );
 
@@ -3892,7 +3899,7 @@ fn main() -> Result<()> {
                 exclude,
                 features,
                 no_default_features,
-                all_targets,
+                targets,
                 resolution,
             )?;
 

@@ -236,7 +236,7 @@ fn calculate(
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::derivation::build_compile_script;
-    use super::super::{NixUnit, TargetConfig, UnitKind, fresh_unit_graph};
+    use super::super::{NixUnit, TargetConfig, TargetSelection, UnitKind, fresh_unit_graph};
     use cargo::util::command_prelude::UserIntent;
     use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
@@ -477,7 +477,7 @@ shared = { path = "../shared" }
             &[],
             &[],
             false,
-            false,
+            &TargetSelection::default(),
             None,
         )
         .unwrap();

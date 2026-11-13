@@ -538,7 +538,8 @@ cross builds. Permissions are adjusted from the Nix store's read-only
 The recommended way to use cargo-schnee is through a cargo wrapper that
 transparently redirects `cargo build`, `cargo check`, `cargo run`, `cargo test`,
 `cargo bench`, and `cargo doc` to their `cargo schnee` equivalents. The wrapper
-also forwards `-p`/`--package`, `--features`, `--bin`, `--no-default-features`,
+also forwards `-p`/`--package`, `--features`, `--no-default-features`, Cargo's target
+selection flags such as `--bin`, `--lib` and `--all-targets`,
 `--manifest-path`, `--target`, and `--profile`. For `cargo doc`, the wrapper
 additionally forwards `--no-deps` and `--document-private-items`. The
 [simple example](examples/simple/) demonstrates this approach with a

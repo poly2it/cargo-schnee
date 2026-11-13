@@ -198,6 +198,7 @@ impl Model {
                     .chain(&u.build_script_dep)
                     .chain(&u.build_script_compile_key)
                     .chain(u.links_dep_keys.iter().map(|(k, _)| k))
+                    .chain(u.bin_exes.iter().filter_map(|(_, k)| k.as_ref()))
                     .filter_map(|k| index.get(k.as_str()).copied())
                     .collect::<HashSet<_>>()
                     .into_iter()
